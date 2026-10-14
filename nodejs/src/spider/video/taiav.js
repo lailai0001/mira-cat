@@ -13,9 +13,13 @@ const TABS = [
   { name: '国产AV', tip: 'category', class: '国产AV' },
   { name: '有码', tip: 'category', class: '有码' },
   { name: '无码', tip: 'category', class: '无码' },
+  { name: '中文字幕', tip: 'category', class: '中文字幕' },
   { name: 'Onlyfans', tip: 'tag', class: 'Onlyfans' },
   { name: 'Korean Bj', tip: 'tag', class: 'Korean Bj' },
   { name: '探花', tip: 'tag', class: '探花' },
+  { name: '自拍', tip: 'tag', class: '自拍' },
+  { name: '无码破解', tip: 'tag', class: '无码破解' },
+  { name: '主播', tip: 'tag', class: '主播' },
 ];
 
 const CLASSES = TABS.map((t) => ({
