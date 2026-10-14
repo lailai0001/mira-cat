@@ -13,6 +13,7 @@ const PAGE_API = PROXY_BASE + '/page?u=';
 const CATS = [
   ['__home', '最新'],
   ['__popular', '热门'],
+  ['__trending', '趋势'],
   ['censored-jav', '有码 Censored'],
   ['uncensored-jav', '无码 Uncensored'],
   ['amateur', '素人 Amateur'],
@@ -118,6 +119,8 @@ async function category(reqIn) {
     url = page === 1 ? HOST + '/' : `${HOST}/page/${page}/`;
   } else if (tid === '__popular') {
     url = page === 1 ? HOST + '/popular/' : `${HOST}/popular/page/${page}/`;
+  } else if (tid === '__trending') {
+    url = page === 1 ? HOST + '/trending/' : `${HOST}/trending/page/${page}/`;
   } else {
     const base = HOST + '/category/' + tid;
     url = page === 1 ? base + '/' : `${base}/page/${page}/`;

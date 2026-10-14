@@ -14,6 +14,8 @@ const CATS = [
   { type_id: 'zhenren', type_name: '真人短剧' },
   { type_id: 'aiduanju', type_name: 'AI短剧' },
   { type_id: 'browse', type_name: '片库索引' },
+  { type_id: 'rank', type_name: '排行榜' },
+  { type_id: 'home', type_name: '首页推荐' },
 ];
 
 function t(v) {

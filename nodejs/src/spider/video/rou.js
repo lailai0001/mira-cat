@@ -22,6 +22,9 @@ const CLASSES = [
   { type_id: 'https://rou.video/t/欧美', type_name: '欧美' },
   { type_id: 'https://rou.video/t/网红', type_name: '网红' },
   { type_id: 'https://rou.video/t/动漫', type_name: '动漫' },
+  { type_id: 'https://rou.video/t/偷拍', type_name: '偷拍' },
+  { type_id: 'https://rou.video/t/主播', type_name: '主播' },
+  { type_id: 'https://rou.video/t/无码', type_name: '无码' },
 ];
 
 function headers() {

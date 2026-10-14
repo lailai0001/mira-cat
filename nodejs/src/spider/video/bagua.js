@@ -10,7 +10,27 @@ const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36';
 
 const CATS = [
-  { type_id: 'xazd', type_name: '默认' },
+  { type_id: 'latest', type_name: '最新更新' },
+  { type_id: 'mrds', type_name: '每日大赛' },
+  { type_id: 'ztds', type_name: '主题大赛' },
+  { type_id: 'rstt', type_name: '热搜吃瓜' },
+  { type_id: 'xazd', type_name: '校园学生' },
+  { type_id: 'blyp', type_name: '必撸大赛' },
+  { type_id: 'fctg', type_name: '反差泄密' },
+  { type_id: 'mhds', type_name: '网红黑料' },
+  { type_id: 'lqdp', type_name: '猎奇重口' },
+  { type_id: 'jdsj', type_name: 'AV看片' },
+  { type_id: 'mxwh', type_name: '明星大赛' },
+  { type_id: 'smdh', type_name: '动漫之家' },
+  { type_id: 'dypd', type_name: '影视国漫' },
+  { type_id: 'mtds', type_name: 'cos写真' },
+  { type_id: 'ysds', type_name: '声控ASMR' },
+  { type_id: 'czds', type_name: '寸止挑战' },
+  { type_id: 'hjds', type_name: '混剪PMV' },
+  { type_id: 'tgds', type_name: '原创投稿' },
+  { type_id: 'omjp', type_name: '欧美精品' },
+  { type_id: 'qwcs', type_name: '全网参赛' },
+  { type_id: 'aijc', type_name: 'AI剧场' },
 ];
 
 function t(v) {
@@ -132,7 +152,12 @@ async function category(reqIn) {
   const body = reqIn?.body || {};
   const id = String(Array.isArray(body.id) ? body.id[0] : body.id || 'xazd');
   const page = Math.max(1, parseInt(body.page) || 1);
-  const path = page === 1 ? `/category/${id}/` : `/category/${id}/${page}/`;
+  let path;
+  if (id === 'latest') {
+    path = page === 1 ? '/' : `/page/${page}/`;
+  } else {
+    path = page === 1 ? `/category/${id}/` : `/category/${id}/${page}/`;
+  }
   const html = await fetchHtml(BASE_URL + path);
   const list = parseList(html);
   return { page, pagecount: page, list };

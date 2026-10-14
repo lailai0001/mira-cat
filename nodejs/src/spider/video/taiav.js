@@ -20,6 +20,9 @@ const TABS = [
   { name: '自拍', tip: 'tag', class: '自拍' },
   { name: '无码破解', tip: 'tag', class: '无码破解' },
   { name: '主播', tip: 'tag', class: '主播' },
+  { name: '偷拍', tip: 'tag', class: '偷拍' },
+  { name: '制服', tip: 'tag', class: '制服' },
+  { name: '人妻', tip: 'tag', class: '人妻' },
 ];
 
 const CLASSES = TABS.map((t) => ({

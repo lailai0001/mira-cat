@@ -41,6 +41,9 @@ const CLASSES = [
   { type_id: '/cat/creampie/', type_name: '内射' },
   { type_id: '/cat/threesome/', type_name: '3P' },
   { type_id: '/cat/lesbian/', type_name: '女同' },
+  { type_id: '/cat/massage/', type_name: '按摩' },
+  { type_id: '/cat/ebony/', type_name: '黑人' },
+  { type_id: '/cat/latina/', type_name: '拉丁' },
 ];
 
 function parseList(html) {
