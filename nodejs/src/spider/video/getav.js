@@ -3,63 +3,83 @@ import req from '../../util/req.js';
 const KEY = 'py_getav';
 const NAME = 'GetAV';
 const HOST = 'https://getav.me';
-const STATIC_HOST = 'https://static.worldstatic.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
-function formatPoster(raw) {
-  if (!raw) return '';
-  let pic = String(raw).trim();
-  if (pic.startsWith('//')) pic = 'https:' + pic;
-  else if (pic.startsWith('/')) pic = STATIC_HOST + pic;
-  return pic;
+function t(v) {
+  return String(v == null ? '' : v).trim();
 }
 
-async function fetchApi(path) {
+function decodeHtml(s) {
+  s = t(s);
+  if (!s) return '';
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(parseInt(d, 10)));
+}
+
+async function fetchHtml(path) {
   const url = path.startsWith('http') ? path : HOST + path;
   try {
     const { data } = await req.get(url, {
       headers: {
         'User-Agent': UA,
-        'Referer': 'https://getav.me/zh',
-        'Origin': 'https://getav.me',
-        'Accept': 'application/json, text/plain, */*',
+        'Referer': HOST + '/zh',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
       },
       timeout: 15000,
     });
-    return typeof data === 'string' ? JSON.parse(data) : data;
+    return typeof data === 'string' ? data : String(data || '');
   } catch (e) {
-    return {};
+    return '';
   }
 }
 
-function parseVodList(items) {
+// Parse video cards from server-rendered HTML
+// Card pattern: <a href="/zh/videos/{slug}"> ... <h3 title="TITLE">
+function parseCards(html) {
   const list = [];
-  for (const it of (items || [])) {
-    const vodId = String(it.id || it.vod_id || '');
-    const vodName = String(it.title || it.vod_name || it.name || '').trim();
-    if (!vodId || !vodName) continue;
+  const seen = {};
+  if (!html) return list;
+  const re = /<a href="(\/zh\/videos\/[\w\-]+)">([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    const href = m[1];
+    const inner = m[2];
+    if (seen[href]) continue;
+    const tm = inner.match(/title="([^"]+)"/i);
+    const title = tm ? decodeHtml(tm[1]) : '';
+    if (!title) continue;
+    seen[href] = 1;
+    // poster: look for img near the link (may be in sibling element, try data around)
     list.push({
-      vod_id: vodId,
-      vod_name: vodName,
-      vod_pic: formatPoster(it.poster || it.vod_pic || it.img || it.localImg),
-      vod_remarks: String(it.duration || it.vod_remarks || ''),
+      vod_id: href,
+      vod_name: title,
+      vod_pic: '',
+      vod_remarks: '',
     });
   }
   return list;
 }
+
+const CATS = {
+  'new': { path: '/zh/new-releases', name: '最新' },
+  'hot': { path: '/zh/hot', name: '热门' },
+  'uncensored': { path: '/zh/uncensored', name: '无码' },
+  'censored': { path: '/zh/censored', name: '有码' },
+};
 
 async function init() {
   return {};
 }
 
 async function home() {
-  const classes = [
-    { type_id: 'new', type_name: '最新' },
-    { type_id: 'hot', type_name: '热门' },
-    { type_id: 'uncensored', type_name: '无码' },
-    { type_id: 'censored', type_name: '有码' },
-  ];
+  const classes = Object.keys(CATS).map((k) => ({ type_id: k, type_name: CATS[k].name }));
   return { class: classes, filters: {}, list: [] };
 }
 
@@ -67,20 +87,12 @@ async function category(reqIn) {
   const body = reqIn?.body || {};
   const tid = String(body.id || 'new');
   const page = Math.max(1, parseInt(body.page, 10) || 1);
-  
-  let apiPath = `/api/videos?page=${page}&limit=24`;
-  if (tid === 'hot') apiPath += '&sort=hot';
-  else if (tid === 'uncensored') apiPath += '&type=uncensored';
-  else if (tid === 'censored') apiPath += '&type=censored';
-  
-  const res = await fetchApi(apiPath);
-  const data = res.data || res;
-  const items = data.list || data.videos || data.items || [];
-  const list = parseVodList(items);
-  
+  const cat = CATS[tid] || CATS['new'];
+  const html = await fetchHtml(`${cat.path}?page=${page}`);
+  const list = parseCards(html);
   return {
     page,
-    pagecount: list.length >= 24 ? page + 1 : page,
+    pagecount: list.length >= 20 ? page + 1 : page,
     limit: 24,
     total: list.length,
     list,
@@ -91,48 +103,57 @@ async function detail(reqIn) {
   const ids = Array.isArray(reqIn?.body?.id) ? reqIn.body.id : [reqIn?.body?.id];
   const list = [];
   for (const id of (ids || []).filter(Boolean)) {
-    const res = await fetchApi(`/api/video/${id}`);
-    const data = res.data || res;
-    if (!data || !data.id) continue;
+    const html = await fetchHtml(id);
+    if (!html) continue;
+    // title from <title> or JSON-LD
+    let name = '';
+    const tm = html.match(/<title>([^<]+)<\/title>/i);
+    if (tm) name = decodeHtml(tm[1]).split('|')[0].trim();
+    // poster from JSON-LD thumbnailUrl
+    let pic = '';
+    const pm = html.match(/"thumbnailUrl":"([^"]+)"/);
+    if (pm) pic = pm[1].replace(/\\u0026/g, '&');
+    // description from JSON-LD
+    let desc = '';
+    const dm = html.match(/"description":"([^"]{0,500})"/);
+    if (dm) desc = decodeHtml(dm[1]);
+    if (!name) continue;
     list.push({
-      vod_id: String(data.id),
-      vod_name: String(data.title || ''),
-      vod_pic: formatPoster(data.poster || data.localImg),
-      vod_content: String(data.description || '').trim(),
+      vod_id: id,
+      vod_name: name,
+      vod_pic: pic,
+      vod_content: desc,
       vod_play_from: 'GetAV',
-      vod_play_url: `播放$${data.id}`,
+      vod_play_url: `播放$${id}`,
     });
   }
   return { list };
 }
 
 async function play(reqIn) {
-  const id = String(reqIn?.body?.id || '').trim();
+  const id = t(reqIn?.body?.id);
   if (!id) return { parse: 0, url: '' };
-  const res = await fetchApi(`/api/video/${id}/play`);
-  const data = res.data || res;
-  const url = String(data.url || data.playUrl || data.stream || '');
-  if (url) {
-    return {
-      parse: 0,
-      url,
-      header: { Referer: 'https://getav.me/', 'User-Agent': UA },
-    };
-  }
-  return { parse: 0, url: '', message: '未获取到播放地址' };
+  // Stream URL is loaded client-side via JS; use sniffing on the video page
+  const pageUrl = id.startsWith('http') ? id : HOST + id;
+  return {
+    parse: 1,
+    url: pageUrl,
+    header: { Referer: HOST + '/zh', 'User-Agent': UA },
+  };
 }
 
 async function search(reqIn) {
   const body = reqIn?.body || {};
-  const wd = String(body.wd || '').trim();
+  const wd = t(body.wd);
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!wd) return { page, pagecount: page, limit: 24, total: 0, list: [] };
-  
-  const res = await fetchApi(`/api/search?keyword=${encodeURIComponent(wd)}&page=${page}&limit=24`);
-  const data = res.data || res;
-  const items = data.list || data.videos || [];
-  const list = parseVodList(items);
-  
+  const html = await fetchHtml(`/zh/search?q=${encodeURIComponent(wd)}&page=${page}`);
+  let list = parseCards(html);
+  if (!list.length) {
+    // fallback: try alternate search path
+    const html2 = await fetchHtml(`/zh/search/${encodeURIComponent(wd)}?page=${page}`);
+    list = parseCards(html2);
+  }
   return { page, pagecount: page, limit: 24, total: list.length, list };
 }
 
