@@ -4,27 +4,31 @@ on:
   push:
     branches: [main]
     paths:
-      - 'js/**'
-      - 'build.js'
-      - 'package.json'
+      - 'scripts/**'
       - '.github/workflows/build.yml'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - run: npm install --no-audit --no-fund
-      - run: npm run build
-      - name: Commit dist
+
+      - name: Verify bundle integrity
         run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add dist/index.js dist/index.js.md5
-          git diff --cached --quiet || git commit -m "auto-build: update dist bundle"
-          git push
+          python3 - <<'EOF'
+          import hashlib
+          data = open('dist/index.js','rb').read()
+          md5 = hashlib.md5(data).hexdigest()
+          expect = open('dist/index.js.md5').read().strip()
+          assert md5 == expect, f"MD5 mismatch: {md5} != {expect}"
+          # 确认直播源和配置页面不在注册表中
+          text = data.decode('utf-8', errors='ignore')
+          assert 'jq,xq]' not in text, "注册表中仍有 jq,xq"
+          print(f"OK: bundle {len(data)} bytes, md5 {md5}")
+          EOF
+
+      - name: Summary
+        run: |
+          echo "Bundle 校验通过。当前为补丁版（基于 fangkuia 包移除 jq/xq）。"
+          echo "js/ 目录为 XPTV 格式源文件存档，供参考；实际生效的是 dist/index.js。"
