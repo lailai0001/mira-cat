@@ -41,28 +41,53 @@ async function fetchHtml(path) {
 }
 
 // Parse video cards from server-rendered HTML
-// Card pattern: <a href="/zh/videos/{slug}"> ... <h3 title="TITLE">
+// Card structure: <div class="group ..."><a href="/zh/videos/{slug}"><img src="POSTER"/></a><a href="/zh/videos/{slug}"><h3 title="TITLE">
 function parseCards(html) {
   const list = [];
   const seen = {};
   if (!html) return list;
-  const re = /<a href="(\/zh\/videos\/[\w\-]+)">([\s\S]*?)<\/a>/gi;
+  // Match the card container to get both poster and title
+  const cardRe = /<div class="group cursor-pointer[\s\S]*?<a[^>]*href="(\/zh\/videos\/[\w\-]+)"[^>]*>([\s\S]*?)<\/a>\s*<a[^>]*href="\/zh\/videos\/[\w\-]+"[^>]*>([\s\S]*?)<\/a>/gi;
   let m;
-  while ((m = re.exec(html))) {
+  while ((m = cardRe.exec(html))) {
     const href = m[1];
-    const inner = m[2];
+    const imgBlock = m[2];
+    const titleBlock = m[3];
     if (seen[href]) continue;
-    const tm = inner.match(/title="([^"]+)"/i);
+    const tm = titleBlock.match(/title="([^"]+)"/i);
     const title = tm ? decodeHtml(tm[1]) : '';
     if (!title) continue;
     seen[href] = 1;
-    // poster: look for img near the link (may be in sibling element, try data around)
+    // poster from img src in the first <a> (static.worldstatic.com)
+    let pic = '';
+    const im = imgBlock.match(/<img[^>]*src="([^"]+)"/i);
+    if (im) {
+      pic = im[1].replace(/&amp;/g, '&');
+      if (pic.startsWith('//')) pic = 'https:' + pic;
+    }
     list.push({
       vod_id: href,
       vod_name: title,
-      vod_pic: '',
+      vod_pic: pic,
       vod_remarks: '',
     });
+  }
+  // Fallback: old pattern for search pages or different layouts
+  if (!list.length) {
+    const re = /<a href="(\/zh\/videos\/[\w\-]+)">([\s\S]*?)<\/a>/gi;
+    while ((m = re.exec(html))) {
+      const href = m[1];
+      const inner = m[2];
+      if (seen[href]) continue;
+      const tm = inner.match(/title="([^"]+)"/i);
+      const title = tm ? decodeHtml(tm[1]) : '';
+      if (!title) continue;
+      seen[href] = 1;
+      let pic = '';
+      const im = inner.match(/<img[^>]*src="([^"]+)"/i);
+      if (im) pic = im[1].replace(/&amp;/g, '&');
+      list.push({ vod_id: href, vod_name: title, vod_pic: pic, vod_remarks: '' });
+    }
   }
   return list;
 }

@@ -19,6 +19,8 @@ const CATS = [
   { type_id: 'yuanchuang', type_name: '野果原创' },
   { type_id: 'zhenren', type_name: '真人短剧' },
   { type_id: 'mogai', type_name: '魔改漫剧' },
+  { type_id: 'manju', type_name: '漫剧' },
+  { type_id: 'aiduanju', type_name: 'AI短剧' },
 ];
 
 function t(v) {
@@ -72,7 +74,7 @@ function unwrap(d) {
 function proxiedCover(url) {
   url = t(url);
   if (!url) return '';
-  if (/pic\.wlwvch\.cn|pic\.zdmhyg\.cn|pic\.wirqed\.cn/i.test(url)) {
+  if (/pic\.wlwvch\.cn|pic\.zdmhyg\.cn|pic\.wirqed\.cn|imgpublic\.ycomesc\.live/i.test(url)) {
     return COVER_PROXY + '/?url=' + encodeURIComponent(url);
   }
   return url;

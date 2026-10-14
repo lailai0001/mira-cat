@@ -26,7 +26,15 @@ async function getText(url) {
 
 function imgOf(html) {
   const clean = html.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-  let m = clean.match(/https?:\/\/[^"'\s)]+\.(?:jpg|png|jpeg|webp)/i);
+  // 优先取文章封面（z-image-loader-url 或 blog-background 类的 img）
+  let m = clean.match(/z-image-loader-url\s*=\s*"([^"]+)"/i);
+  if (m && /^https?:\/\//i.test(m[1])) return m[1];
+  m = clean.match(/<img[^>]*class="[^"]*blog-background[^"]*"[^>]*>/i);
+  if (m) {
+    const sm = m[0].match(/(?:z-image-loader-url|data-src|src)\s*=\s*"([^"]+)"/i);
+    if (sm && /^https?:\/\//i.test(sm[1]) && !/data:image/i.test(sm[1])) return sm[1];
+  }
+  m = clean.match(/https?:\/\/[^"'\s)]+\.(?:jpg|png|jpeg|webp)/i);
   if (m) return m[0];
   m = clean.match(/url\s*\(\s*['"]?([^"'\)]+)['"]?\s*\)/i);
   if (m) {

@@ -81,7 +81,8 @@ function parseList(html) {
       }
     }
     if (!cover) {
-      const im = block.match(/<img[^>]*\bsrc\s*=\s*["']([^"']+)["']/i);
+      // 注意：用 (?<![\w-]) 避免匹配到 data-src/data-preview-src 等
+      const im = block.match(/<img[^>]*?(?<![\w-])src\s*=\s*["']([^"']+)["']/i);
       if (im) cover = t(im[1]);
     }
     const low = cover.toLowerCase();

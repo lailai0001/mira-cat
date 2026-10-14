@@ -93,11 +93,18 @@ const CATS = [
   { type_id: 'tag_qihuan', type_name: '奇幻' },
   { type_id: 'tag_guzhuang', type_name: '古装' },
   { type_id: 'tag_dongman', type_name: '动漫' },
+  { type_id: 'tag_tianchong', type_name: '甜宠' },
+  { type_id: 'tag_nuelian', type_name: '虐恋' },
+  { type_id: 'tag_chuanyue', type_name: '穿越' },
 ];
 
 function toVod(it) {
   if (!it || !it.id) return null;
-  const cover = it.coverUrl || it.cover || '';
+  let cover = it.coverUrl || it.cover || '';
+  // coverUrl 可能是相对路径（如 /media/covers/xxx.png），补全域名
+  if (cover && !/^https?:\/\//i.test(cover)) {
+    cover = API_BASE + (cover.startsWith('/') ? cover : '/' + cover);
+  }
   const ep = it.episodeCount || '';
   let remark = ep ? '全' + ep + '集' : '';
   const tags = Array.isArray(it.tags) ? it.tags.join(' · ') : '';
@@ -144,6 +151,9 @@ const CAT_QUERY = {
   tag_qihuan: { sort: 'latest', _tagFilter: '奇幻' },
   tag_guzhuang: { sort: 'latest', _tagFilter: '古装' },
   tag_dongman: { sort: 'latest', _tagFilter: '动漫' },
+  tag_tianchong: { sort: 'latest', _tagFilter: '甜宠' },
+  tag_nuelian: { sort: 'latest', _tagFilter: '虐恋' },
+  tag_chuanyue: { sort: 'latest', _tagFilter: '穿越' },
 };
 
 async function home() {
@@ -174,7 +184,10 @@ async function detail(reqIn) {
   const data = await apiGet('/dramas/' + encodeURIComponent(id), {});
   const drama = (data && data.drama) || {};
   const eps = (data && data.episodes) || [];
-  const cover = drama.coverUrl || '';
+  let cover = drama.coverUrl || '';
+  if (cover && !/^https?:\/\//i.test(cover)) {
+    cover = API_BASE + (cover.startsWith('/') ? cover : '/' + cover);
+  }
   const tags = Array.isArray(drama.tags) ? drama.tags.join(' · ') : '';
   const playUrls = [];
   const playFrom = [];
