@@ -18,6 +18,10 @@ const CLASSES = [
   { type_id: 'https://rou.video/t/自拍流出', type_name: '自拍流出' },
   { type_id: 'https://rou.video/t/OnlyFans', type_name: 'OnlyFans' },
   { type_id: 'https://rou.video/t/日本', type_name: '日本' },
+  { type_id: 'https://rou.video/t/韩国', type_name: '韩国' },
+  { type_id: 'https://rou.video/t/欧美', type_name: '欧美' },
+  { type_id: 'https://rou.video/t/网红', type_name: '网红' },
+  { type_id: 'https://rou.video/t/动漫', type_name: '动漫' },
 ];
 
 function headers() {
