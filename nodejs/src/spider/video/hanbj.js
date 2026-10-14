@@ -252,7 +252,7 @@ async function detail(reqIn) {
     let name = '';
     const tm = html.match(/<title>([^<]+)/i);
     if (tm) {
-      name = t(tm[1]).replace(/\s*[|\\-–].*$/, '').replace(/&#8211;/g, '-');
+      name = t(tm[1]).replace(/\s*[|\\\-\–].*$/, '').replace(/&#8211;/g, '-');
     }
     let pic = '';
     const om = html.match(/property=["']og:image["'][^>]*content=["']([^"']+)/i);
