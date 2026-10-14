@@ -19,6 +19,10 @@ import feiye from './spider/video/feiye.js';
 import huadu from './spider/video/huadu.js';
 import supjav from './spider/video/supjav.js';
 import sanjipian from './spider/video/sanjipian.js';
+import hl818 from './spider/video/hl818.js';
+import upload5 from './spider/video/upload5.js';
+import getav from './spider/video/getav.js';
+import hanbj from './spider/video/hanbj.js';
 
 const spiders = [
     missav_xptv,
@@ -42,6 +46,10 @@ const spiders = [
     huadu,
     supjav,
     sanjipian,
+    hl818,
+    upload5,
+    getav,
+    hanbj,
 ];
 const spiderPrefix = '/spider'; // API 路由前缀
 
