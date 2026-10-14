@@ -109,11 +109,17 @@ async function category(reqIn) {
 }
 
 async function detail(reqIn) {
-  const ids = Array.isArray(reqIn?.body?.id) ? reqIn.body.id : [reqIn?.body?.id];
-  const vid = String(ids[0] || '').match(/(\d+)/)?.[1] || '';
-  if (!vid) return { list: [] };
-  const html = await getText(`${HOST}/${vid}.html`);
-  if (!html || html.length < 500) return { list: [] };
+  const rawIds = Array.isArray(reqIn?.body?.id) ? reqIn.body.id : [reqIn?.body?.id];
+  const vids = [];
+  for (const r of (rawIds || [])) {
+    const v = String(r || '').match(/(\d+)/)?.[1] || '';
+    if (v && !vids.includes(v)) vids.push(v);
+  }
+  if (!vids.length) return { list: [] };
+  const list = [];
+  for (const vid of vids) {
+    const html = await getText(`${HOST}/${vid}.html`);
+    if (!html || html.length < 500) continue;
   let m3u8 = '';
   let m = html.match(/(?:const|let|var)\s+rawUrl\s*=\s*['"]([^'"]+)['"]/i);
   if (m) m3u8 = m[1];
@@ -130,7 +136,7 @@ async function detail(reqIn) {
     const ms = html.match(/https?:\/\/[^\s"'\\]+\.m3u8[^\s"'\\]*/gi) || [];
     m3u8 = ms.find((u) => !/sharer|balecao/i.test(u)) || '';
   }
-  if (!m3u8 || isJuv(m3u8)) return { list: [] };
+  if (!m3u8 || isJuv(m3u8)) continue;
   let name = '视频' + vid;
   const tm = html.match(/<title>(.*?)<\/title>/s);
   if (tm) {
@@ -138,19 +144,22 @@ async function detail(reqIn) {
       .replace(/[-_–—]\s*[^-_–—]*[-_–—]\s*UU直播破解.*$/, '')
       .replace(/[-_–—]\s*UU直播破解.*$/, '').trim() || name;
   }
-  if (isJuv(name)) return { list: [] };
+  if (isJuv(name)) continue;
   const pm = html.match(/(?:data-original|data-src|src)="([^"]+\.(?:jpg|jpeg|png))"/i);
-  return {
-    list: [{
-      vod_id: vid, vod_name: name, vod_pic: pm ? absPic(pm[1]) : '',
-      vod_remarks: NAME, vod_play_from: NAME, vod_play_url: '第1集$' + m3u8,
-    }],
-  };
+  list.push({
+    vod_id: vid, vod_name: name, vod_pic: pm ? absPic(pm[1]) : '',
+    vod_remarks: NAME, vod_play_from: NAME, vod_play_url: '第1集$' + m3u8,
+  });
+  }
+  return { list };
 }
 
 async function play(reqIn) {
-  const id = String(reqIn?.body?.id || '').trim();
-  return { parse: 0, url: id, header: { 'User-Agent': UA } };
+  // MiraPlayer 可能把 "第1集$https://..." 整个传过来, 先去掉 "xxx$" 前缀
+  let id = String(reqIn?.body?.id || '').trim();
+  if (/\$/.test(id)) id = id.split('$').pop().trim();
+  if (!id) return { parse: 0, url: '', header: { 'User-Agent': UA } };
+  return { parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
 }
 
 async function search() { return { list: [], page: 1, pagecount: 0 }; }
