@@ -27,6 +27,11 @@ import duanju91 from './spider/video/91duanju.js';
 import asmr from './spider/video/asmr.js';
 import pandalive from './spider/video/pandalive.js';
 import march from './spider/video/march.js';
+import jinguo from './spider/video/jinguo.js';
+import chengguo from './spider/video/chengguo.js';
+import yeguo from './spider/video/yeguo.js';
+import mrds from './spider/video/mrds.js';
+import bianfu from './spider/video/bianfu.js';
 
 const spiders = [
     missav_xptv,
@@ -58,6 +63,11 @@ const spiders = [
     asmr,
     pandalive,
     march,
+    jinguo,
+    chengguo,
+    yeguo,
+    mrds,
+    bianfu,
 ];
 const spiderPrefix = '/spider'; // API 路由前缀
 
