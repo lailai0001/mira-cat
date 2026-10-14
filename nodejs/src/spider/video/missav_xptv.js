@@ -40,6 +40,8 @@ const CLASSES = [
   { type_id: 'dm34/cn/madou', type_name: '麻豆传媒' },
   { type_id: 'dm17/cn/twav', type_name: 'TWAV AV' },
   { type_id: 'dm15/cn/furuke', type_name: 'Furuke AV' },
+  { type_id: 'cn/censored', type_name: '有码' },
+  { type_id: 'cn/uncensored', type_name: '无码' },
 ];
 
 const M3U8_PREFIXES = [
