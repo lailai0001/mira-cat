@@ -17,7 +17,8 @@ const spiderPrefix = '/spider'; // API 路由前缀
  */
 export default async function router(fastify) {
     // register all spider router
-    spiders.forEach((spider) => {
+    spiders.forEach((spiderFn) => {
+        const spider = typeof spiderFn === 'function' ? spiderFn() : spiderFn;
         const path = spiderPrefix + '/' + spider.meta.key + '/' + spider.meta.type;
         fastify.register(spider.api, { prefix: path });
         console.log('Register spider: ' + path);
@@ -68,7 +69,8 @@ export default async function router(fastify) {
                         },
                         color: fastify.config.color || [],
                     };
-                    spiders.forEach((spider) => {
+                    spiders.forEach((spiderFn) => {
+                        const spider = typeof spiderFn === 'function' ? spiderFn() : spiderFn;
                         let meta = Object.assign({}, spider.meta);
                         meta.api = spiderPrefix + '/' + meta.key + '/' + meta.type;
                         meta.key = 'nodejs_' + meta.key;
