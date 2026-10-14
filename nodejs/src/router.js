@@ -1,11 +1,35 @@
 import missav_xptv from './spider/video/missav_xptv.js';
 import chigua51 from './spider/video/chigua51.js';
 import avdb from './spider/video/avdb.js';
+import kanav from './spider/video/kanav.js';
+import taiav from './spider/video/taiav.js';
+import rou from './spider/video/rou.js';
+import madou from './spider/video/madou.js';
+import pornhub from './spider/video/pornhub.js';
+import ppp from './spider/video/ppp.js';
+import xvideos from './spider/video/xvideos.js';
+import xxxfollow from './spider/video/xxxfollow.js';
+import hanime from './spider/video/hanime.js';
+import spankbang from './spider/video/spankbang_new.js';
+import huangdou from './spider/video/huangdou.js';
+import huangguo from './spider/video/huangguo.js';
 
 const spiders = [
     missav_xptv,
     chigua51,
     avdb,
+    kanav,
+    taiav,
+    rou,
+    madou,
+    pornhub,
+    ppp,
+    xvideos,
+    xxxfollow,
+    hanime,
+    spankbang,
+    huangdou,
+    huangguo,
 ];
 const spiderPrefix = '/spider'; // API 路由前缀
 
