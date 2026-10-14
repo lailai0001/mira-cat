@@ -32,6 +32,7 @@ import chengguo from './spider/video/chengguo.js';
 import yeguo from './spider/video/yeguo.js';
 import mrds from './spider/video/mrds.js';
 import bianfu from './spider/video/bianfu.js';
+import bagua from './spider/video/bagua.js';
 
 const spiders = [
     missav_xptv,
@@ -68,6 +69,7 @@ const spiders = [
     yeguo,
     mrds,
     bianfu,
+    bagua,
 ];
 const spiderPrefix = '/spider'; // API 路由前缀
 
