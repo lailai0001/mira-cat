@@ -16,7 +16,6 @@ import huangguo from './spider/video/huangguo.js';
 import av123 from './spider/video/av123.js';
 import chigua57 from './spider/video/chigua57.js';
 import feiye from './spider/video/feiye.js';
-import huadu from './spider/video/huadu.js';
 import supjav from './spider/video/supjav.js';
 import sanjipian from './spider/video/sanjipian.js';
 import hl818 from './spider/video/hl818.js';
@@ -53,7 +52,6 @@ const spiders = [
     av123,
     chigua57,
     feiye,
-    huadu,
     supjav,
     sanjipian,
     hl818,
