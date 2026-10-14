@@ -13,6 +13,12 @@ import hanime from './spider/video/hanime.js';
 import spankbang from './spider/video/spankbang_new.js';
 import huangdou from './spider/video/huangdou.js';
 import huangguo from './spider/video/huangguo.js';
+import av123 from './spider/video/av123.js';
+import chigua57 from './spider/video/chigua57.js';
+import feiye from './spider/video/feiye.js';
+import huadu from './spider/video/huadu.js';
+import supjav from './spider/video/supjav.js';
+import sanjipian from './spider/video/sanjipian.js';
 
 const spiders = [
     missav_xptv,
@@ -30,6 +36,12 @@ const spiders = [
     spankbang,
     huangdou,
     huangguo,
+    av123,
+    chigua57,
+    feiye,
+    huadu,
+    supjav,
+    sanjipian,
 ];
 const spiderPrefix = '/spider'; // API 路由前缀
 
