@@ -29,14 +29,19 @@ function H() {
 
 async function getText(url) {
   // 注: 本站屏蔽 axios 的 TLS 指纹, 必须用 Node 原生 fetch
-  try {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 20000);
-    const r = await fetch(url, { headers: H(), signal: ctl.signal });
-    clearTimeout(timer);
-    if (!r.ok) return '';
-    return await r.text();
-  } catch { return ''; }
+  // 手机网络可能较慢: 30秒超时 + 失败重试一次
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 30000);
+      const r = await fetch(url, { headers: H(), signal: ctl.signal });
+      clearTimeout(timer);
+      if (!r.ok) continue;
+      const t = await r.text();
+      if (t && t.length > 500) return t;
+    } catch { /* 重试 */ }
+  }
+  return '';
 }
 
 function stripTags(s) {
@@ -83,7 +88,8 @@ function pagecountOf(html, pg) {
   const ms = String(html || '').match(/\/vodtype\/\d+-(\d+)\.html/gi) || [];
   let max = pg;
   for (const s of ms) {
-    const n = parseInt(s.match(/(\d+)/)[1], 10);
+    const mm = s.match(/-(\d+)\.html/i);
+    const n = mm ? parseInt(mm[1], 10) : 0;
     if (n > max) max = n;
   }
   return max;
