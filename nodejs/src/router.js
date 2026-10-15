@@ -16,7 +16,6 @@ import av123 from './spider/video/av123.js';
 import chigua57 from './spider/video/chigua57.js';
 import feiye from './spider/video/feiye.js';
 import supjav from './spider/video/supjav.js';
-import sanjipian from './spider/video/sanjipian.js';
 import hl818 from './spider/video/hl818.js';
 import upload5 from './spider/video/upload5.js';
 import getav from './spider/video/getav.js';
@@ -55,7 +54,6 @@ const spiders = [
     chigua57,
     feiye,
     supjav,
-    sanjipian,
     hl818,
     upload5,
     getav,
