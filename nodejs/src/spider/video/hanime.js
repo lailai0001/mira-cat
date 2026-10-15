@@ -75,14 +75,30 @@ async function getHtml(url) {
 // 注意: 站点有 Cloudflare("Just a moment...") 检查，XPTV 原版通过 $utils.openSafari 处理，
 // CatPawOpen 环境下无此能力；此处做挑战页识别 + 主备域名轮询，尽代码侧最大努力。
 
-// ---------- getTabs（XPTV 原逻辑） ----------
+// ---------- getTabs（XPTV 原逻辑 + 首页失败时静态兜底） ----------
+// 静态兜底分类：与站内导航一致（2026-10-15 从 hanime1.me 首页实测收集）。
+// 手机端抓不到首页（超时/被拦）时用，保证分类列表不再空白。
+const FALLBACK_GENRES = ['裏番', '泡麵番', 'Motion Anime', '3DCG', '2.5D', '2D動畫', 'AI生成', 'MMD', 'Cosplay'];
+
+function fallbackTabs() {
+  const list = [];
+  for (const name of FALLBACK_GENRES) {
+    let ui = 1;
+    if (name.includes('裏番') || name.includes('泡麵番')) ui = 0;
+    // 与线上解析保持一致：原始 genre 拼 URL 后再整体 encodeURI
+    const abs = `${ACTIVE_HOST}/search?genre=${name}`;
+    list.push({ name, ui, ext: { url: encodeURI(abs) } });
+  }
+  return list;
+}
+
 async function getTabs() {
   const list = [];
   const ignore = ['新番預告', 'H漫畫', '無碼黃油'];
   const isIgnoreClassName = (className) => ignore.some((el) => className.includes(el));
 
   const html = await getHtml(HOST);
-  if (!html) return list;
+  if (!html) return fallbackTabs();
   const $ = cheerio.load(html);
 
   $('#main-nav-home > a.nav-item').each((i, e) => {
@@ -102,7 +118,7 @@ async function getTabs() {
     list.push({ name, ui, ext: { url: encodeURI(abs) } });
   });
 
-  return list;
+  return list.length ? list : fallbackTabs();
 }
 
 // ---------- getCards（XPTV 原逻辑） ----------
