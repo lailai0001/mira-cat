@@ -1,0 +1,14 @@
+{
+  "updated": "2026-10-15",
+  "note": "有料 init 域名列表 - 域名轮换时只更新此文件，无需重建",
+  "hosts": [
+    "https://xginit.ylapi3321.com/api",
+    "https://h5init.ylapi3321.com/api",
+    "https://init.ylapi3321.com/api",
+    "https://web.ylapi3321.com/api",
+    "https://xginit.ylapi1688.com/api",
+    "https://h5init.ylapi1688.com/api",
+    "https://init.ylapi1688.com/api",
+    "https://web.ylapi1688.com/api"
+  ]
+}
