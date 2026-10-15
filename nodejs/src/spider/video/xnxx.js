@@ -3,7 +3,9 @@
 // 列表: .thumb-block ; 详情: setVideoUrlHigh/Low ; 播放: 直链 mp4/m3u8
 const KEY = 'py_xnxx';
 const NAME = 'XNXX';
-const HOST = 'https://xnxx.health';
+// 多个镜像域名, 哪个通走哪个 (xnxx.health 在部分网络下可能被墙)
+const HOSTS = ['https://xnxx.health', 'https://www.xnxx.health', 'https://xnxx.com', 'https://www.xnxx.com'];
+const HOST = HOSTS[0];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 const FALLBACK_CATS = [
@@ -29,16 +31,32 @@ function H() {
   };
 }
 
-async function getText(url, cookie) {
+function toTryUrls(url) {
+  // 把 URL 的域名依次换成各个镜像域名, 哪个通走哪个
+  const urls = [];
+  const m = String(url || '').match(/^https?:\/\/[^/]+(\/.*)?$/i);
+  const path = m ? (m[1] || '/') : String(url || '');
+  for (const h of HOSTS) {
+    const u = h + path;
+    if (!urls.includes(u)) urls.push(u);
+  }
+  if (!urls.includes(url)) urls.unshift(url);
+  return urls;
+}
+
+async function fetchOnce(url, cookie) {
   // 注: 本站屏蔽 axios 的 TLS 指纹, 必须用 Node 原生 fetch
   const headers = H();
   if (cookie) headers['Cookie'] = cookie;
   try {
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 20000);
+    const timer = setTimeout(() => ctl.abort(), 25000);
     const r = await fetch(url, { headers, signal: ctl.signal });
     clearTimeout(timer);
-    if (r.ok) return await r.text();
+    if (r.ok) {
+      const t = await r.text();
+      if (t && t.length > 1000) return t;
+    }
     // 403 JS cookie 挑战: 提取 document.cookie="..." 后重试
     if (r.status === 403) {
       const html = await r.text();
@@ -46,14 +64,25 @@ async function getText(url, cookie) {
       if (m) {
         const nv = m[1].split(';')[0].trim();
         const ctl2 = new AbortController();
-        const timer2 = setTimeout(() => ctl2.abort(), 20000);
+        const timer2 = setTimeout(() => ctl2.abort(), 25000);
         const r2 = await fetch(url, { headers: { ...headers, 'Cookie': nv }, signal: ctl2.signal });
         clearTimeout(timer2);
-        if (r2.ok) return await r2.text();
+        if (r2.ok) {
+          const t2 = await r2.text();
+          if (t2 && t2.length > 1000) return t2;
+        }
       }
     }
-    return '';
-  } catch { return ''; }
+  } catch {}
+  return '';
+}
+
+async function getText(url, cookie) {
+  for (const u of toTryUrls(url)) {
+    const t = await fetchOnce(u, cookie);
+    if (t) return t;
+  }
+  return '';
 }
 
 function parseList(html) {
