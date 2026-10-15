@@ -19,6 +19,10 @@ const CLASSES = [
 { type_id: '/p/2', type_name: '🎤 综艺'},
 { type_id: '/p/66', type_name: '⚡ 短剧'},
 { type_id: '/p/53', type_name: '⚽ 体育'},
+{ type_id: '/p/66/c/67', type_name: '🎭 爽剧短剧'},
+{ type_id: '/p/53/c/54', type_name: '🏟️ 足球'},
+{ type_id: '/p/3/c/82', type_name: '🇰🇷 韩剧'},
+{ type_id: '/p/4/c/86', type_name: '🇯🇵 日漫'},
 ];
 
 const AREAS = [
@@ -69,6 +73,10 @@ const FILTERS = {
 '/p/2': FILTER_COMMON,
 '/p/66': FILTER_COMMON,
 '/p/53': FILTER_COMMON,
+'/p/66/c/67': FILTER_COMMON,
+'/p/53/c/54': FILTER_COMMON,
+'/p/3/c/82': FILTER_COMMON,
+'/p/4/c/86': FILTER_COMMON,
 };
 
 function headers(referer) {
