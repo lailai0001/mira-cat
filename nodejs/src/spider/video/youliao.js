@@ -14,18 +14,78 @@ const AES_IV = Buffer.from('515cd1587d7cfbdd', 'utf8');
 const CHANNEL = '1031';
 const UA = 'Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
 const ORIGIN = 'https://0zq6w.shddlcd.cn';
+const REMOTE_DOMAINS_URL = 'https://raw.githubusercontent.com/lailai0001/mira-cat/refs/heads/main/nodejs/src/spider/video/youliao-domains.json';
 const INIT_HOSTS = [
+  // 新基础设施 (38.34.0.x) - 2026-10-15 可用
   'https://xginit.ylapi3321.com/api',
+  'https://h5init.ylapi3321.com/api',
+  'https://init.ylapi3321.com/api',
+  'https://web.ylapi3321.com/api',
   'https://xginit.ylapi1688.com/api',
-  'https://web.al.ctqhnw.com/api',
+  'https://h5init.ylapi1688.com/api',
+  'https://init.ylapi1688.com/api',
+  'https://web.ylapi1688.com/api',
+  // ctqhnw 系
+  'https://xginit.al.ctqhnw.com/api',
+  'https://xginit.qn.ctqhnw.com/api',
+  'https://h5init.al.ctqhnw.com/api',
+  'https://h5init.qn.ctqhnw.com/api',
+  'https://init.al.ctqhnw.com/api',
   'https://init.qn.ctqhnw.com/api',
+  'https://web.al.ctqhnw.com/api',
+  'https://web.qn.ctqhnw.com/api',
+  'https://api.al.ctqhnw.com/api',
+  'https://api.qn.ctqhnw.com/api',
+  // nwglda 系
+  'https://xginit.al.nwglda.com/api',
+  'https://xginit.qn.nwglda.com/api',
+  'https://h5init.al.nwglda.com/api',
+  'https://h5init.qn.nwglda.com/api',
+  'https://init.al.nwglda.com/api',
   'https://init.qn.nwglda.com/api',
+  'https://web.al.nwglda.com/api',
+  'https://web.qn.nwglda.com/api',
+  'https://api.al.nwglda.com/api',
+  'https://api.qn.nwglda.com/api',
+  // pnwkult 系
+  'https://xginit.al.pnwkult.com/api',
+  'https://xginit.qn.pnwkult.com/api',
+  'https://h5init.al.pnwkult.com/api',
   'https://h5init.qn.pnwkult.com/api',
   'https://init.al.pnwkult.com/api',
-  'https://init.youliao88.com/api',
-  'https://h5init.m.nbajkbq.com/api',
+  'https://init.qn.pnwkult.com/api',
+  'https://web.al.pnwkult.com/api',
+  'https://web.qn.pnwkult.com/api',
+  'https://api.al.pnwkult.com/api',
+  'https://api.qn.pnwkult.com/api',
+  // nbajkbq 系
+  'https://xginit.qn.nbajkbq.com/api',
+  'https://xginit.m.nbajkbq.com/api',
   'https://h5init.qn.nbajkbq.com/api',
-  'https://h5init.al.pnwkult.com/api',
+  'https://h5init.m.nbajkbq.com/api',
+  'https://init.qn.nbajkbq.com/api',
+  'https://init.m.nbajkbq.com/api',
+  'https://web.qn.nbajkbq.com/api',
+  'https://web.m.nbajkbq.com/api',
+  'https://api.qn.nbajkbq.com/api',
+  'https://api.m.nbajkbq.com/api',
+  // youliao88 系
+  'https://xginit.al.youliao88.com/api',
+  'https://xginit.qn.youliao88.com/api',
+  'https://xginit.m.youliao88.com/api',
+  'https://h5init.al.youliao88.com/api',
+  'https://h5init.qn.youliao88.com/api',
+  'https://h5init.m.youliao88.com/api',
+  'https://init.youliao88.com/api',
+  'https://init.al.youliao88.com/api',
+  'https://init.qn.youliao88.com/api',
+  'https://init.m.youliao88.com/api',
+  'https://web.al.youliao88.com/api',
+  'https://web.qn.youliao88.com/api',
+  'https://web.m.youliao88.com/api',
+  'https://api.al.youliao88.com/api',
+  'https://api.qn.youliao88.com/api',
+  'https://api.m.youliao88.com/api',
 ];
 const PLAIN_IMG_HOST = 'qgjs.m.nzwkzj.com';
 const NEW = 'n_new', REC = 'n_rec', LIB = 'n_lib';
@@ -98,11 +158,38 @@ async function apiPost(base, path, data, auth = true, timeoutMs = 20000, retries
   return dec(txt);
 }
 
+async function getRemoteHosts() {
+  try {
+    let txt = '';
+    try {
+      const r = await req.get(REMOTE_DOMAINS_URL, { timeout: 10000, responseType: 'text' });
+      if (r.status === 200) txt = t(r.data);
+    } catch { /* try fetch */ }
+    if (!txt && typeof fetch !== 'undefined') {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 12000);
+        const r = await fetch(REMOTE_DOMAINS_URL, { signal: ctrl.signal });
+        clearTimeout(timer);
+        if (r.ok) txt = t(await r.text());
+      } catch { /* ignore */ }
+    }
+    if (txt) {
+      const j = JSON.parse(txt);
+      if (Array.isArray(j.hosts) && j.hosts.length) return j.hosts.filter(h => typeof h === 'string' && h.startsWith('http'));
+    }
+  } catch { /* ignore */ }
+  return [];
+}
+
 async function bootOnce() {
   if (S.api) return true;
-  for (const host of INIT_HOSTS) {
+  // 优先用远程配置的域名列表 (仓库里的 youliao-domains.json, 可随时更新无需重建)
+  const remoteHosts = await getRemoteHosts();
+  const hosts = remoteHosts.length ? [...new Set([...remoteHosts, ...INIT_HOSTS])] : INIT_HOSTS;
+  for (const host of hosts) {
     try {
-      const r = await apiPost(host, '/player/do_init_h5', { system: '3', channel: CHANNEL, new_live: '1' }, false, 12000, 1);
+      const r = await apiPost(host, '/player/do_init_h5', { system: '3', channel: CHANNEL, new_live: '1' }, false, 8000, 1);
       const d = (r && r.data) || null;
       if (d && typeof d === 'object' && d.api_url) {
         S.api = String(d.api_url).replace(/\/$/, '') + '/api';
@@ -122,7 +209,7 @@ async function boot() {
   try {
     const ok = await Promise.race([
       bootOnce(),
-      new Promise((resolve) => setTimeout(() => resolve(false), 60000)),
+      new Promise((resolve) => setTimeout(() => resolve(false), 90000)),
     ]);
     return !!ok;
   } catch { return false; }
