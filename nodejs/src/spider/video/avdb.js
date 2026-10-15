@@ -105,7 +105,7 @@ async function detail(reqIn) {
 // MiraPlayer 解析异常导致无法快进/后退。Worker 抓取后去掉该标签再返回。
 // 用户在 Cloudflare 部署 avdb-m3u8-clean-worker.js 后，把实际地址填入下面;
 // 为空时自动回退直连（保持原行为，不会断播）。
-const M3U8_PROXY = 'https://avdb-m3u8.li768435813.workers.dev';
+const M3U8_PROXY = '';
 
 async function play(reqIn) {
   const body = reqIn?.body || {};
