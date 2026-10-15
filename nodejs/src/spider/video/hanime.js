@@ -26,18 +26,27 @@ function isChallenge(html) {
 }
 
 // 单次请求：先框架 req（App 内走原生网络栈），失败再降级原生 fetch
+// 移动端 + VPN 较慢，超时放宽到 30 秒，每个通道重试 1 次
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
 async function reqOnce(url) {
-  try {
-    const { data } = await req.get(url, { headers: headers(), timeout: 15000 });
-    const t = String(data || '');
-    if (t && t.length > 5000 && !isChallenge(t)) return t;
-  } catch (e) { /* fallthrough */ }
-  if (typeof fetch !== 'undefined') {
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const r = await fetch(url, { headers: headers() });
-      const t = await r.text();
+      const { data } = await req.get(url, { headers: headers(), timeout: 30000 });
+      const t = String(data || '');
       if (t && t.length > 5000 && !isChallenge(t)) return t;
-    } catch (e) { /* fallthrough */ }
+    } catch (e) { /* fallthrough to retry/fetch */ }
+    if (typeof fetch !== 'undefined') {
+      try {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 30000);
+        const r = await fetch(url, { headers: headers(), signal: ctl.signal });
+        clearTimeout(timer);
+        const t = await r.text();
+        if (t && t.length > 5000 && !isChallenge(t)) return t;
+      } catch (e) { /* fallthrough */ }
+    }
+    if (attempt === 0) await sleep(1500);
   }
   return '';
 }
