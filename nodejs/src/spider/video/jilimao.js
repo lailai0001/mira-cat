@@ -1,7 +1,8 @@
 // 吉利猫 - CatPawOpen JS Spider (全新重写)
 // 站点: https://jlm100.cc (原 jlm7.cc 已迁走)
 // 结构: 苹果CMS, /index.php/vod/type/id/{id}/page/{pg}.html
-// 注意: 本站屏蔽 axios, 使用 Node 原生 fetch
+// 请求: 双通道 — 先框架 req(axios, MiraPlayer 内核可用)，失败再试 Node 原生 fetch
+import req from '../../util/req.js';
 
 const KEY = 'py_jilimao';
 const NAME = '吉利猫';
@@ -44,19 +45,25 @@ function absUrl(u) {
 }
 
 async function getText(url, retries = 2) {
+  const headers = {
+    'User-Agent': UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Referer': HOST + '/',
+  };
   for (let i = 0; i < retries; i++) {
+    // 通道1: 框架 req (axios) — MiraPlayer 内核可用
     try {
+      const { data, status } = await req.get(url, { headers, timeout: 20000, responseType: 'text' });
+      const t = String(data || '');
+      if (status === 200 && t.length > 1000) return t;
+    } catch { /* 换通道2 */ }
+    // 通道2: Node 原生 fetch
+    try {
+      if (typeof fetch === 'undefined') continue;
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 30000);
-      const r = await fetch(url, {
-        signal: ctrl.signal,
-        headers: {
-          'User-Agent': UA,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'zh-CN,zh;q=0.9',
-          'Referer': HOST + '/',
-        },
-      });
+      const timer = setTimeout(() => ctrl.abort(), 25000);
+      const r = await fetch(url, { signal: ctrl.signal, headers });
       clearTimeout(timer);
       if (!r.ok) continue;
       const t = await r.text();
