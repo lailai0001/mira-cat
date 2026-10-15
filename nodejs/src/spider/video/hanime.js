@@ -10,6 +10,21 @@ const HOST = 'https://hanime1.me';
 // 官方 App 指定的主备域名（ghostcoder42/hanime1）：hanimeone.me 为主，hanime1.me 为备
 const HOSTS = ['https://hanime1.me', 'https://hanimeone.me'];
 let ACTIVE_HOST = HOSTS[0];
+
+// ===== 正向代理（方案B）=====
+// 手机直连 hanime 站会被 Cloudflare 拦截，改走用户自建的 Worker 中转：
+// 手机只连自己的 *.workers.dev 域名（不被拦），Worker 在 Cloudflare 网络内抓取目标站再转发。
+// 部署 Worker 后把下面换成实际地址（部署时的 worker 名称 + 你的 workers.dev 子域名）。
+const PROXY = 'https://hanime-proxy.li768435813.workers.dev';
+function proxify(url) {
+  return `${PROXY}/?url=${encodeURIComponent(url)}`;
+}
+// 封面图也走代理：App 直接拉图床同样可能被拦
+function proxyPic(url) {
+  if (!url || !/^https?:\/\//i.test(url)) return url || '';
+  return proxify(url);
+}
+// ===== 正向代理结束 =====
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Mobile/15E148 Safari/604.1';
 
 function headers() {
@@ -62,11 +77,19 @@ function hostCandidates(url) {
 
 async function getHtml(url) {
   for (const u of hostCandidates(url)) {
-    const t = await reqOnce(u);
+    // 先走代理：手机只连自己的 worker 域名，不会被 Cloudflare 拦
+    const t = await reqOnce(proxify(u));
     if (t) {
       const m = String(u).match(/^https?:\/\/[^/]+/);
-      if (m) ACTIVE_HOST = m[0];
+      if (m) ACTIVE_HOST = m[0]; // 注意：取目标站域名，不是代理域名
       return t;
+    }
+    // 代理失败再直连兜底（代理挂了时仍有机会）
+    const t2 = await reqOnce(u);
+    if (t2) {
+      const m = String(u).match(/^https?:\/\/[^/]+/);
+      if (m) ACTIVE_HOST = m[0];
+      return t2;
     }
   }
   return '';
@@ -182,7 +205,7 @@ function parseCards($, rootSel) {
       cards.push({
         vod_id: finalHref,
         vod_name: title,
-        vod_pic: cover || '',
+        vod_pic: proxyPic(cover),
         vod_remarks: remarks.join(' · '),
         vod_duration: duration,
         ext: { url: finalHref, duration, subtitle: stats.subtitle, stats },
@@ -202,7 +225,7 @@ function parseCards($, rootSel) {
       cards.push({
         vod_id: finalHref,
         vod_name: title,
-        vod_pic: cover || '',
+        vod_pic: proxyPic(cover),
         vod_remarks: '',
         ext: { url: finalHref },
       });
@@ -320,7 +343,7 @@ async function searchCards(text, page = 1) {
     cards.push({
       vod_id: finalHref,
       vod_name: title,
-      vod_pic: cover || '',
+      vod_pic: proxyPic(cover),
       vod_remarks: remarks.join(' · '),
       vod_duration: duration,
       ext: { url: finalHref, duration, subtitle, stats },
@@ -400,7 +423,7 @@ async function detail(reqIn) {
       {
         vod_id: vid,
         vod_name: name,
-        vod_pic: pic,
+        vod_pic: proxyPic(pic),
         vod_remarks: '',
         vod_content: content,
         vod_play_from: NAME,
