@@ -4,7 +4,7 @@
 // 播放: 播放页 const source / m3u8 / mp4 直出, 否则嗅探
 const KEY = 'py_jilimao';
 const NAME = '吉利猫';
-const HOST = 'https://jlm7.cc';
+const HOST = 'https://jlm100.cc';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const FALLBACK_CATS = [
