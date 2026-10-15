@@ -125,6 +125,9 @@ async function home() {
       { type_id: 'xiaoshuo', type_name: '成人小说' },
       { type_id: 'paihang', type_name: '热播榜' },
       { type_id: 'biaoqian', type_name: '标签榜' },
+      { type_id: 'biaoqian/ntr', type_name: 'NTR' },
+      { type_id: 'biaoqian/fancha', type_name: '反差' },
+      { type_id: 'biaoqian/cabian', type_name: '擦边' },
     ],
     filters: {},
   };
