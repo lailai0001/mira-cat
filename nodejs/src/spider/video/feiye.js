@@ -1,165 +1,185 @@
 import req from '../../util/req.js';
 
+// 绯夜 (py_feiye) — 全新重写版
+// 站点: https://feiyechengren.pages.dev/ (AppleCMS JSON API)
+// 三线路: /api/ /api2/ /api3/
+
 const KEY = 'py_feiye';
 const NAME = '绯夜';
-const HOST = 'https://feiyechengren.pages.dev';
-const APIS = ['/api/', '/api2/', '/api3/'];
-const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1';
+const BASES = [
+  'https://feiyechengren.pages.dev/api/',
+  'https://feiyechengren.pages.dev/api2/',
+  'https://feiyechengren.pages.dev/api3/',
+];
+const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1';
 
-// 双通道：先框架 req，失败再原生 fetch（MiraPlayer 内无 fetch）
-async function getText(url) {
-  const headers = { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': HOST + '/' };
-  try {
-    const { data } = await req.get(url, { headers, timeout: 20000 });
-    const t = String(data || '');
-    if (t.length > 100) return t;
-  } catch (e) { /* fallback */ }
-  try {
-    if (typeof fetch === 'undefined') return '';
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 25000);
-    const r = await fetch(url, { headers, signal: ctrl.signal });
-    clearTimeout(timer);
-    if (!r.ok) return '';
-    const t = await r.text();
-    return t.length > 100 ? t : '';
-  } catch (e) { return ''; }
+// 站点真实分类 (2026-10-15 从 videolist 实测收集)
+const CATS = [
+  { type_id: '20', type_name: '精品推荐' },
+  { type_id: '22', type_name: '主播秀色' },
+  { type_id: '23', type_name: '日本有码' },
+  { type_id: '24', type_name: '日本无码' },
+  { type_id: '25', type_name: '中文字幕' },
+  { type_id: '26', type_name: '童颜巨乳' },
+  { type_id: '27', type_name: '性感人妻' },
+  { type_id: '28', type_name: '强奸乱伦' },
+  { type_id: '33', type_name: '丝袜OL' },
+  { type_id: '35', type_name: '自拍偷拍' },
+  { type_id: '36', type_name: '日本片商' },
+  { type_id: '56', type_name: '网曝系列' },
+  { type_id: '57', type_name: '麻豆传媒' },
+  { type_id: '61', type_name: '国产乱伦' },
+  { type_id: '62', type_name: '国产丝袜' },
+  { type_id: '63', type_name: '国产SM' },
+  { type_id: '65', type_name: '探花嫖娼' },
+];
+
+function t(v) {
+  return String(v == null ? '' : v).trim();
 }
 
-async function fetchJson(params) {
-  const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
-  }
-  const q = qs.toString();
-  for (const base of APIS) {
-    const t = await getText(HOST + base + '?' + q);
-    if (t) {
-      try {
-        const j = JSON.parse(t);
-        if (j && j.code === 1) return j;
-      } catch (e) { /* try next line */ }
-    }
+// 双通道请求: 先框架 req (MiraPlayer 内核可用), 失败再原生 fetch
+async function getJson(params) {
+  const qs = Object.entries(params)
+    .filter(([, v]) => v != null && v !== '')
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join('&');
+  const headers = {
+    'User-Agent': UA,
+    'Accept': 'application/json',
+    'Referer': 'https://feiyechengren.pages.dev/',
+  };
+  for (const base of BASES) {
+    const url = base + '?' + qs;
+    // 通道1: 框架 req
+    try {
+      const { data, status } = await req.get(url, { headers, timeout: 25000 });
+      const d = typeof data === 'string' ? JSON.parse(data) : data;
+      if (status === 200 && d && d.code === 1) return d;
+    } catch { /* 换通道2 */ }
+    // 通道2: 原生 fetch
+    try {
+      if (typeof fetch === 'undefined') continue;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 25000);
+      const r = await fetch(url, { signal: ctrl.signal, headers });
+      clearTimeout(timer);
+      if (!r.ok) continue;
+      const d = await r.json();
+      if (d && d.code === 1) return d;
+    } catch { /* 换下一线路 */ }
   }
   return null;
 }
 
-function normItem(v) {
+function parseVod(v) {
   if (!v) return null;
-  const id = String(v.vod_id ?? v.id ?? '');
+  const id = t(v.vod_id);
   if (!id) return null;
   return {
     vod_id: id,
-    vod_name: v.vod_name || v.name || '',
-    vod_pic: v.vod_pic || v.pic || '',
-    vod_remarks: v.vod_remarks || v.vod_class || v.vod_time || '',
+    vod_name: t(v.vod_name) || '未命名',
+    vod_pic: t(v.vod_pic),
+    vod_remarks: t(v.vod_remarks || v.vod_time || ''),
+    type_name: t(v.type_name),
   };
 }
 
-function itemsOf(d) {
+function parseList(d) {
   const list = [];
-  if (d && Array.isArray(d.list)) {
-    for (const v of d.list) {
-      const it = normItem(v);
-      if (it) list.push(it);
-    }
+  if (!d) return list;
+  const arr = Array.isArray(d.list) ? d.list : [];
+  for (const v of arr) {
+    const item = parseVod(v);
+    if (item) list.push(item);
   }
   return list;
 }
 
-// 分类从 videolist 的 type_id/type_name 动态收集（站点没有单独的分类接口）
-// 扫前 5 页，最多收集 14 个（与官网前端 hotCats 一致）
-async function home() {
-  const list = [{ type_id: '', type_name: '全部' }];
-  const seen = new Set();
-  for (let pg = 1; pg <= 5; pg++) {
-    const d = await fetchJson({ ac: 'videolist', pg });
-    if (!d || !Array.isArray(d.list) || !d.list.length) break;
-    for (const v of d.list) {
-      const tid = String(v.type_id || '');
-      const tname = v.type_name || '';
-      if (tid && tname && !seen.has(tid)) {
-        seen.add(tid);
-        list.push({ type_id: tid, type_name: tname });
-      }
-      if (list.length >= 15) break;
-    }
-    if (list.length >= 15) break;
-  }
-  return { class: list };
+async function init(reqIn) {
+  return {};
 }
 
-async function homeVod() {
-  const d = await fetchJson({ ac: 'videolist', pg: 1 });
-  return { list: itemsOf(d) };
+async function home(reqIn) {
+  const cls = [{ type_id: '', type_name: '全部' }];
+  for (const c of CATS) cls.push({ type_id: c.type_id, type_name: c.type_name });
+  return { class: cls, list: [] };
 }
 
 async function category(reqIn) {
   const body = reqIn?.body || {};
+  const tid = t(body.tid);
   const page = Math.max(1, parseInt(body.page, 10) || 1);
-  const tid = String(body.id || '');
   const params = { ac: 'videolist', pg: page };
   if (tid) params.t = tid;
-  const d = await fetchJson(params);
-  const list = itemsOf(d);
-  const pagecount = parseInt((d && d.pagecount) || page, 10) || page;
-  return { page, pagecount, limit: 30, total: pagecount * 30, list };
+  const d = await getJson(params);
+  const list = parseList(d);
+  const pagecount = d ? Math.max(1, parseInt(d.pagecount, 10) || 1) : 1;
+  const total = d ? parseInt(d.total, 10) || 0 : 0;
+  const limit = d ? parseInt(d.limit, 10) || 10 : 10;
+  return { page, pagecount, limit, total, list };
 }
 
 async function detail(reqIn) {
   const body = reqIn?.body || {};
-  const ids = Array.isArray(body.id) ? body.id : [body.id];
-  const vid = String(ids[0] || '').trim();
-  if (!vid) return { list: [] };
-  const d = await fetchJson({ ac: 'detail', ids: vid });
-  const items = (d && Array.isArray(d.list) ? d.list : []);
-  const v = items[0];
-  if (!v) return { list: [] };
-  return {
-    list: [{
-      vod_id: String(v.vod_id ?? vid),
-      vod_name: v.vod_name || vid,
-      vod_pic: v.vod_pic || '',
-      vod_remarks: v.vod_remarks || v.vod_class || '',
-      vod_content: (v.vod_content || v.vod_blurb || '').replace(/<[^>]*>/g, ' ').trim(),
-      vod_play_from: v.vod_play_from || NAME,
-      vod_play_url: v.vod_play_url || '',
-    }],
-  };
+  const id = t(body.id);
+  if (!id) return { list: [] };
+  const d = await getJson({ ac: 'detail', ids: id });
+  const list = [];
+  if (d && Array.isArray(d.list)) {
+    for (const v of d.list) {
+      const item = parseVod(v);
+      if (!item) continue;
+      item.vod_content = t(v.vod_content || v.vod_blurb || '');
+      item.vod_actor = t(v.vod_actor);
+      item.vod_director = t(v.vod_director);
+      item.vod_year = t(v.vod_year || (v.vod_time || '').slice(0, 4));
+      item.vod_area = t(v.vod_area);
+      const playUrl = t(v.vod_play_url);
+      // AppleCMS 格式: 第1集$https://...m3u8#第2集$https://...
+      item.vod_play_from = t(v.vod_play_from) || '绯夜';
+      item.vod_play_url = playUrl;
+      list.push(item);
+    }
+  }
+  return { list };
 }
 
 async function play(reqIn) {
   const body = reqIn?.body || {};
-  const id = String(body.id || '').trim();
-  let url = id;
-  const dollar = id.lastIndexOf('$');
-  if (dollar >= 0) url = id.slice(dollar + 1).trim();
-  if (!url) return { parse: 1, url: id, header: { 'User-Agent': UA } };
-  return {
-    parse: 0,
-    url,
-    header: { 'User-Agent': UA, 'Referer': HOST + '/' },
-  };
+  let id = t(body.id);
+  if (!id) return { parse: 0, url: '' };
+  // id 可能是 "第1集$https://...m3u8" 形式, 取 $ 后面的直链
+  if (id.includes('$')) id = id.split('$').pop().trim();
+  if (/^https?:\/\//i.test(id)) {
+    return {
+      parse: 0,
+      url: id,
+      header: { Referer: 'https://feiyechengren.pages.dev/', 'User-Agent': UA },
+    };
+  }
+  return { parse: 0, url: id };
 }
 
 async function search(reqIn) {
   const body = reqIn?.body || {};
+  const wd = t(body.wd);
   const page = Math.max(1, parseInt(body.page, 10) || 1);
-  const wd = String(body.wd || '').trim();
-  if (!wd) return { page, pagecount: page, limit: 0, total: 0, list: [] };
-  const d = await fetchJson({ ac: 'videolist', pg: page, wd });
-  const list = itemsOf(d);
-  const pagecount = parseInt((d && d.pagecount) || page, 10) || page;
-  return { page, pagecount, limit: 30, total: pagecount * 30, list };
+  if (!wd) return { page, pagecount: page, limit: 10, total: 0, list: [] };
+  const d = await getJson({ ac: 'videolist', wd, pg: page });
+  const list = parseList(d);
+  const pagecount = d ? Math.max(1, parseInt(d.pagecount, 10) || 1) : 1;
+  const total = d ? parseInt(d.total, 10) || 0 : 0;
+  const limit = d ? parseInt(d.limit, 10) || 10 : 10;
+  return { page, pagecount, limit, total, list };
 }
 
-export default function spider() {
+export default function createSpider() {
   return {
     meta: { key: KEY, name: NAME, type: 3 },
     api: async (fastify) => {
-      fastify.post('/init', async () => ({}));
+      fastify.post('/init', init);
       fastify.post('/home', home);
-      fastify.post('/homeVod', homeVod);
       fastify.post('/category', category);
       fastify.post('/detail', detail);
       fastify.post('/play', play);
