@@ -39,6 +39,7 @@ import pingguo from './spider/video/pingguo.js';
 import woxiu from './spider/video/woxiu.js';
 import yunvxj from './spider/video/yunvxj.js';
 import youliao from './spider/video/youliao.js';
+import jable from './spider/video/jable.js';
 
 const spiders = [
     missav_xptv,
@@ -82,6 +83,7 @@ const spiders = [
     woxiu,
     yunvxj,
     youliao,
+    jable,
 ];
 const spiderPrefix = '/spider'; // API 路由前缀
 
