@@ -7,23 +7,64 @@ import * as cheerio from 'cheerio';
 const KEY = 'py_hanime';
 const NAME = 'Hanime';
 const HOST = 'https://hanime1.me';
+// 官方 App 指定的主备域名（ghostcoder42/hanime1）：hanimeone.me 为主，hanime1.me 为备
+const HOSTS = ['https://hanime1.me', 'https://hanimeone.me'];
+let ACTIVE_HOST = HOSTS[0];
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Mobile/15E148 Safari/604.1';
 
 function headers() {
-  return { 'User-Agent': UA, Referer: HOST + '/' };
+  return {
+    'User-Agent': UA,
+    Referer: ACTIVE_HOST + '/',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
+  };
+}
+
+function isChallenge(html) {
+  return /Just a moment|cf-challenge|challenge-platform|Attention Required|cf_clearance/i.test(html);
+}
+
+// 单次请求：先框架 req（App 内走原生网络栈），失败再降级原生 fetch
+async function reqOnce(url) {
+  try {
+    const { data } = await req.get(url, { headers: headers(), timeout: 15000 });
+    const t = String(data || '');
+    if (t && t.length > 5000 && !isChallenge(t)) return t;
+  } catch (e) { /* fallthrough */ }
+  if (typeof fetch !== 'undefined') {
+    try {
+      const r = await fetch(url, { headers: headers() });
+      const t = await r.text();
+      if (t && t.length > 5000 && !isChallenge(t)) return t;
+    } catch (e) { /* fallthrough */ }
+  }
+  return '';
+}
+
+function hostCandidates(url) {
+  const out = [url];
+  for (const h of HOSTS) {
+    const swapped = String(url).replace(/^https?:\/\/[^/]+/, h);
+    if (!out.includes(swapped)) out.push(swapped);
+  }
+  return out;
 }
 
 async function getHtml(url) {
-  try {
-    const { data } = await req.get(url, { headers: headers(), timeout: 15000 });
-    return String(data || '');
-  } catch (e) {
-    return '';
+  for (const u of hostCandidates(url)) {
+    const t = await reqOnce(u);
+    if (t) {
+      const m = String(u).match(/^https?:\/\/[^/]+/);
+      if (m) ACTIVE_HOST = m[0];
+      return t;
+    }
   }
+  return '';
 }
 
 // 注意: 站点有 Cloudflare("Just a moment...") 检查，XPTV 原版通过 $utils.openSafari 处理，
-// CatPawOpen 环境下无此能力，若返回挑战页则列表/详情会为空。
+// CatPawOpen 环境下无此能力；此处做挑战页识别 + 主备域名轮询，尽代码侧最大努力。
 
 // ---------- getTabs（XPTV 原逻辑） ----------
 async function getTabs() {
@@ -47,7 +88,7 @@ async function getTabs() {
     }
     // XPTV 原版 tab 的 ext 只有 url（无 id），此处直接以 url 作为 type_id；
     // 过滤掉指向站外的推广 tab（如 erodalabs 广告），分类请求只能走本站
-    const abs = href.startsWith('http') ? href : `https://hanime1.me${href}`;
+    const abs = href.startsWith('http') ? href : `${ACTIVE_HOST}${href}`;
     if (!isInnerDomain(abs)) return;
     list.push({ name, ui, ext: { url: encodeURI(abs) } });
   });
@@ -61,7 +102,7 @@ function absUrl(u) {
   if (!u) return '';
   if (/^https?:\/\//i.test(u)) return u;
   if (u.startsWith('//')) return 'https:' + u;
-  if (u.startsWith('/')) return `https://hanime1.me${u}`;
+  if (u.startsWith('/')) return `${ACTIVE_HOST}${u}`;
   return u;
 }
 
@@ -69,8 +110,11 @@ function isInnerDomain(href) {
   if (href && href.includes('://')) {
     const m = href.match(/https?:\/\/([^/]+)/);
     if (m) {
-      const domain = m[1];
-      if (domain !== 'hanime1.me' && !domain.endsWith('.hanime1.me')) return false;
+      const domain = m[1].toLowerCase();
+      const ok = ['hanime1.me', 'hanimeone.me'].some(
+        (d) => domain === d || domain.endsWith('.' + d)
+      );
+      if (!ok) return false;
     }
   }
   return true;
@@ -218,7 +262,7 @@ async function getPlayinfo(ext) {
 // ---------- search（XPTV 原逻辑） ----------
 async function searchCards(text, page = 1) {
   const kw = encodeURIComponent(text);
-  const url = `${HOST}/search?query=${kw}&broad=on&page=${page}`;
+  const url = `${ACTIVE_HOST}/search?query=${kw}&broad=on&page=${page}`;
   const html = await getHtml(url);
   if (!html) return [];
   const $ = cheerio.load(html);
