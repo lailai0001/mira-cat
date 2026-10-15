@@ -9,6 +9,10 @@ import req from '../../util/req.js';
 const KEY = 'py_jable';
 const NAME = 'Jable';
 const HOST = 'https://jable.tv';
+// 正向代理（Cloudflare Worker）：手机直连 jable.tv 会被 CF 拦截，走代理绕过
+// 用户需把 hanime-proxy Worker 更新为 v2（白名单含 jable.tv）后才生效；
+// 未部署时自动回退直连。
+const PROXY = 'https://hanime-proxy.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
 
 // 兜底分类(站点实测 12 个主题 + 3 个专区)
@@ -40,6 +44,11 @@ function absUrl(u) {
   return HOST + (u.startsWith('/') ? u : '/' + u);
 }
 
+function proxify(url) {
+  if (!PROXY) return url;
+  return PROXY + '/?url=' + encodeURIComponent(url);
+}
+
 async function getText(url, referer, retries = 2) {
   const headers = {
     'User-Agent': UA,
@@ -47,24 +56,28 @@ async function getText(url, referer, retries = 2) {
     'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.6',
     'Referer': referer || HOST + '/',
   };
-  for (let i = 0; i < retries; i++) {
-    // 通道1: 框架 req (axios)
-    try {
-      const { data, status } = await req.get(url, { headers, timeout: 20000, responseType: 'text' });
-      const s = t(data);
-      if (status === 200 && s.length > 1000) return s;
-    } catch { /* 换通道2 */ }
-    // 通道2: Node 原生 fetch
-    try {
-      if (typeof fetch === 'undefined') continue;
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 25000);
-      const r = await fetch(url, { signal: ctrl.signal, headers });
-      clearTimeout(timer);
-      if (!r.ok) continue;
-      const s = t(await r.text());
-      if (s.length > 1000) return s;
-    } catch { /* retry */ }
+  // 候选 URL：先走代理（手机直连被 CF 拦时用），再直连兜底
+  const urls = PROXY ? [proxify(url), url] : [url];
+  for (const u of urls) {
+    for (let i = 0; i < retries; i++) {
+      // 通道1: 框架 req (axios)
+      try {
+        const { data, status } = await req.get(u, { headers, timeout: 25000, responseType: 'text' });
+        const s = t(data);
+        if (status === 200 && s.length > 1000) return s;
+      } catch { /* 换通道2 */ }
+      // 通道2: Node 原生 fetch
+      try {
+        if (typeof fetch === 'undefined') continue;
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 30000);
+        const r = await fetch(u, { signal: ctrl.signal, headers });
+        clearTimeout(timer);
+        if (!r.ok) continue;
+        const s = t(await r.text());
+        if (s.length > 1000) return s;
+      } catch { /* retry */ }
+    }
   }
   return '';
 }
