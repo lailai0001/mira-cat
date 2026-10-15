@@ -35,6 +35,7 @@ import qiezi from './spider/video/qiezi.js';
 import xnxx from './spider/video/xnxx.js';
 import uu from './spider/video/uu.js';
 import sanjipian from './spider/video/sanjipian.js';
+import pingguo from './spider/video/pingguo.js';
 
 const spiders = [
     missav_xptv,
@@ -74,6 +75,7 @@ const spiders = [
     xnxx,
     uu,
     sanjipian,
+    pingguo,
 ];
 const spiderPrefix = '/spider'; // API 路由前缀
 
