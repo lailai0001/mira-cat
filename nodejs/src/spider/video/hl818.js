@@ -6,6 +6,16 @@ const KEY = 'py_818hl';
 const NAME = '818黑料网';
 const HOST = 'https://cell.lacdfsq.cc/';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+// 封面为 AES-128-CBC 加密存储（key f5d965df75336270 / iv 97b60394abc2fbe1），走解密代理出图
+const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
+
+function proxyCover(url) {
+  url = String(url || '').trim();
+  if (!url) return '';
+  if (url.indexOf('data:') === 0) return url;
+  if (url.indexOf('bagua-img-proxy') >= 0) return url;
+  return IMG_PROXY + encodeURIComponent(url);
+}
 
 function H() {
   return {
@@ -65,7 +75,7 @@ function parseArticles(html) {
     items.push({
       vod_id: href,
       vod_name: title,
-      vod_pic: imgOf(blk),
+      vod_pic: proxyCover(imgOf(blk)),
       vod_remarks: tm ? tm[1].trim() : '',
     });
     if (items.length >= 30) break;
