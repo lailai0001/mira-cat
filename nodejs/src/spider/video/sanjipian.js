@@ -103,22 +103,40 @@ return String(s || '')
 .replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 }
 
-async function fetchText(targetUrl, referer = '', checkHost = true, timeout = 5000) {
+async function fetchText(targetUrl, referer = '', checkHost = true, timeout = 20000) {
 if (!targetUrl) return { code: 0, text: ''};
 if (targetUrl.startsWith('//')) targetUrl = 'https:' + targetUrl;
 else if (targetUrl.startsWith('/')) targetUrl = siteUrl + targetUrl;
+const h = headers(referer);
+for (let attempt = 0; attempt < 3; attempt++) {
+// 通道1: 框架 req (axios) — MiraPlayer 内核可用
 try {
-const { data} = await req.get(targetUrl, { headers: headers(referer), timeout});
-return { code: 200, text: String(data || '')};
+const { data, status} = await req.get(targetUrl, { headers: h, timeout, responseType: 'text'});
+const t = String(data || '');
+if (status === 200 && t.length > 1000) return { code: 200, text: t};
 } catch (e) {
 const code = e?.response?.status || -1;
 if ([404, 451, 502, 503].includes(code) && checkHost) {
 if (await refreshSiteUrl()) {
 return fetchText(targetUrl, referer, false, timeout);
 }
-}
 return { code, text: ''};
 }
+}
+// 通道2: Node 原生 fetch (App 内无原生 fetch 时自动跳过)
+try {
+if (typeof fetch === 'undefined') continue;
+const ctrl = new AbortController();
+const timer = setTimeout(() => ctrl.abort(), timeout + 5000);
+const r = await fetch(targetUrl, { signal: ctrl.signal, headers: h});
+clearTimeout(timer);
+if (r.ok) {
+const t = await r.text();
+if (t && t.length > 1000) return { code: 200, text: t};
+}
+} catch (e) {}
+}
+return { code: -1, text: ''};
 }
 
 // 动态自愈: 从导航站解码最新可用域名
@@ -248,7 +266,7 @@ if (extend.year) queryParts.push('year=' + encodeURIComponent(extend.year));
 if (page > 1) queryParts.push('page=' + page);
 if (queryParts.length) reqPath += (reqPath.includes('?')? '&': '?') + queryParts.join('&');
 
-const res = await fetchText(reqPath, '', true, 4000);
+const res = await fetchText(reqPath, '', true);
 const list = parseCardList(res.text);
 return {
 page,
@@ -264,7 +282,7 @@ const ids = Array.isArray(reqIn?.body?.id)? reqIn.body.id: [reqIn?.body?.id];
 const targetPath = String(ids[0] || '').trim();
 if (!targetPath) return { list: []};
 
-const res = await fetchText(targetPath, '', true, 4000);
+const res = await fetchText(targetPath, '', true);
 const htmlText = res.text || '';
 
 const titleM = htmlText.match(/<title>(.*?)<\/title>/i);
@@ -319,7 +337,7 @@ const body = reqIn?.body || {};
 let playUrl = String(body.id || '').trim();
 
 if (playUrl &&!/^https?:\/\//i.test(playUrl) && (playUrl.startsWith('/v/') || playUrl.startsWith('/'))) {
-const res = await fetchText(playUrl, '', true, 4000);
+const res = await fetchText(playUrl, '', true);
 const mHls = (res.text || '').match(/https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/);
 if (mHls) playUrl = mHls[0].replace(/\\\//g, '/');
 }
@@ -344,7 +362,7 @@ if (!wd) return { page, pagecount: page, limit: 0, total: 0, list: []};
 let searchUrl = '/search?q=' + encodeURIComponent(wd);
 if (page > 1) searchUrl += '&page=' + page;
 
-const res = await fetchText(searchUrl, '', true, 4000);
+const res = await fetchText(searchUrl, '', true);
 const list = parseCardList(res.text);
 return {
 page,
