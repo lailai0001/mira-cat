@@ -2,7 +2,8 @@
 // Ported from KoreanBJ.py (HOST=https://ww1.koreanbj.club)
 // 列表: loop-video /video/slug/
 // 播放: VOE 系 embed → 六层混淆解包 → m3u8/mp4 直出
-// 注：本站屏蔽 axios，统一使用 Node 原生 fetch
+// 请求: 双通道 — 先框架 req(axios, MiraPlayer 内核可用)，失败再试 Node 原生 fetch
+import req from '../../util/req.js';
 
 const KEY = 'py_hanbj';
 const NAME = '韩国BJ';
@@ -51,12 +52,20 @@ function absUrl(u, base) {
 }
 
 async function getText(url, referer) {
-  // 注：本站会 RST axios 的 TLS 连接，改用 Node 原生 fetch
+  const hdrs = headers(referer);
+  // 通道1: 框架 req (axios) — MiraPlayer 内核可用
   try {
+    const { data, status } = await req.get(url, { headers: hdrs, timeout: 20000, responseType: 'text' });
+    const t = String(data || '');
+    if (status === 200 && t) return t;
+  } catch { /* 换通道2 */ }
+  // 通道2: Node 原生 fetch
+  try {
+    if (typeof fetch === 'undefined') return '';
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 22000);
     const r = await fetch(url, {
-      headers: headers(referer),
+      headers: hdrs,
       signal: ctrl.signal,
     });
     clearTimeout(timer);
