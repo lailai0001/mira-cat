@@ -6,9 +6,18 @@ const HOST = 'https://91crdj.com';
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const PAGE_SIZE = 20;
+// 封面为 AES-128-CBC 加密存储（与 818/八卦同一套密钥），需走用户自建解密 Worker
+const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev';
 
 function t(v) {
   return String(v == null ? '' : v).trim();
+}
+
+function proxyCover(url) {
+  const u = t(url);
+  if (!u || !u.startsWith('http')) return u;
+  // Worker 需在白名单中放行 pic.drleao.cn 才能解密出图
+  return `${IMG_PROXY}/img?url=${encodeURIComponent(u)}`;
 }
 
 function headers(referer) {
@@ -98,7 +107,7 @@ function parseList(html) {
     items.push({
       vod_id: channel + '|' + p,
       vod_name: title,
-      vod_pic: cover,
+      vod_pic: proxyCover(cover),
       vod_remarks: remarks,
     });
   }
@@ -114,6 +123,8 @@ async function home() {
       { type_id: 'shipin', type_name: '成人视频' },
       { type_id: 'manhua', type_name: '成人漫画' },
       { type_id: 'xiaoshuo', type_name: '成人小说' },
+      { type_id: 'paihang', type_name: '热播榜' },
+      { type_id: 'biaoqian', type_name: '标签榜' },
     ],
     filters: {},
   };
@@ -232,7 +243,7 @@ async function detail(reqIn) {
     list.push({
       vod_id: rawStr,
       vod_name: title,
-      vod_pic: pic,
+      vod_pic: proxyCover(pic),
       vod_content: intro,
       vod_remarks: playUrls.length ? `共${playUrls.length}集` : '',
       vod_play_from: playUrls.length ? NAME : '',
