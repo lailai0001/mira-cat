@@ -24,20 +24,31 @@ function decodeHtml(s) {
 
 async function fetchHtml(path) {
   const url = path.startsWith('http') ? path : HOST + path;
-  try {
-    const { data } = await req.get(url, {
-      headers: {
-        'User-Agent': UA,
-        'Referer': HOST + '/zh',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-      },
-      timeout: 15000,
-    });
-    return typeof data === 'string' ? data : String(data || '');
-  } catch (e) {
-    return '';
+  const headers = {
+    'User-Agent': UA,
+    'Referer': HOST + '/zh',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+  };
+  // 双通道: 通道1 框架 req (axios, MiraPlayer 内核可用); 通道2 Node 原生 fetch (站点屏蔽 axios 指纹时用)
+  for (let i = 0; i < 2; i++) {
+    try {
+      const { data, status } = await req.get(url, { headers, timeout: 20000, responseType: 'text' });
+      const t = typeof data === 'string' ? data : String(data || '');
+      if (status === 200 && t.length > 500) return t;
+    } catch { /* 换通道2 */ }
+    try {
+      if (typeof fetch === 'undefined') continue;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 25000);
+      const r = await fetch(url, { signal: ctrl.signal, headers });
+      clearTimeout(timer);
+      if (!r.ok) continue;
+      const t = await r.text();
+      if (t && t.length > 500) return t;
+    } catch { /* retry */ }
   }
+  return '';
 }
 
 // Parse video cards from server-rendered HTML
@@ -97,7 +108,39 @@ const CATS = {
   'hot': { path: '/zh/hot', name: '热门' },
   'uncensored': { path: '/zh/uncensored', name: '无码' },
   'censored': { path: '/zh/censored', name: '有码' },
+  'subtitle': { path: '/zh/subtitle', name: '字幕' },
+  'series': { path: '/zh/series', name: '系列' },
+  'studios': { path: '/zh/studios', name: '片商' },
 };
+
+// videoSources is embedded as escaped JSON in the detail HTML:
+// \"videoSources\":[{\"type\":\"raw_1080p\",\"url\":\"https://static.worldstatic.com/...index.txt?t=...\"},...]
+// The index.txt is an AES-128 m3u8 playlist (Content-Type: application/vnd.apple.mpegurl)
+const QUALITY_ORDER = ['raw_1080p', 'raw_720p', 'raw_480p', 'raw_240p'];
+const QUALITY_NAME = { raw_1080p: '1080P', raw_720p: '720P', raw_480p: '480P', raw_240p: '240P' };
+
+function parseVideoSources(html) {
+  const tracks = [];
+  if (!html) return tracks;
+  const m = html.match(/\\"videoSources\\":\[(.*?)\],\\"/s);
+  if (!m) return tracks;
+  const seen = {};
+  const re = /\\"type\\":\\"([^"\\]+)\\",\\"url\\":\\"([^"\\]+)/g;
+  let mm;
+  while ((mm = re.exec(m[1])) !== null) {
+    const type = mm[1];
+    if (seen[type]) continue;
+    seen[type] = 1;
+    tracks.push({ type, url: mm[2].replace(/\\u0026/g, '&') });
+  }
+  // highest quality first
+  tracks.sort((a, b) => {
+    const ia = QUALITY_ORDER.indexOf(a.type);
+    const ib = QUALITY_ORDER.indexOf(b.type);
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+  });
+  return tracks;
+}
 
 async function init() {
   return {};
@@ -142,6 +185,15 @@ async function detail(reqIn) {
     let desc = '';
     const dm = html.match(/"description":"([^"]{0,500})"/);
     if (dm) desc = decodeHtml(dm[1]);
+    // play: multi-quality direct m3u8 from videoSources (1080P first);
+    // fallback to page-URL sniffing if not found
+    const tracks = parseVideoSources(html);
+    let playUrl;
+    if (tracks.length) {
+      playUrl = tracks.map((tr) => `${QUALITY_NAME[tr.type] || tr.type}$${tr.url}`).join('#');
+    } else {
+      playUrl = `播放$${id}`;
+    }
     if (!name) continue;
     list.push({
       vod_id: id,
@@ -149,16 +201,26 @@ async function detail(reqIn) {
       vod_pic: pic,
       vod_content: desc,
       vod_play_from: 'GetAV',
-      vod_play_url: `播放$${id}`,
+      vod_play_url: playUrl,
     });
   }
   return { list };
 }
 
 async function play(reqIn) {
-  const id = t(reqIn?.body?.id);
+  let id = t(reqIn?.body?.id);
   if (!id) return { parse: 0, url: '' };
-  // Stream URL is loaded client-side via JS; use sniffing on the video page
+  // id may be "1080P$https://..." full track string; keep only the URL part
+  if (/\$/.test(id)) id = id.split('$').pop().trim();
+  // direct worldstatic m3u8 -> play directly
+  if (/^https?:\/\//i.test(id) && /worldstatic\.com/i.test(id)) {
+    return {
+      parse: 0,
+      url: id,
+      header: { Referer: HOST + '/zh', 'User-Agent': UA },
+    };
+  }
+  // fallback: sniff on the video page
   const pageUrl = id.startsWith('http') ? id : HOST + id;
   return {
     parse: 1,
