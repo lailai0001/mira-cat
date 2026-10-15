@@ -1,7 +1,8 @@
 // UU直播破解 - CatPawOpen JS Spider (全新重写)
 // 站点: https://cmk.uuzbpj7.hair
 // 结构: 自定义CMS, video-item 列表, 详情页 /{id}.html, const rawUrl 直出 m3u8
-// 注意: 本站屏蔽 axios, 使用 Node 原生 fetch
+// 请求: 双通道 — 先框架 req(axios, MiraPlayer 内核可用)，失败再试 Node 原生 fetch
+import req from '../../util/req.js';
 
 const KEY = 'py_uu';
 const NAME = 'UU直播破解';
@@ -28,19 +29,25 @@ function stripTags(s) {
 }
 
 async function getText(url, retries = 2) {
+  const headers = {
+    'User-Agent': UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Referer': HOST + '/',
+  };
   for (let i = 0; i < retries; i++) {
+    // 通道1: 框架 req (axios) — MiraPlayer 内核可用
     try {
+      const { data, status } = await req.get(url, { headers, timeout: 20000, responseType: 'text' });
+      const t = String(data || '');
+      if (status === 200 && t.length > 500) return t;
+    } catch { /* 换通道2 */ }
+    // 通道2: Node 原生 fetch (部分站点屏蔽 axios 指纹时用)
+    try {
+      if (typeof fetch === 'undefined') continue;
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 30000);
-      const r = await fetch(url, {
-        signal: ctrl.signal,
-        headers: {
-          'User-Agent': UA,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'zh-CN,zh;q=0.9',
-          'Referer': HOST + '/',
-        },
-      });
+      const timer = setTimeout(() => ctrl.abort(), 25000);
+      const r = await fetch(url, { signal: ctrl.signal, headers });
       clearTimeout(timer);
       if (!r.ok) continue;
       const t = await r.text();
