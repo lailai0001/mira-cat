@@ -79,12 +79,12 @@ async function home() {
   const cls = CATS.map(([id, name]) => ({ type_id: id, type_name: name }));
   const filters = {};
   for (const [id] of CATS) filters[id] = {};
-  const html = await getText(HOST + '/');
+  const html = await getText(HOST + BASE);
   return { class: cls, filters, list: parseList(html) };
 }
 
 async function homeVod() {
-  return { list: parseList(await getText(HOST + '/')) };
+  return { list: parseList(await getText(HOST + BASE)) };
 }
 
 async function category(reqIn) {
