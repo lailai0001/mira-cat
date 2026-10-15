@@ -47,14 +47,14 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 async function reqOnce(url) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const { data } = await req.get(url, { headers: headers(), timeout: 30000 });
+      const { data } = await req.get(url, { headers: headers(), timeout: 90000 });
       const t = String(data || '');
       if (t && t.length > 5000 && !isChallenge(t)) return t;
     } catch (e) { /* fallthrough to retry/fetch */ }
     if (typeof fetch !== 'undefined') {
       try {
         const ctl = new AbortController();
-        const timer = setTimeout(() => ctl.abort(), 30000);
+        const timer = setTimeout(() => ctl.abort(), 90000);
         const r = await fetch(url, { headers: headers(), signal: ctl.signal });
         clearTimeout(timer);
         const t = await r.text();
