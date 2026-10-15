@@ -129,7 +129,7 @@ async function category(reqIn) {
   let d;
   if (id === 'home') {
     if (page > 1) {
-      d = await apiPost('/api/theater/exploreList', { page, limit: 24 });
+      d = await apiPost('/api/theater/exploreList', { page: page - 1, limit: 24 });
     } else {
       d = await apiPost('/api/home/homePage', {});
       const inner = unwrap(d);
@@ -139,7 +139,7 @@ async function category(reqIn) {
         if (m && Array.isArray(m.list)) list = list.concat(m.list);
         else if (m && (m.video_id || m.id)) list.push(m);
       }
-      return { page, pagecount: page, list: listFrom({ list }) };
+      return { page, pagecount: page + 1, list: listFrom({ list }) };
     }
   } else if (id === 'rank') {
     d = await apiPost('/api/theater/videoRank', { page, limit: 24 });
