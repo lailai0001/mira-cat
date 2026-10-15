@@ -15,6 +15,11 @@ const CHANNEL = '1031';
 const UA = 'Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
 const ORIGIN = 'https://0zq6w.shddlcd.cn';
 const INIT_HOSTS = [
+  'https://xginit.ylapi3321.com/api',
+  'https://xginit.ylapi1688.com/api',
+  'https://web.al.ctqhnw.com/api',
+  'https://init.qn.ctqhnw.com/api',
+  'https://init.qn.nwglda.com/api',
   'https://h5init.qn.pnwkult.com/api',
   'https://init.al.pnwkult.com/api',
   'https://init.youliao88.com/api',
@@ -51,17 +56,17 @@ function dec(text) {
 }
 
 // 双通道 POST form
-async function postForm(url, body, headers, retries = 2) {
+async function postForm(url, body, headers, retries = 2, timeoutMs = 20000) {
   const data = new URLSearchParams(body || {}).toString();
   for (let i = 0; i < retries; i++) {
     try {
-      const r = await req.post(url, data, { headers, timeout: 20000, responseType: 'text' });
+      const r = await req.post(url, data, { headers, timeout: timeoutMs, responseType: 'text' });
       if (r.status === 200 && t(r.data).length > 10) return t(r.data);
     } catch { /* 通道2 */ }
     try {
       if (typeof fetch === 'undefined') continue;
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 25000);
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs + 5000);
       const r = await fetch(url, { method: 'POST', headers, body: data, signal: ctrl.signal });
       clearTimeout(timer);
       if (!r.ok) continue;
@@ -72,7 +77,7 @@ async function postForm(url, body, headers, retries = 2) {
   return '';
 }
 
-async function apiPost(base, path, data, auth = true) {
+async function apiPost(base, path, data, auth = true, timeoutMs = 20000, retries = 2) {
   const tm = Math.floor(Date.now() / 1000).toString();
   let p;
   try { p = new URL(base + path).pathname; } catch { p = path; }
@@ -89,24 +94,38 @@ async function apiPost(base, path, data, auth = true) {
     h['token'] = String(S.token);
     h['Access-Token'] = String(S.token);
   }
-  const txt = await postForm(base + path, data || {}, h);
+  const txt = await postForm(base + path, data || {}, h, retries, timeoutMs);
   return dec(txt);
 }
 
-async function boot() {
+async function bootOnce() {
   if (S.api) return true;
   for (const host of INIT_HOSTS) {
-    const r = await apiPost(host, '/player/do_init_h5', { system: '3', channel: CHANNEL, new_live: '1' }, false);
-    const d = (r && r.data) || null;
-    if (d && typeof d === 'object' && d.api_url) {
-      S.api = String(d.api_url).replace(/\/$/, '') + '/api';
-      const pi = d.player_info || {};
-      S.token = pi.token || '';
-      S.uid = pi.uid || '';
-      return true;
-    }
+    try {
+      const r = await apiPost(host, '/player/do_init_h5', { system: '3', channel: CHANNEL, new_live: '1' }, false, 12000, 1);
+      const d = (r && r.data) || null;
+      if (d && typeof d === 'object' && d.api_url) {
+        S.api = String(d.api_url).replace(/\/$/, '') + '/api';
+        const pi = d.player_info || {};
+        S.token = pi.token || '';
+        S.uid = pi.uid || '';
+        return true;
+      }
+    } catch { /* 下一个 host */ }
   }
   return false;
+}
+
+// boot 总超时守卫: 最多 60 秒, 避免 App 卡在"获取首页分类数据..."
+async function boot() {
+  if (S.api) return true;
+  try {
+    const ok = await Promise.race([
+      bootOnce(),
+      new Promise((resolve) => setTimeout(() => resolve(false), 60000)),
+    ]);
+    return !!ok;
+  } catch { return false; }
 }
 
 async function call(path, data) {
