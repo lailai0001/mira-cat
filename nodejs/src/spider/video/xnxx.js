@@ -1,6 +1,7 @@
 // XNXX - CatPawOpen JS Spider (全新重写)
 // 多镜像域名兜底: xnxx.health 可能被墙, 依次尝试
-// 注意: 本站屏蔽 axios, 使用 Node 原生 fetch
+// 请求: 双通道 — 先框架 req(axios, MiraPlayer 内核可用)，失败再试 Node 原生 fetch
+import req from '../../util/req.js';
 
 const KEY = 'py_xnxx';
 const NAME = 'XNXX';
@@ -53,17 +54,23 @@ function stripTags(s) {
 }
 
 async function fetchOne(url) {
+  const headers = {
+    'User-Agent': UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+  // 通道1: 框架 req (axios) — MiraPlayer 内核可用
   try {
+    const { data, status } = await req.get(url, { headers, timeout: 20000, responseType: 'text' });
+    const t = String(data || '');
+    if (status === 200 && t.length > 1000) return t;
+  } catch { /* 换通道2 */ }
+  // 通道2: Node 原生 fetch
+  try {
+    if (typeof fetch === 'undefined') return '';
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 25000);
-    const r = await fetch(url, {
-      signal: ctrl.signal,
-      headers: {
-        'User-Agent': UA,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-    });
+    const r = await fetch(url, { signal: ctrl.signal, headers });
     clearTimeout(timer);
     if (!r.ok) return '';
     const t = await r.text();
