@@ -8,6 +8,7 @@ const NAME = '野果短剧';
 const API_BASE = 'https://www.yeguodj.com/api.php';
 const SITE = 'https://yeguodj.com';
 const COVER_PROXY = 'https://huangguo.wulii.de5.net';
+const IMG_WORKER = 'https://bagua-img-proxy.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 const API_KEY = '2acf7e91e9864673';
@@ -21,6 +22,9 @@ const CATS = [
   { type_id: 'mogai', type_name: '魔改漫剧' },
   { type_id: 'manju', type_name: '漫剧' },
   { type_id: 'aiduanju', type_name: 'AI短剧' },
+  { type_id: 'wanghong', type_name: '网红改编' },
+  { type_id: 'jinji', type_name: '禁忌伦理' },
+  { type_id: 'zhichang', type_name: '职场反差' },
 ];
 
 function t(v) {
@@ -74,6 +78,10 @@ function unwrap(d) {
 function proxiedCover(url) {
   url = t(url);
   if (!url) return '';
+  // pic.jtzatly.cn 的图是 AES-128-CBC 加密存储（与 818/91 同手法），走解密 Worker
+  if (/^https?:\/\/pic\.jtzatly\.cn\//i.test(url)) {
+    return IMG_WORKER + '/img?url=' + encodeURIComponent(url);
+  }
   if (/pic\.wlwvch\.cn|pic\.zdmhyg\.cn|pic\.wirqed\.cn|imgpublic\.ycomesc\.live/i.test(url)) {
     return COVER_PROXY + '/?url=' + encodeURIComponent(url);
   }
@@ -141,6 +149,12 @@ async function category(reqIn) {
     d = await apiPost('/api/theater/exploreList', { page, limit: 24, theme: 8 });
   } else if (id === 'mogai') {
     d = await apiPost('/api/theater/exploreList', { page, limit: 24, theme: 9 });
+  } else if (id === 'wanghong') {
+    d = await apiPost('/api/theater/exploreList', { page, limit: 24, theme: 10 });
+  } else if (id === 'jinji') {
+    d = await apiPost('/api/theater/exploreList', { page, limit: 24, setting: 23 });
+  } else if (id === 'zhichang') {
+    d = await apiPost('/api/theater/exploreList', { page, limit: 24, setting: 24 });
   } else {
     d = await apiPost('/api/theater/exploreList', { page, limit: 24 });
   }
