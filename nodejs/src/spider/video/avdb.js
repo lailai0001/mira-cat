@@ -101,15 +101,28 @@ async function detail(reqIn) {
   };
 }
 
+// m3u8 净化代理: helvid 返回的 playlist 带 #U18-CANARY 非标标签，
+// MiraPlayer 解析异常导致无法快进/后退。Worker 抓取后去掉该标签再返回。
+// 用户在 Cloudflare 部署 avdb-m3u8-clean-worker.js 后，把实际地址填入下面;
+// 为空时自动回退直连（保持原行为，不会断播）。
+const M3U8_PROXY = 'https://avdb-m3u8.li768435813.workers.dev';
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   const url = String(body.id || '');
   // 注意: helvid.com 的分片有 Referer 检查，用 helvid.com 做 Referer 会 403
   // 必须用 avdbapi.com 或 upload18.org，或不带 Referer
+  let playUrl = url;
+  let header = { 'User-Agent': UA, 'Referer': 'https://avdbapi.com/' };
+  if (M3U8_PROXY && /helvid\.com\/m\//.test(url)) {
+    playUrl = `${M3U8_PROXY}/playlist.m3u8?url=${encodeURIComponent(url)}`;
+    // 走自家 Worker，不需要 Referer
+    header = { 'User-Agent': UA };
+  }
   return {
     parse: 0,
-    url,
-    header: { 'User-Agent': UA, 'Referer': 'https://avdbapi.com/' },
+    url: playUrl,
+    header,
   };
 }
 
