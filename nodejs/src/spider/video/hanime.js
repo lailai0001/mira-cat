@@ -108,9 +108,8 @@ function fallbackTabs() {
   for (const name of FALLBACK_GENRES) {
     let ui = 1;
     if (name.includes('裏番') || name.includes('泡麵番')) ui = 0;
-    // 与线上解析保持一致：原始 genre 拼 URL 后再整体 encodeURI
-    const abs = `${ACTIVE_HOST}/search?genre=${name}`;
-    list.push({ name, ui, ext: { url: encodeURI(abs) } });
+    // type_id 用短格式 genre:xxx，避免长 URL 编码经 App 传递时出问题；真实 URL 在 getCards 里重建
+    list.push({ name, ui, ext: { genre: name } });
   }
   return list;
 }
@@ -134,11 +133,17 @@ async function getTabs() {
     if (name.includes('裏番') || name.includes('泡麵番')) {
       ui = 0;
     }
-    // XPTV 原版 tab 的 ext 只有 url（无 id），此处直接以 url 作为 type_id；
     // 过滤掉指向站外的推广 tab（如 erodalabs 广告），分类请求只能走本站
     const abs = href.startsWith('http') ? href : `${ACTIVE_HOST}${href}`;
     if (!isInnerDomain(abs)) return;
-    list.push({ name, ui, ext: { url: encodeURI(abs) } });
+    // type_id 用短格式 genre:xxx，避免长 URL 编码经 App 传递时出问题；真实 URL 在 getCards 里重建
+    // 从 href 提取 genre 参数，提不到则直接用分类名（站内 genre 均与分类名一致）
+    let genre = name;
+    try {
+      const gm = abs.match(/[?&]genre=([^&]+)/);
+      if (gm) genre = decodeURIComponent(gm[1]);
+    } catch (e) { /* fallback to name */ }
+    list.push({ name, ui, ext: { genre } });
   });
 
   return list.length ? list : fallbackTabs();
@@ -239,6 +244,11 @@ async function getCards(ext) {
   ext = typeof ext === 'string' ? JSON.parse(ext) : (ext || {});
   const { page = 1, url } = ext;
   let fetchUrl = String(url || '');
+  // 短 type_id（genre:xxx）在此重建为完整搜索 URL，避免长 URL 经 App 传递损坏
+  if (fetchUrl.startsWith('genre:')) {
+    const genreName = fetchUrl.slice(6);
+    fetchUrl = `${ACTIVE_HOST}/search?genre=${encodeURIComponent(genreName)}`;
+  }
   if (page > 1) fetchUrl += `&page=${page}`;
 
   const html = await getHtml(fetchUrl);
@@ -362,7 +372,7 @@ async function init() {
 async function home() {
   const tabs = await getTabs();
   const CLASSES = tabs.map((tab) => ({
-    type_id: String(tab.ext.url),
+    type_id: 'genre:' + String(tab.ext.genre || tab.name),
     type_name: tab.name,
   }));
   return { class: CLASSES, filters: {} };
