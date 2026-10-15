@@ -9,7 +9,6 @@ import pornhub from './spider/video/pornhub.js';
 import ppp from './spider/video/ppp.js';
 import xvideos from './spider/video/xvideos.js';
 import xxxfollow from './spider/video/xxxfollow.js';
-import hanime from './spider/video/hanime.js';
 import spankbang from './spider/video/spankbang_new.js';
 import huangdou from './spider/video/huangdou.js';
 import huangguo from './spider/video/huangguo.js';
@@ -49,7 +48,6 @@ const spiders = [
     ppp,
     xvideos,
     xxxfollow,
-    hanime,
     spankbang,
     huangdou,
     huangguo,
