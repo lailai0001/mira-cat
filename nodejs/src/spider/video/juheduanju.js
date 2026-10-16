@@ -145,13 +145,50 @@ function cgParseList(html) {
   } catch (e) {}
   return vods;
 }
+async function cgApiList(channel, page) {
+  // 站点改版后 ?page= 参数被忽略,翻页走 POST /api/v1/channels/{channel}?page=
+  let j = null;
+  try {
+    j = await httpPostJson(CG_SITE + '/api/v1/channels/' + encodeURIComponent(channel) + '?page=' + page, {},
+      { ...cgHeaders(), 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' });
+  } catch (e) { return null; }
+  if (!j || typeof j !== 'object') return null;
+  const d = (j.data && typeof j.data === 'object') ? j.data : j;
+  const arr = Array.isArray(d) ? d : (Array.isArray(d.list) ? d.list : (Array.isArray(d.items) ? d.items : null));
+  if (!arr || !arr.length) return null;
+  const vods = [];
+  const seen = new Set();
+  for (const item of arr) {
+    if (!item || typeof item !== 'object') continue;
+    const title = item.title, slug = item.slug;
+    if (!title || typeof title !== 'string' || !slug || typeof slug !== 'string' || seen.has(slug)) continue;
+    seen.add(slug);
+    let pic = '';
+    const cov = item.cover;
+    if (cov) {
+      const u = (typeof cov === 'object' ? (cov.url || cov.fallback_url) : cov);
+      if (u && typeof u === 'string') pic = cgProxyPic(u);
+    }
+    const eps = item.total_episode_count || item.published_episode_count || item.latest_episode_number;
+    vods.push({ vod_id: 'chengguo:' + slug, vod_name: title, vod_pic: pic, vod_remarks: eps ? (eps + '集') : '' });
+  }
+  if (!vods.length) return null;
+  const total = parseInt((d && d.total) || j.total || 0, 10) || 0;
+  const hasMore = total > 0 ? (page * arr.length < total) : (arr.length >= 20);
+  return { list: vods, hasMore };
+}
 const cg = {
   cats: CG_CATS,
   async list(cat, page) {
-    const path = '/' + (cat || 'yuanchuang');
-    const url = page > 1 ? CG_SITE + path + '?page=' + page : CG_SITE + path;
-    const html = await httpGet(url, cgHeaders());
-    return cgParseList(html);
+    const ch = cat || 'yuanchuang';
+    if (page > 1) {
+      const r = await cgApiList(ch, page);
+      if (r) return r;
+      return { list: [], hasMore: false };
+    }
+    const html = await httpGet(CG_SITE + '/' + ch, cgHeaders());
+    const list = cgParseList(html);
+    return { list, hasMore: list.length >= 12 };
   },
   async search(wd) {
     const html = await httpGet(CG_SITE + '/search?q=' + encodeURIComponent(wd), cgHeaders());
@@ -244,11 +281,13 @@ const qixing = {
   cats: QX_CATS,
   async list(cat, page) {
     const tk = await qxAuth();
-    if (!tk) return [];
+    if (!tk) return { list: [], hasMore: false };
     const j = await httpGetJson(QX_SITE + '/v1/theater/home_page?theater_class_id=' + encodeURIComponent(cat || '1') + '&page_num=' + page + '&page_size=24', qxH(tk));
-    const items = (j && j.data && Array.isArray(j.data.list)) ? j.data.list : [];
+    const d = (j && j.data && typeof j.data === 'object') ? j.data : {};
+    const items = Array.isArray(d.list) ? d.list : [];
     const cn = (QX_CATS.find(c => c.type_id === String(cat)) || {}).type_name || '';
-    return items.map(it => qxCard(it, cn)).filter(Boolean);
+    const list = items.map(it => qxCard(it, cn)).filter(Boolean);
+    return { list, hasMore: list.length > 0 && d.is_end !== true };
   },
   async search(wd) {
     const tk = await qxAuth();
@@ -340,12 +379,14 @@ const xingya = {
   cats: XY_CATS,
   async list(cat, page) {
     const h = await xyAuth();
-    if (!h) return [];
+    if (!h) return { list: [], hasMore: false };
     const c = XY_CATS.find(x => x.type_id === String(cat)) || XY_CATS[0];
     const j = await httpGetJson(XY_SITE + '/cloud/v2/theater/home_page?theater_class_id=' + c.cid + '&type=1&class2_ids=0&page_num=' + page + '&page_size=24', h);
-    const arr = (j && j.data && Array.isArray(j.data.list)) ? j.data.list : [];
+    const d = (j && j.data && typeof j.data === 'object') ? j.data : {};
+    const arr = Array.isArray(d.list) ? d.list : [];
     const items = arr.map(e => (e && typeof e === 'object' && e.theater) ? e.theater : null).filter(Boolean);
-    return items.map(it => xyCard(it, c.type_name)).filter(Boolean);
+    const list = items.map(it => xyCard(it, c.type_name)).filter(Boolean);
+    return { list, hasMore: list.length > 0 && d.is_end !== true };
   },
   async search(wd) {
     const h = await xyAuth();
@@ -437,7 +478,7 @@ function kbCard(item, catName) {
   };
 }
 async function kbBrowsePage(spec, page) {
-  let cursor = '', target = [];
+  let cursor = '', target = [], targetNext = '';
   for (let i = 1; i <= page; i++) {
     const data = { limit: KB_PAGE, ...spec.q };
     if (cursor) data.cursor = cursor;
@@ -459,11 +500,11 @@ async function kbBrowsePage(spec, page) {
       if (out.length >= KB_PAGE || !next) break;
       cursor = next;
     }
-    if (i === page) target = out;
+    if (i === page) { target = out; targetNext = next; }
     cursor = next;
     if (!next) break;
   }
-  return target;
+  return { items: target, hasMore: !!targetNext };
 }
 async function kbEpTable(dramaId, no) {
   const body = await kbTrpc('episode.watch', { dramaId, episodeNumber: no });
@@ -479,8 +520,9 @@ const kuangbiao = {
   cats: KB_CATS,
   async list(cat, page) {
     const spec = KB_CATS.find(x => x.type_id === String(cat)) || KB_CATS[0];
-    const items = await kbBrowsePage(spec, page);
-    return items.map(it => kbCard(it, spec.type_name)).filter(Boolean);
+    const { items, hasMore } = await kbBrowsePage(spec, page);
+    const list = items.map(it => kbCard(it, spec.type_name)).filter(Boolean);
+    return { list, hasMore: list.length > 0 && hasMore };
   },
   async search(wd) {
     const items = await kbBrowsePage(KB_CATS[0], 1);
@@ -536,14 +578,19 @@ const kuwo = {
   cats: KW_CATS,
   async list(cat, page) {
     const j = await httpGetJson(KW_SITE + '/moduleMore?currentPage=' + page + '&moduleId=' + encodeURIComponent(cat || '10') + '&rn=12', kwH());
-    const items = (j && j.data && Array.isArray(j.data.list)) ? j.data.list : [];
+    const d = (j && j.data && typeof j.data === 'object') ? j.data : {};
+    const items = Array.isArray(d.list) ? d.list : [];
     const seen = new Set();
     const out = [];
     for (const a of items) {
       const c = kwCard(a);
       if (c && !seen.has(c.vod_id)) { seen.add(c.vod_id); out.push(c); }
     }
-    return out;
+    let hasMore;
+    if (d.hasNextPage === true || d.hasNextPage === false) hasMore = d.hasNextPage;
+    else if (typeof d.pageNum === 'number' && typeof d.pages === 'number') hasMore = d.pageNum < d.pages;
+    else hasMore = out.length >= 12;
+    return { list: out, hasMore: out.length > 0 && hasMore };
   },
   async search(wd) {
     const out = [], seen = new Set();
@@ -600,7 +647,7 @@ function jwCleanPic(pic) {
   let host = '';
   try { host = (new URL(s).hostname || '').toLowerCase(); } catch (e) { return ''; }
   if (!host) return '';
-  for (const ph of ['img.test.com', 'huangdouhui.tv']) {
+  for (const ph of ['huangdouhui.tv']) {
     if (host === ph || host.endsWith('.' + ph)) return '';
   }
   return s;
@@ -619,6 +666,13 @@ async function jwQuery(params) {
   if (!j || j.code !== 1) return [];
   return Array.isArray(j.list) ? j.list : [];
 }
+async function jwQueryPage(params) {
+  const j = await httpGetJson(JW_SITE + '/api.php/provide/vod/?' + new URLSearchParams(params).toString(), jwH());
+  if (!j || j.code !== 1) return { items: [], hasMore: false };
+  const items = Array.isArray(j.list) ? j.list : [];
+  const pg = parseInt(j.page, 10) || 1, pgc = parseInt(j.pagecount, 10) || 1;
+  return { items, hasMore: items.length > 0 && pg < pgc };
+}
 function jwPlayEps(raw) {
   let best = [];
   for (const line of String(raw || '').split('$$$')) {
@@ -636,8 +690,8 @@ function jwPlayEps(raw) {
 const juwu = {
   cats: JW_CATS,
   async list(cat, page) {
-    const items = await jwQuery({ ac: 'detail', t: cat || '1', pg: String(page) });
-    return items.map(jwCard).filter(Boolean);
+    const { items, hasMore } = await jwQueryPage({ ac: 'detail', t: cat || '1', pg: String(page) });
+    return { list: items.map(jwCard).filter(Boolean), hasMore };
   },
   async search(wd) {
     const items = await jwQuery({ ac: 'detail', wd, pg: '1' });
@@ -720,7 +774,7 @@ const weiguan = {
     const seen = new Set();
     const out = [];
     for (const it of arr) { const c = wgCard(it); if (c && !seen.has(c.vod_id)) { seen.add(c.vod_id); out.push(c); } }
-    return out;
+    return { list: out, hasMore: out.length >= 30 };
   },
   async search(wd) {
     const j = await httpPostJson(WG_SITE + '/drama/home/search?version_code=1500&os_type=1',
@@ -814,7 +868,8 @@ async function home() {
 
 async function homeVod() {
   try {
-    const list = await kuwo.list('10', 1);
+    const r = await kuwo.list('10', 1);
+    const list = (r && r.list) || [];
     return { list: list.slice(0, 12) };
   } catch (e) { return { list: [] }; }
 }
@@ -828,9 +883,13 @@ async function category(reqIn) {
   const cats = platCats(pkey);
   const sub = String((body.extend && body.extend.class) || body.class || cats[0].type_id);
   const valid = cats.some(c => c.type_id === sub) ? sub : cats[0].type_id;
-  let list = [];
-  try { list = await plat.list(valid, page); } catch (e) {}
-  return { page, pagecount: list.length >= 12 ? page + 1 : page, limit: list.length, total: 9999, list };
+  let list = [], hasMore = false;
+  try {
+    const r = await plat.list(valid, page);
+    if (r && typeof r === 'object' && !Array.isArray(r)) { list = r.list || []; hasMore = !!r.hasMore; }
+    else if (Array.isArray(r)) { list = r; hasMore = list.length >= 12; }
+  } catch (e) {}
+  return { page, pagecount: hasMore ? page + 1 : page, limit: list.length, total: 9999, list };
 }
 
 async function detail(reqIn) {
