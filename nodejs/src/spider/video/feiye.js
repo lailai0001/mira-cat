@@ -108,7 +108,7 @@ async function home(reqIn) {
 
 async function category(reqIn) {
   const body = reqIn?.body || {};
-  const tid = t(body.tid);
+  const tid = t(body.tid || body.id);
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const params = { ac: 'videolist', pg: page };
   if (tid) params.t = tid;
