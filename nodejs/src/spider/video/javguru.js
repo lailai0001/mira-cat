@@ -264,35 +264,79 @@ function unpackDeanEdwards(html) {
   return p;
 }
 
-// 从网关2页面提取 m3u8 地址 (优先 hls2 > hls3 > hls4)
-function extractM3u8(gw2html, gw2url) {
+// 从网关2页面提取 m3u8 地址列表 (按优先级: hls2 > hls4 > hls3)
+// 返回 [{quality, url}]，url 已补全为绝对地址
+function extractM3u8List(gw2html, gw2url) {
   const unpacked = unpackDeanEdwards(gw2html);
   const src = unpacked || gw2html;
-  // 找 links 对象
-  const links = {};
+  // hls4 相对地址的 host 藏在解包后 JS 里 (premilkyway CDN)
+  let cdnHost = '';
+  const hostM = src.match(/(https?:\/\/[a-z0-9.-]*premilkyway[a-z0-9.-]*)/i);
+  if (hostM) cdnHost = hostM[1].replace(/\/$/, '');
+  const out = [];
   const lm = src.match(/var\s+links\s*=\s*(\{[^;]*?\});/);
   if (lm) {
-    const hm = lm[1].match(/"hls2"\s*:\s*"([^"]+)"/);
-    const hm3 = lm[1].match(/"hls3"\s*:\s*"([^"]+)"/);
-    const hm4 = lm[1].match(/"hls4"\s*:\s*"([^"]+)"/);
-    if (hm) links.hls2 = hm[1];
-    if (hm3) links.hls3 = hm3[1];
-    if (hm4) links.hls4 = hm4[1];
+    for (const k of ['hls2', 'hls4', 'hls3']) {
+      const mm = lm[1].match(new RegExp('"' + k + '"\\s*:\\s*"([^"]+)"'));
+      if (mm) {
+        let url = mm[1];
+        if (url.startsWith('/') && cdnHost) url = cdnHost + url;
+        else if (url.startsWith('/')) {
+          try { url = new URL(gw2url).origin + url; } catch (e) { /* ignore */ }
+        }
+        if (/^https?:\/\//i.test(url)) out.push({ quality: k, url });
+      }
+    }
   }
   // 兜底: 直接找 m3u8 URL
-  if (!links.hls2 && !links.hls3 && !links.hls4) {
+  if (!out.length) {
     const all = [...src.matchAll(/https?:\/\/[^"'\s\\]+\.m3u8[^"'\s\\]*/g)].map(x => x[0]);
-    if (all.length) return all[0];
-    return '';
+    for (const u of all) out.push({ quality: 'auto', url: u });
   }
-  let url = links.hls2 || links.hls3 || links.hls4 || '';
-  if (url && url.startsWith('/')) {
-    try {
-      const u = new URL(gw2url);
-      url = u.origin + url;
-    } catch (e) { /* ignore */ }
-  }
-  return url;
+  return out;
+}
+
+// 兼容旧名
+function extractM3u8(gw2html, gw2url) {
+  const list = extractM3u8List(gw2html, gw2url);
+  return list.length ? list[0].url : '';
+}
+
+// 验证 m3u8 是否可达 (只读头部, 10秒超时)
+async function checkM3u8(url, referer) {
+  const headers = { 'User-Agent': UA, 'Referer': referer || REFERER, 'Accept': '*/*', 'Range': 'bytes=0-2047' };
+  try {
+    const { data, status } = await req.get(url, { headers, timeout: 10000 });
+    if (status === 200 || status === 206) {
+      const txt = typeof data === 'string' ? data : '';
+      if (txt.includes('#EXTM3U')) return true;
+    }
+  } catch (e) { /* 换 fetch */ }
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 10000);
+    const r = await fetch(url, { headers, signal: ctl.signal });
+    clearTimeout(timer);
+    if (r.ok) {
+      const txt = await r.text();
+      if (txt.includes('#EXTM3U')) return true;
+    }
+  } catch (e) { /* ignore */ }
+  return false;
+}
+
+// 解析单个流 key -> m3u8 候选列表 (内部用)
+async function resolveStream(detailHtml, streamKey) {
+  const gateway1 = extractGateway(detailHtml, streamKey);
+  if (!gateway1) return { gateway1: '', list: [] };
+  const gw1html = await getHtml(gateway1);
+  if (!gw1html) return { gateway1, list: [] };
+  const gateway2 = computeGateway2(gw1html);
+  if (!gateway2) return { gateway1, list: [] };
+  const gw2html = await getHtml(gateway2);
+  if (!gw2html) return { gateway1, list: [] };
+  const list = extractM3u8List(gw2html, gateway2);
+  return { gateway1, gateway2, list };
 }
 
 async function play(reqIn) {
@@ -309,37 +353,54 @@ async function play(reqIn) {
     streamKey = parts[1];
   }
 
-  // 第1步: 详情页 -> 网关1 URL
   const html = await getHtml(detailUrl);
   if (!html) return { parse: 0, url: '' };
-  const gateway1 = extractGateway(html, streamKey);
-  if (!gateway1) return { parse: 0, url: '' };
 
-  // 第2步: 网关1 -> 计算网关2 URL
-  const gw1html = await getHtml(gateway1);
-  if (!gw1html) {
-    // 降级: 返回网关1用嗅探
-    return { parse: 1, url: gateway1, header: { 'User-Agent': UA, 'Referer': REFERER } };
+  // 收集所有流 key: 先用户选的, 再其余
+  const allKeys = [];
+  const aRe = /<a[^>]+data-localize="([a-z]+)"[^>]*>/g;
+  let am;
+  while ((am = aRe.exec(html)) !== null) {
+    if (!allKeys.includes(am[1])) allKeys.push(am[1]);
   }
-  const gateway2 = computeGateway2(gw1html);
-  if (!gateway2) {
-    return { parse: 1, url: gateway1, header: { 'User-Agent': UA, 'Referer': REFERER } };
+  const ordered = [];
+  if (streamKey) ordered.push(streamKey);
+  for (const k of allKeys) if (!ordered.includes(k)) ordered.push(k);
+
+  let firstGateway1 = '';
+  const resolved = [];
+  // 逐流解析 (每流: 详情->网关1->网关2->解包)
+  for (const key of ordered) {
+    const r = await resolveStream(html, key);
+    if (!firstGateway1 && r.gateway1) firstGateway1 = r.gateway1;
+    if (r.list.length) resolved.push(r);
+  }
+  // 每流只验证首选 m3u8 (hls2), 取第一个可用的 (避免过多请求导致超时)
+  for (const r of resolved) {
+    const item = r.list[0];
+    if (await checkM3u8(item.url, r.gateway2 || r.gateway1)) {
+      return {
+        parse: 0,
+        url: item.url,
+        header: { 'User-Agent': UA, 'Referer': r.gateway2 || r.gateway1 || REFERER },
+      };
+    }
+  }
+  // 首选都不可达: 返回第一个候选让播放器尝试 (不再验证以节省时间)
+  if (resolved.length && resolved[0].list.length) {
+    const r = resolved[0];
+    return {
+      parse: 0,
+      url: r.list[0].url,
+      header: { 'User-Agent': UA, 'Referer': r.gateway2 || r.gateway1 || REFERER },
+    };
   }
 
-  // 第3步: 网关2 -> 解包 JS -> m3u8
-  const gw2html = await getHtml(gateway2);
-  if (!gw2html) {
-    return { parse: 1, url: gateway1, header: { 'User-Agent': UA, 'Referer': REFERER } };
-  }
-  const m3u8 = extractM3u8(gw2html, gateway2);
-  if (!m3u8) {
-    return { parse: 1, url: gateway1, header: { 'User-Agent': UA, 'Referer': REFERER } };
-  }
-  // 直链播放
+  // 都不可达: 降级嗅探网关1
   return {
-    parse: 0,
-    url: m3u8,
-    header: { 'User-Agent': UA, 'Referer': 'https://jav.guru/' },
+    parse: 1,
+    url: firstGateway1,
+    header: { 'User-Agent': UA, 'Referer': REFERER },
   };
 }
 
