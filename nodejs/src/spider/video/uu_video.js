@@ -340,17 +340,21 @@ let _categories = null;
 
 async function getCategories() {
   if (_categories) return _categories;
+  // 用户要求隐藏的分类（2026-10-19）：探花360、新闻357、VR346、其他269
+  const HIDDEN = new Set(['360', '357', '346', '269']);
   try {
     const data = await apiCall('/api/v2/home/public/video/cate/list', { type: 'long' });
     if (data && data.list && data.list.length > 0) {
-      _categories = data.list.map(c => ({
-        type_id: String(c.id),
-        type_name: c.title || c.name,
-      }));
+      _categories = data.list
+        .map(c => ({
+          type_id: String(c.id),
+          type_name: c.title || c.name,
+        }))
+        .filter(c => !HIDDEN.has(c.type_id));
       return _categories;
     }
   } catch { /* 降级到硬编码 */ }
-  // 降级：硬编码（2026-10-19 从 API 实测的 18 个真实分类）
+  // 降级：硬编码（2026-10-19 从 API 实测，已剔除隐藏的 4 个分类）
   _categories = [
     { type_id: '268', type_name: '热门' },
     { type_id: '262', type_name: '国产' },
@@ -361,15 +365,11 @@ async function getCategories() {
     { type_id: '267', type_name: '动漫' },
     { type_id: '341', type_name: '三级' },
     { type_id: '342', type_name: 'AI换脸' },
-    { type_id: '360', type_name: '探花' },
     { type_id: '358', type_name: '麻豆' },
     { type_id: '356', type_name: '擦边短剧' },
     { type_id: '347', type_name: '黑料' },
     { type_id: '266', type_name: '传媒' },
     { type_id: '345', type_name: '女主播' },
-    { type_id: '346', type_name: 'VR' },
-    { type_id: '357', type_name: '新闻' },
-    { type_id: '269', type_name: '其他' },
   ];
   return _categories;
 }
@@ -398,9 +398,8 @@ async function init(reqIn) {
 
 async function home(reqIn) {
   const cats = await getCategories();
-  // 首页用第一个有内容的分类（探花360等为空，跳过）
-  // 优先用 国产262
-  const firstCat = cats.find(c => c.type_id === '262') || cats.find(c => c.type_id !== '360' && c.type_id !== '357' && c.type_id !== '346') || cats[0];
+  // 首页用第一个有内容的分类，优先用 国产262
+  const firstCat = cats.find(c => c.type_id === '262') || cats[0];
   const data = await apiCall('/api/v2/home/public/video/list', {
     page: '1', limit: '20', type: 'cate', typeId: firstCat.type_id, videoType: 'long',
   });
@@ -422,8 +421,12 @@ async function category(reqIn) {
   const data = await apiCall('/api/v2/home/public/video/list', {
     page: String(page), limit: '20', type: 'cate', typeId: cat.type_id, videoType: 'long',
   });
-  const list = data && data.list ? data.list.map(formatVideo) : [];
   const total = data?.total || 0;
+  // 防御：请求的页超出总数时直接返回空（API 对超页会返回第1页重复内容，如热门分类）
+  if (total > 0 && (page - 1) * 20 >= total) {
+    return { page, pagecount: Math.ceil(total / 20) || 1, limit: 20, total, list: [] };
+  }
+  const list = data && data.list ? data.list.map(formatVideo) : [];
   return {
     page,
     pagecount: Math.ceil(total / 20) || 1,
