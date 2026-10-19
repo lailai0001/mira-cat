@@ -293,8 +293,9 @@ async function init(reqIn) {
 
 async function home(reqIn) {
   const cats = await getCategories();
-  // 首页用第一个分类的列表
-  const firstCat = cats[0];
+  // 首页用第一个有内容的分类（探花360等为空，跳过）
+  // 优先用 国产262
+  const firstCat = cats.find(c => c.type_id === '262') || cats.find(c => c.type_id !== '360' && c.type_id !== '357' && c.type_id !== '346') || cats[0];
   const data = await apiCall('/api/v2/home/public/video/list', {
     page: '1', limit: '20', type: 'cate', typeId: firstCat.type_id, videoType: 'long',
   });
@@ -307,7 +308,8 @@ async function home(reqIn) {
 
 async function category(reqIn) {
   const body = reqIn?.body || {};
-  const tid = String(body.id || '');
+  // 兼容 MiraPlayer 传参：id 或 tid
+  const tid = String(body.tid || body.id || '');
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const cats = await getCategories();
   const cat = cats.find(c => c.type_id === tid) || cats[0];
@@ -327,7 +329,9 @@ async function category(reqIn) {
 }
 
 async function detail(reqIn) {
-  const ids = Array.isArray(reqIn?.body?.id) ? reqIn.body.id : [reqIn?.body?.id];
+  // 兼容 id 数组或单个，兼容 tid
+  const rawIds = reqIn?.body?.id ?? reqIn?.body?.tid;
+  const ids = Array.isArray(rawIds) ? rawIds : [rawIds];
   const list = [];
   for (const raw of ids.filter(Boolean)) {
     const vodId = String(raw).trim();
