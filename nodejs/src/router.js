@@ -35,9 +35,7 @@ import qiezi from './spider/video/qiezi.js';
 import xnxx from './spider/video/xnxx.js';
 import uu from './spider/video/uu.js';
 import sanjipian from './spider/video/sanjipian.js';
-import pingguo from './spider/video/pingguo.js';
 import woxiu from './spider/video/woxiu.js';
-import yunvxj from './spider/video/yunvxj.js';
 import juheduanju from './spider/video/juheduanju.js';
 import xingmengasmr from './spider/video/xingmengasmr.js';
 import avjoy from './spider/video/avjoy.js';
@@ -80,9 +78,7 @@ const spiders = [
     xnxx,
     uu,
     sanjipian,
-    pingguo,
     woxiu,
-    yunvxj,
     juheduanju,
     xingmengasmr,
     avjoy,];
