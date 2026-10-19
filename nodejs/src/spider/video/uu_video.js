@@ -237,6 +237,104 @@ async function apiCall(apiPath, params = {}) {
   return null;
 }
 
+// 指纹登录 token 缓存
+let _accessToken = '';
+let _tokenTime = 0;
+const TOKEN_TTL = 30 * 60 * 1000; // 30分钟（服务端 accessTokenTtl=1860秒）
+
+// CDN 列表缓存
+let _cdnList = null;
+
+// 生成随机指纹（md5(uuid)）
+function genFingerprint() {
+  const hex = '0123456789abcdef';
+  let s = '';
+  for (let i = 0; i < 32; i++) s += hex[Math.floor(Math.random() * 16)];
+  // 简单 md5 实现（FNV 不行，需要 md5；用已有 fnv1a 扩展不够，这里用固定算法）
+  // 为简化：直接用 32 位 hex 随机串作为 fingerPrint（实测服务端接受）
+  return s;
+}
+
+// 指纹登录获取 accessToken
+async function ensureAccessToken() {
+  if (_accessToken && Date.now() - _tokenTime < TOKEN_TTL) return _accessToken;
+  const fp = genFingerprint();
+  const body = JSON.stringify({ channel: 'tz', fingerPrint: fp });
+  for (const base of API_HOSTS) {
+    try {
+      const { text } = await httpPost(`${base}/api-user/v2/login/fingerprint`, body, {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Referer': HOST + '/',
+      });
+      if (!text) continue;
+      const resp = JSON.parse(text);
+      if (resp.code !== 200) continue;
+      let data = resp.data;
+      if (typeof data === 'string' && data) {
+        try { data = xorDecrypt(data, resp.key || ''); } catch { continue; }
+      }
+      const tk = data && (data.accessToken || data.token);
+      if (tk) {
+        _accessToken = tk;
+        _tokenTime = Date.now();
+        return _accessToken;
+      }
+    } catch { continue; }
+  }
+  throw new Error('指纹登录失败');
+}
+
+// 获取视频 CDN 列表（站点渠道配置）
+async function getCdnList() {
+  if (_cdnList) return _cdnList;
+  try {
+    const data = await apiCall('/api/v2/home/public/aed/site/channel', { channel: 'tz' });
+    if (data && Array.isArray(data.videoUrlCdns) && data.videoUrlCdns.length > 0) {
+      _cdnList = data.videoUrlCdns;
+      return _cdnList;
+    }
+  } catch { /* 降级 */ }
+  // 降级：硬编码（2026-10-19 从配置实测）
+  _cdnList = [
+    'https://m338.xn--d9u11dw2l41at78afwi.xn--fiqs8s',
+    'https://fqu.fquauf.com:51666',
+    'https://vte.vteotx.com:51666',
+    'https://i1t.i1tyqh.com:51666',
+    'https://tmm.tmmr4x.com:51888',
+  ];
+  return _cdnList;
+}
+
+// 调用需要鉴权的 API
+async function apiCallAuth(apiPath, params = {}) {
+  const token = await ensureAccessToken();
+  const query = new URLSearchParams(params).toString();
+  for (const base of API_HOSTS) {
+    const url = `${base}${apiPath}${query ? '?' + query : ''}`;
+    try {
+      const { text } = await httpGet(url, {
+        'Referer': HOST + '/',
+        'Accept': 'application/json',
+        'Authorization': 'Bearer ' + token,
+      });
+      if (!text) continue;
+      const resp = JSON.parse(text);
+      if (resp.code !== 200) {
+        // token 可能过期，重试一次
+        if (resp.code === 401) { _accessToken = ''; }
+        continue;
+      }
+      if (resp.data == null) return null;
+      if (typeof resp.data === 'string' && resp.data) {
+        return xorDecrypt(resp.data, resp.key || '');
+      }
+      return resp.data;
+    } catch { continue; }
+  }
+  return null;
+}
+
 // 分类缓存
 let _categories = null;
 
@@ -345,16 +443,8 @@ async function detail(reqIn) {
     const data = await apiCall('/api/v2/home/public/video/long/detail', { id: vodId });
     if (!data) continue;
 
-    // 构造播放地址：/m3u8_video/go/{date}/{mediaId}/play.m3u8
-    // date 从 createdAt 取（YYYYMMDD），mediaId 从 data.mediaId 取
-    let playUrl = '';
-    if (data.mediaId) {
-      const dateStr = String(data.createdAt || '').slice(0, 10).replace(/-/g, '');
-      if (dateStr && /^\d{8}$/.test(dateStr)) {
-        playUrl = `/m3u8_video/go/${dateStr}/${data.mediaId}/play.m3u8`;
-      }
-    }
-
+    // 播放地址由 play() 通过播放地址 API 实时获取（指纹登录 → masterUrl + CDN 拼接）
+    // 这里只传视频 id，play() 会处理
     let pic = '';
     if (data.thumb) {
       const encUrl = `${HOST}${data.thumb}`;
@@ -369,7 +459,7 @@ async function detail(reqIn) {
       vod_pic: pic,
       vod_content: (data.content || '').replace(/<[^>]+>/g, '').trim(),
       vod_play_from: 'Uu视频',
-      vod_play_url: playUrl ? `正片$${playUrl}` : '',
+      vod_play_url: `正片$${vodId}`,
     });
   }
   return { list };
@@ -386,19 +476,40 @@ async function play(reqIn) {
     return { parse: 0, url: id, header: { Referer: HOST + '/', 'User-Agent': UA } };
   }
 
-  // 相对路径（如 /m3u8_video/go/20261018/44365/play.m3u8）
-  // 有 Worker 时走 /uuvideo 代理（parse:0 直连）；无 Worker 时降级 parse:1 嗅探
+  // 相对路径（如 /m3u8_video/go/...）走 Worker 代理或嗅探（兼容旧逻辑）
   if (id.startsWith('/')) {
     if (WORKER_HOST) {
       const workerUrl = `${WORKER_HOST}/uuvideo?url=${encodeURIComponent(id)}`;
       return { parse: 0, url: workerUrl, header: { Referer: HOST + '/', 'User-Agent': UA } };
     }
-    // 降级：尝试用 API host 拼接（可能 404），parse:1 嗅探
     const fullUrl = `${API_HOSTS[0]}${id}`;
     return { parse: 1, url: fullUrl, header: { Referer: HOST + '/', 'User-Agent': UA } };
   }
 
-  return { parse: 0, url: id };
+  // 数字 id：走播放地址 API（指纹登录 → /api/v2/home/user/video/play/url）
+  // 返回 masterUrl(相对路径) + CDN 拼接 = 完整 m3u8 直链，parse:0
+  try {
+    const playData = await apiCallAuth('/api/v2/home/user/video/play/url', { id });
+    if (playData) {
+      const relUrl = playData.masterUrl || playData.p720Url || playData.p480Url || '';
+      if (relUrl) {
+        const cdns = await getCdnList();
+        // cdnId 提示用哪个 CDN；默认用第一个
+        let cdnIdx = 0;
+        const cdnIdMatch = String(relUrl).match(/cdnId=(\d+)/);
+        if (cdnIdMatch) {
+          const cid = parseInt(cdnIdMatch[1], 10);
+          if (cid >= 0 && cid < cdns.length) cdnIdx = cid;
+        }
+        const fullUrl = cdns[cdnIdx].replace(/\/$/, '') + relUrl;
+        return { parse: 0, url: fullUrl, header: { Referer: HOST + '/', 'User-Agent': UA } };
+      }
+    }
+  } catch (e) {
+    // 降级：返回空，让前端提示
+  }
+
+  return { parse: 0, url: '' };
 }
 
 async function search(reqIn) {
