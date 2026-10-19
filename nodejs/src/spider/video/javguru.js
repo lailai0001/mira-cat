@@ -211,6 +211,90 @@ function extractGateway(html, key) {
   return '';
 }
 
+// 从网关1页面计算网关2 URL
+// 网关1: <div id="{cid}" class="stream-box" data-x="p1" data-y="p2" data-z="p3">
+//         window.cfg = {cid, base, rtype, keys:[data-x, data-y, data-z]}
+// 网关2 = base + '?' + rtype + 'r=' + reverse(p1+p2+p3)
+function computeGateway2(html) {
+  const cidM = html.match(/cid:\s*'([^']+)'/);
+  const baseM = html.match(/base:\s*'([^']+)'/);
+  const rtypeM = html.match(/rtype:\s*'([^']+)'/);
+  const keysM = html.match(/keys:\s*\[\s*'([^']+)'\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*\]/);
+  if (!cidM || !baseM || !rtypeM || !keysM) return '';
+  const divM = html.match(new RegExp('<div[^>]+id="' + cidM[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '"[^>]*>'));
+  if (!divM) return '';
+  const divTag = divM[0];
+  const p1 = (divTag.match(new RegExp(keysM[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '="([^"]+)"')) || [])[1];
+  const p2 = (divTag.match(new RegExp(keysM[2].replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '="([^"]+)"')) || [])[1];
+  const p3 = (divTag.match(new RegExp(keysM[3].replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '="([^"]+)"')) || [])[1];
+  if (!p1 || !p2 || !p3) return '';
+  const rev = (p1 + p2 + p3).split('').reverse().join('');
+  return baseM[1] + '?' + rtypeM[1] + 'r=' + rev;
+}
+
+// Dean Edwards packer 解包
+function unpackDeanEdwards(html) {
+  const idx = html.indexOf('eval(function(p,a,c,k,e,d)');
+  if (idx < 0) return '';
+  const seg = html.slice(idx, idx + 25000);
+  const m = seg.match(/',(\d+),(\d+),'/);
+  if (!m) return '';
+  const radix = parseInt(m[1], 10);
+  const count = parseInt(m[2], 10);
+  const payloadStart = seg.indexOf("}('") + 3;
+  const payload = seg.slice(payloadStart, payloadStart + m.index);
+  const ksStart = seg.indexOf(",'", m.index) + 2;
+  const ksEnd = seg.indexOf("'.split", ksStart);
+  if (ksEnd < 0) return '';
+  const keys = seg.slice(ksStart, ksEnd).split('|');
+  const digits = '0123456789abcdefghijklmnopqrstuvwxyz';
+  function toRadix(n) {
+    if (n === 0) return '0';
+    let s = '';
+    while (n > 0) { s = digits[n % radix] + s; n = Math.floor(n / radix); }
+    return s;
+  }
+  let p = payload;
+  for (let c = count - 1; c >= 0; c--) {
+    const word = toRadix(c);
+    if (c < keys.length && keys[c]) {
+      p = p.replace(new RegExp('\\b' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g'), keys[c]);
+    }
+  }
+  return p;
+}
+
+// 从网关2页面提取 m3u8 地址 (优先 hls2 > hls3 > hls4)
+function extractM3u8(gw2html, gw2url) {
+  const unpacked = unpackDeanEdwards(gw2html);
+  const src = unpacked || gw2html;
+  // 找 links 对象
+  const links = {};
+  const lm = src.match(/var\s+links\s*=\s*(\{[^;]*?\});/);
+  if (lm) {
+    const hm = lm[1].match(/"hls2"\s*:\s*"([^"]+)"/);
+    const hm3 = lm[1].match(/"hls3"\s*:\s*"([^"]+)"/);
+    const hm4 = lm[1].match(/"hls4"\s*:\s*"([^"]+)"/);
+    if (hm) links.hls2 = hm[1];
+    if (hm3) links.hls3 = hm3[1];
+    if (hm4) links.hls4 = hm4[1];
+  }
+  // 兜底: 直接找 m3u8 URL
+  if (!links.hls2 && !links.hls3 && !links.hls4) {
+    const all = [...src.matchAll(/https?:\/\/[^"'\s\\]+\.m3u8[^"'\s\\]*/g)].map(x => x[0]);
+    if (all.length) return all[0];
+    return '';
+  }
+  let url = links.hls2 || links.hls3 || links.hls4 || '';
+  if (url && url.startsWith('/')) {
+    try {
+      const u = new URL(gw2url);
+      url = u.origin + url;
+    } catch (e) { /* ignore */ }
+  }
+  return url;
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -225,15 +309,37 @@ async function play(reqIn) {
     streamKey = parts[1];
   }
 
+  // 第1步: 详情页 -> 网关1 URL
   const html = await getHtml(detailUrl);
   if (!html) return { parse: 0, url: '' };
-  const gateway = extractGateway(html, streamKey);
-  if (!gateway) return { parse: 0, url: '' };
-  // 网关页用 JS 加载第三方 iframe, 用嗅探模式让播放器 WebView 捕获真实流
+  const gateway1 = extractGateway(html, streamKey);
+  if (!gateway1) return { parse: 0, url: '' };
+
+  // 第2步: 网关1 -> 计算网关2 URL
+  const gw1html = await getHtml(gateway1);
+  if (!gw1html) {
+    // 降级: 返回网关1用嗅探
+    return { parse: 1, url: gateway1, header: { 'User-Agent': UA, 'Referer': REFERER } };
+  }
+  const gateway2 = computeGateway2(gw1html);
+  if (!gateway2) {
+    return { parse: 1, url: gateway1, header: { 'User-Agent': UA, 'Referer': REFERER } };
+  }
+
+  // 第3步: 网关2 -> 解包 JS -> m3u8
+  const gw2html = await getHtml(gateway2);
+  if (!gw2html) {
+    return { parse: 1, url: gateway1, header: { 'User-Agent': UA, 'Referer': REFERER } };
+  }
+  const m3u8 = extractM3u8(gw2html, gateway2);
+  if (!m3u8) {
+    return { parse: 1, url: gateway1, header: { 'User-Agent': UA, 'Referer': REFERER } };
+  }
+  // 直链播放
   return {
-    parse: 1,
-    url: gateway,
-    header: { 'User-Agent': UA, 'Referer': REFERER },
+    parse: 0,
+    url: m3u8,
+    header: { 'User-Agent': UA, 'Referer': 'https://jav.guru/' },
   };
 }
 
