@@ -3,6 +3,7 @@
 // 原理: 逆向 JS PoW 验证 (FNV-1a) → 获取 vv_challenge cookie → 调用 JSON API
 // API: https://aa3.aa36jn.com:52000/api/v2/home/public/video/...
 // 响应解密: XOR (key 来自响应)
+// 封面: 官方签名接口 POST /api/v2/home/user/cdn/sign（需指纹登录）→ https://pps.aiide.online/...enc.js（内容为真实 JPEG）
 // 请求: 双通道 — 先框架 req(axios)，失败再试 Node 原生 fetch
 import req from '../../util/req.js';
 
@@ -19,10 +20,93 @@ const API_HOSTS = [
   'https://iv4.iv4muy.com:51999',
 ];
 
-// Cloudflare Worker 代理（解决 .enc 封面和视频 CDN 问题）
+// Cloudflare Worker 代理（视频 CDN 代理；封面已改走官方签名直链，不再需要 /uuimg）
 // 部署后填入 Worker 域名，如 'https://uu-proxy.xxx.workers.dev'
-// 为空时降级为直连（封面可能不显示、播放走嗅探）
+// 为空时降级为直连
 const WORKER_HOST = 'https://uu-proxy.li768435813.workers.dev';
+
+// 图片 CDN 配置缓存（从站点 API 获取：picUrl + bucket）
+let _imgCdn = null;
+async function getImgCdn() {
+  if (_imgCdn) return _imgCdn;
+  try {
+    const data = await apiCall('/api/v2/home/public/cdn/image/index', { channel: 'tz' });
+    if (data && Array.isArray(data.list) && data.list.length > 0) {
+      const line = data.list.find(l => l.picVideoUrl || l.picUrl) || data.list[0];
+      const pic = String(line.picVideoUrl || line.picUrl || '').replace(/\/+$/, '');
+      const bucket = String(line.bucket || '').replace(/^\/+|\/+$/g, '');
+      if (pic && bucket) {
+        let origin = pic;
+        try { origin = new URL(pic).origin; } catch { /* 用原值 */ }
+        _imgCdn = { origin, bucket };
+        return _imgCdn;
+      }
+    }
+  } catch { /* 降级 */ }
+  _imgCdn = { origin: 'https://pps.aiide.online', bucket: 'encryption-ts' };
+  return _imgCdn;
+}
+
+// 批量签名封面图（POST /api/v2/home/user/cdn/sign，需 accessToken）
+// thumbs: ['/uploads/file/20261019/xxx_compress.jpg.enc', ...]
+// 返回 Map: thumb -> 完整可访问的签名 URL
+async function signImages(thumbs) {
+  const result = new Map();
+  const uniq = [...new Set((thumbs || []).map(t).filter(Boolean))];
+  if (uniq.length === 0) return result;
+  const cdn = await getImgCdn();
+  // 构造签名 path：与前端逻辑一致 → `{bucket}/{thumb去前导斜杠}.js`
+  const pathMap = new Map(); // signPath -> thumb
+  const signPaths = [];
+  for (const th of uniq) {
+    // thumb 可能是相对路径或完整 URL，只取路径部分
+    let clean = th;
+    try {
+      if (/^https?:\/\//i.test(th)) clean = new URL(th).pathname;
+    } catch { /* 保持原值 */ }
+    clean = String(clean).replace(/^\/+/, '');
+    // 去掉可能已有的 bucket 前缀，避免重复
+    if (clean.startsWith(cdn.bucket + '/')) clean = clean.slice(cdn.bucket.length + 1);
+    const sp = clean.endsWith('.js') ? `${cdn.bucket}/${clean}` : `${cdn.bucket}/${clean}.js`;
+    pathMap.set(sp, th);
+    signPaths.push(sp);
+  }
+  let token = '';
+  try { token = await ensureAccessToken(); } catch { return result; }
+  for (const base of API_HOSTS) {
+    try {
+      const { text } = await httpPost(`${base}/api/v2/home/user/cdn/sign`,
+        JSON.stringify({ paths: signPaths }),
+        {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Referer': HOST + '/',
+          'Authorization': 'Bearer ' + token,
+        });
+      if (!text) continue;
+      const resp = JSON.parse(text);
+      if (resp.code !== 200) {
+        if (resp.code === 401) { _accessToken = ''; token = await ensureAccessToken().catch(() => ''); }
+        continue;
+      }
+      if (resp.data == null) continue;
+      let data = resp.data;
+      if (typeof data === 'string' && data) {
+        try { data = xorDecrypt(data, resp.key || ''); } catch { continue; }
+      }
+      if (data && Array.isArray(data.list)) {
+        for (const item of data.list) {
+          const th = pathMap.get(item.path);
+          if (th && item.url) {
+            result.set(th, `${cdn.origin}/${String(item.url).replace(/^\/+/, '')}`);
+          }
+        }
+        return result;
+      }
+    } catch { continue; }
+  }
+  return result;
+}
 
 // Cookie 缓存
 let _cookie = '';
@@ -375,21 +459,25 @@ async function getCategories() {
 }
 
 function formatVideo(v) {
-  // thumb 是 .enc 加密文件（如 ..._compress.jpg.enc），只在主站（需 PoW）
-  // 有 Worker 时走 /uuimg 代理；无 Worker 时降级为去 .enc 后缀直连（可能不显示）
-  let pic = '';
-  if (v.thumb) {
-    const encUrl = `${HOST}${v.thumb}`;
-    pic = WORKER_HOST
-      ? `${WORKER_HOST}/uuimg?url=${encodeURIComponent(encUrl)}`
-      : `${HOST}${String(v.thumb).replace(/\.enc$/, '')}`;
-  }
+  // thumb 是 .enc 加密图，封面地址由 fillPics() 批量签名后填入
   return {
     vod_id: String(v.id),
     vod_name: v.title || '',
-    vod_pic: pic,
+    vod_pic: '',
     vod_remarks: v.classifyTitles || v.labelTitles || '',
+    _thumb: t(v.thumb),
   };
+}
+
+// 批量签名并填入封面（列表页调用一次，20 张图一次签名请求）
+async function fillPics(list) {
+  const thumbs = list.map(v => v._thumb).filter(Boolean);
+  const signed = await signImages(thumbs);
+  for (const v of list) {
+    if (v._thumb) v.vod_pic = signed.get(v._thumb) || '';
+    delete v._thumb;
+  }
+  return list;
 }
 
 async function init(reqIn) {
@@ -403,7 +491,7 @@ async function home(reqIn) {
   const data = await apiCall('/api/v2/home/public/video/list', {
     page: '1', limit: '20', type: 'cate', typeId: firstCat.type_id, videoType: 'long',
   });
-  const list = data && data.list ? data.list.map(formatVideo) : [];
+  const list = data && data.list ? await fillPics(data.list.map(formatVideo)) : [];
   return {
     class: cats.map(c => ({ type_id: c.type_id, type_name: c.type_name })),
     list,
@@ -426,7 +514,7 @@ async function category(reqIn) {
   if (total > 0 && (page - 1) * 20 >= total) {
     return { page, pagecount: Math.ceil(total / 20) || 1, limit: 20, total, list: [] };
   }
-  const list = data && data.list ? data.list.map(formatVideo) : [];
+  const list = data && data.list ? await fillPics(data.list.map(formatVideo)) : [];
   return {
     page,
     pagecount: Math.ceil(total / 20) || 1,
@@ -448,18 +536,14 @@ async function detail(reqIn) {
 
     // 播放地址由 play() 通过播放地址 API 实时获取（指纹登录 → masterUrl + CDN 拼接）
     // 这里只传视频 id，play() 会处理
-    let pic = '';
-    if (data.thumb) {
-      const encUrl = `${HOST}${data.thumb}`;
-      pic = WORKER_HOST
-        ? `${WORKER_HOST}/uuimg?url=${encodeURIComponent(encUrl)}`
-        : `${HOST}${String(data.thumb).replace(/\.enc$/, '')}`;
-    }
+    // 封面走官方签名接口批量签名
+    const thumbs = data.thumb ? [t(data.thumb)] : [];
+    const signed = await signImages(thumbs);
 
     list.push({
       vod_id: vodId,
       vod_name: data.title || '',
-      vod_pic: pic,
+      vod_pic: data.thumb ? (signed.get(t(data.thumb)) || '') : '',
       vod_content: (data.content || '').replace(/<[^>]+>/g, '').trim(),
       vod_play_from: 'Uu视频',
       vod_play_url: `正片$${vodId}`,
@@ -524,7 +608,8 @@ async function search(reqIn) {
   const data = await apiCall('/api/v2/home/public/video/search', {
     page: String(page), limit: '20', keyword: wd, videoType: 'long',
   });
-  const list = data && (data.list || data.data) ? (data.list || data.data).map(formatVideo) : [];
+  const rawList = data && (data.list || data.data) ? (data.list || data.data) : [];
+  const list = await fillPics(rawList.map(formatVideo));
   return { page, pagecount: 1, limit: 20, total: list.length, list };
 }
 
