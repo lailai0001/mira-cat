@@ -152,7 +152,7 @@ async function ensureCookie() {
   }
   const jsonText = new TextDecoder().decode(arr);
   const challengeData = JSON.parse(jsonText);
-  const { token, returnPath } = challengeData[0];
+  const { token, postUrl, returnPath } = challengeData[0];
 
   // 3. 解析 JWT payload
   const payloadB64 = token.split('.')[0];
@@ -183,10 +183,10 @@ async function ensureCookie() {
   const proofKey = fnv1a([token, meta.ua, meta.lang, meta.tz, meta.screen, String(proof)].join('|'));
   const powResult = { token, proof, meta, path: returnPath, key: proofKey };
 
-  // 6. POST 验证（form-urlencoded 到 returnPath）
+  // 6. POST 验证（form-urlencoded 到 postUrl，即 /_view/challenge）
   const body = '__viewChallenge=' + encodeURIComponent(JSON.stringify(powResult));
-  const postUrl = `${HOST}${returnPath}`;
-  const { headers: rh } = await httpPost(postUrl, body, {
+  const verifyUrl = `${HOST}${postUrl || '/_view/challenge'}`;
+  const { headers: rh } = await httpPost(verifyUrl, body, {
     'Content-Type': 'application/x-www-form-urlencoded',
     'Accept': 'application/json',
     'Referer': challengeUrl,
@@ -207,16 +207,14 @@ async function ensureCookie() {
   return _cookie;
 }
 
-// 调用 API（自动处理验证和解密）
+// 调用 API（API 服务器无需 PoW cookie，直接调用；自动 XOR 解密）
 async function apiCall(apiPath, params = {}) {
-  const cookie = await ensureCookie();
   const query = new URLSearchParams(params).toString();
-  
+
   for (const base of API_HOSTS) {
     const url = `${base}${apiPath}${query ? '?' + query : ''}`;
     try {
       const { text } = await httpGet(url, {
-        'Cookie': cookie,
         'Referer': HOST + '/',
         'Accept': 'application/json',
       });
@@ -224,7 +222,7 @@ async function apiCall(apiPath, params = {}) {
       const resp = JSON.parse(text);
       if (resp.code !== 200) continue;
       if (!resp.data) return null;
-      // 解密
+      // XOR 解密（key 来自响应）
       const decrypted = xorDecrypt(resp.data, resp.key || '');
       return decrypted;
     } catch {
@@ -239,16 +237,19 @@ let _categories = null;
 
 async function getCategories() {
   if (_categories) return _categories;
-  const data = await apiCall('/api/v2/home/public/video/cate/list', { type: 'long' });
-  if (data && data.list) {
-    _categories = data.list.map(c => ({
-      type_id: String(c.id),
-      type_name: c.title || c.name,
-    }));
-    return _categories;
-  }
-  // 降级：硬编码
-  return [
+  try {
+    const data = await apiCall('/api/v2/home/public/video/cate/list', { type: 'long' });
+    if (data && data.list && data.list.length > 0) {
+      _categories = data.list.map(c => ({
+        type_id: String(c.id),
+        type_name: c.title || c.name,
+      }));
+      return _categories;
+    }
+  } catch { /* 降级到硬编码 */ }
+  // 降级：硬编码（2026-10-19 从 API 实测的 18 个真实分类）
+  _categories = [
+    { type_id: '268', type_name: '热门' },
     { type_id: '262', type_name: '国产' },
     { type_id: '263', type_name: '日本AV' },
     { type_id: '343', type_name: 'AV无码' },
@@ -264,17 +265,25 @@ async function getCategories() {
     { type_id: '266', type_name: '传媒' },
     { type_id: '345', type_name: '女主播' },
     { type_id: '346', type_name: 'VR' },
+    { type_id: '357', type_name: '新闻' },
+    { type_id: '269', type_name: '其他' },
   ];
+  return _categories;
 }
 
 function formatVideo(v) {
-  // thumb 是 .enc 加密，暂时直接用（可能显示不出）
-  // href 是 m3u8 相对路径，需要 CDN 前缀
+  // thumb 是 .enc 加密文件（如 ..._compress.jpg.enc）
+  // 去掉 .enc 后缀，主站可返回图片（需过验证，App 端可能可显示）
+  let pic = '';
+  if (v.thumb) {
+    const thumbPath = String(v.thumb).replace(/\.enc$/, '');
+    pic = `${HOST}${thumbPath}`;
+  }
   return {
     vod_id: String(v.id),
     vod_name: v.title || '',
-    vod_pic: v.thumb ? `https://aa3.aa36jn.com:52000${v.thumb}` : '',
-    vod_remarks: v.classifyTitles || '',
+    vod_pic: pic,
+    vod_remarks: v.classifyTitles || v.labelTitles || '',
   };
 }
 
@@ -324,20 +333,26 @@ async function detail(reqIn) {
     const vodId = String(raw).trim();
     const data = await apiCall('/api/v2/home/public/video/long/detail', { id: vodId });
     if (!data) continue;
-    
-    // 播放地址：href 是相对路径，需要 CDN
-    // 暂时尝试用 API host，实际 CDN 待确认
+
+    // 构造播放地址：/m3u8_video/go/{date}/{mediaId}/play.m3u8
+    // date 从 createdAt 取（YYYYMMDD），mediaId 从 data.mediaId 取
     let playUrl = '';
-    if (data.href) {
-      // href 如 /m3u8_video/go/20261018/44365/play.m3u8
-      // 需要找到视频 CDN，暂时用占位
-      playUrl = data.href;
+    if (data.mediaId) {
+      const dateStr = String(data.createdAt || '').slice(0, 10).replace(/-/g, '');
+      if (dateStr && /^\d{8}$/.test(dateStr)) {
+        playUrl = `/m3u8_video/go/${dateStr}/${data.mediaId}/play.m3u8`;
+      }
     }
-    
+
+    let pic = '';
+    if (data.thumb) {
+      pic = `${HOST}${String(data.thumb).replace(/\.enc$/, '')}`;
+    }
+
     list.push({
       vod_id: vodId,
       vod_name: data.title || '',
-      vod_pic: data.thumb || '',
+      vod_pic: pic,
       vod_content: (data.content || '').replace(/<[^>]+>/g, '').trim(),
       vod_play_from: 'Uu视频',
       vod_play_url: playUrl ? `正片$${playUrl}` : '',
@@ -351,19 +366,20 @@ async function play(reqIn) {
   let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
   if (id.includes('$')) id = id.split('$').pop().trim();
-  
+
   // 如果已经是完整 URL，直接返回
   if (/^https?:\/\//i.test(id)) {
     return { parse: 0, url: id, header: { Referer: HOST + '/', 'User-Agent': UA } };
   }
-  
-  // 如果是相对路径，尝试补全 CDN
-  // 注意：视频 CDN 待确认，这里先返回相对路径让 MiraPlayer 尝试
+
+  // 相对路径（如 /m3u8_video/go/20261018/44365/play.m3u8）
+  // 视频 CDN 未找到，尝试用 API host 拼接（可能 404）
+  // 返回 parse:1 让 MiraPlayer 尝试嗅探
   if (id.startsWith('/')) {
-    // 尝试用 API host（可能不行，需要真实 CDN）
-    return { parse: 0, url: id, header: { Referer: HOST + '/', 'User-Agent': UA } };
+    const fullUrl = `${API_HOSTS[0]}${id}`;
+    return { parse: 1, url: fullUrl, header: { Referer: HOST + '/', 'User-Agent': UA } };
   }
-  
+
   return { parse: 0, url: id };
 }
 
