@@ -19,6 +19,11 @@ const API_HOSTS = [
   'https://iv4.iv4muy.com:51999',
 ];
 
+// Cloudflare Worker 代理（解决 .enc 封面和视频 CDN 问题）
+// 部署后填入 Worker 域名，如 'https://uu-proxy.xxx.workers.dev'
+// 为空时降级为直连（封面可能不显示、播放走嗅探）
+const WORKER_HOST = '';
+
 // Cookie 缓存
 let _cookie = '';
 let _cookieTime = 0;
@@ -272,12 +277,14 @@ async function getCategories() {
 }
 
 function formatVideo(v) {
-  // thumb 是 .enc 加密文件（如 ..._compress.jpg.enc）
-  // 去掉 .enc 后缀，主站可返回图片（需过验证，App 端可能可显示）
+  // thumb 是 .enc 加密文件（如 ..._compress.jpg.enc），只在主站（需 PoW）
+  // 有 Worker 时走 /uuimg 代理；无 Worker 时降级为去 .enc 后缀直连（可能不显示）
   let pic = '';
   if (v.thumb) {
-    const thumbPath = String(v.thumb).replace(/\.enc$/, '');
-    pic = `${HOST}${thumbPath}`;
+    const encUrl = `${HOST}${v.thumb}`;
+    pic = WORKER_HOST
+      ? `${WORKER_HOST}/uuimg?url=${encodeURIComponent(encUrl)}`
+      : `${HOST}${String(v.thumb).replace(/\.enc$/, '')}`;
   }
   return {
     vod_id: String(v.id),
@@ -350,7 +357,10 @@ async function detail(reqIn) {
 
     let pic = '';
     if (data.thumb) {
-      pic = `${HOST}${String(data.thumb).replace(/\.enc$/, '')}`;
+      const encUrl = `${HOST}${data.thumb}`;
+      pic = WORKER_HOST
+        ? `${WORKER_HOST}/uuimg?url=${encodeURIComponent(encUrl)}`
+        : `${HOST}${String(data.thumb).replace(/\.enc$/, '')}`;
     }
 
     list.push({
@@ -377,9 +387,13 @@ async function play(reqIn) {
   }
 
   // 相对路径（如 /m3u8_video/go/20261018/44365/play.m3u8）
-  // 视频 CDN 未找到，尝试用 API host 拼接（可能 404）
-  // 返回 parse:1 让 MiraPlayer 尝试嗅探
+  // 有 Worker 时走 /uuvideo 代理（parse:0 直连）；无 Worker 时降级 parse:1 嗅探
   if (id.startsWith('/')) {
+    if (WORKER_HOST) {
+      const workerUrl = `${WORKER_HOST}/uuvideo?url=${encodeURIComponent(id)}`;
+      return { parse: 0, url: workerUrl, header: { Referer: HOST + '/', 'User-Agent': UA } };
+    }
+    // 降级：尝试用 API host 拼接（可能 404），parse:1 嗅探
     const fullUrl = `${API_HOSTS[0]}${id}`;
     return { parse: 1, url: fullUrl, header: { Referer: HOST + '/', 'User-Agent': UA } };
   }
