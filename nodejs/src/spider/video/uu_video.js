@@ -22,7 +22,7 @@ const API_HOSTS = [
 // Cloudflare Worker 代理（解决 .enc 封面和视频 CDN 问题）
 // 部署后填入 Worker 域名，如 'https://uu-proxy.xxx.workers.dev'
 // 为空时降级为直连（封面可能不显示、播放走嗅探）
-const WORKER_HOST = '';
+const WORKER_HOST = 'https://uu-proxy.li768435813.workers.dev';
 
 // Cookie 缓存
 let _cookie = '';
