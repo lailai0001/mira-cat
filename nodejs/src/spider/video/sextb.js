@@ -42,7 +42,7 @@ const REFERER = SITE + '/';
 // SexTB 专用 HLS 代理 Worker 地址（sextb-hls-worker.js，用户手动部署到
 // 自己的 Cloudflare 后填这里，如 https://sextb-hls.xxx.workers.dev）。
 // 留空 = 未部署: F4 线路无法解析（站方 Origin 墙）、SW 走蜘蛛内解析。
-const SEXTB_WORKER = '';
+const SEXTB_WORKER = 'https://sextb-hls.li768435813.workers.dev';
 
 // 核心分类 + 精选题材 (2026-10-20 从 /genres 页实测存在，两域名通用)
 const CATS = [
