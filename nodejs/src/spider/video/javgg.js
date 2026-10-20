@@ -29,6 +29,13 @@ import req from '../../util/req.js';
 //   拉列表、透传分片全在 Worker 同一出口完成，播放器只连 Worker、零自定义头。
 //   Worker 本体已在 VM 用真实样本全链验证（/v 200、719 分片全经 /s 200、Range 206）。
 //   下方 VIDHIDE_WORKER 常量填入部署地址后生效；留空则 vidhide 维持第三轮嗅探行为。
+// 提速(2026-10-20 第五轮): 第四轮真机全通但播放加载慢。实测瓶颈在串行往返:
+//   play() 先 collectEmbeds(3 个 dooplayer API)才返回 Worker /v, 播放器再串行
+//   /v→/p→首分片, 每跳 Worker 都实时回源(/v 1.2~2.6s、/p 1.1~1.8s)。
+//   → detail 阶段就并行收集线路, 把 embed 列表 base64url 编进 play id;
+//     play() 解出后跳过 collectEmbeds: vidhide-only 直接返回 Worker 地址(本地零网络),
+//     playmate/vidara 仍竞速直解。旧 id(无 $@ 负载)自动回退原 collectEmbeds 流程。
+//   → Worker v2 给 /v、/p 加 Cache API 边缘缓存并在 /v 时后台预热首变体 /p 与首分片。
 
 const KEY = 'py_javgg';
 const NAME = 'JavGG';
@@ -58,6 +65,17 @@ const CATS = [
 
 function t(v) {
   return String(v == null ? '' : v).trim();
+}
+
+// base64url（与 avhub 等源同款 Buffer 写法）: detail 把线路 embed 列表编进 play id 用
+function b64urlEncode(s) {
+  return Buffer.from(String(s), 'utf8').toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlDecode(s) {
+  try {
+    return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+  } catch (e) { return ''; }
 }
 
 function clean(s) {
@@ -314,6 +332,20 @@ async function detail(reqIn) {
   const postM = html.match(/data-post=['"](\d+)['"]/);
   const postId = postM ? postM[1] : '';
 
+  // 提速: 在 detail 阶段顺带并行收集线路 embed（有界 4s），编进 play id 的 $@ 负载，
+  // play() 解出后跳过 collectEmbeds 往返。收集失败/为空则退回旧 id 形式，
+  // play() 会按原流程现场收集，行为与第四轮完全一致。
+  let playId = postId ? postId + '$' + durl : durl;
+  if (postId) {
+    try {
+      const embeds = await collectEmbeds(postId, 4000);
+      if (embeds && embeds.length) {
+        const payload = b64urlEncode(JSON.stringify({ e: embeds.map(e => e.embedUrl) }));
+        if (payload) playId += '$@' + payload;
+      }
+    } catch (e) { /* 保持旧 id 形式 */ }
+  }
+
   return {
     list: [{
       vod_id: durl,
@@ -321,7 +353,7 @@ async function detail(reqIn) {
       vod_pic: pic,
       vod_content: content,
       vod_play_from: 'JavGG',
-      vod_play_url: `正片$${postId ? postId + '$' + durl : durl}`,
+      vod_play_url: `正片$${playId}`,
     }],
   };
 }
@@ -381,7 +413,7 @@ function classifyEmbed(embedUrl) {
   return { embedUrl, prio: 99, kind: 'other', decoder: null };
 }
 
-async function collectEmbeds(postId) {
+async function collectEmbeds(postId, budgetMs) {
   const fetchEmbed = async (srv) => {
     try {
       const apiText = await getText(`${SITE}/wp-json/dooplayer/v2/${postId}/movie/${srv}`, { 'Accept': 'application/json' }, 10);
@@ -391,8 +423,8 @@ async function collectEmbeds(postId) {
       return classifyEmbed(embedUrl);
     } catch (e) { return null; }
   };
-  // 并行收集，限时 5s：慢的 server 不阻塞已拿到的线路
-  const embeds = (await settleWithin([1, 2, 3].map(fetchEmbed), 5000)).filter(Boolean);
+  // 并行收集，限时（默认 5s；detail 预收集收紧到 4s）：慢的 server 不阻塞已拿到的线路
+  const embeds = (await settleWithin([1, 2, 3].map(fetchEmbed), budgetMs || 5000)).filter(Boolean);
   embeds.sort((a, b) => a.prio - b.prio);
   return embeds;
 }
@@ -405,6 +437,20 @@ async function play(reqIn) {
   if (id.startsWith('正片$')) id = id.slice(3);
   if (/\.m3u8(\?|$)/i.test(id)) {
     return { parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': REFERER } };
+  }
+  // 提速快速通道: detail 已把线路 embed 列表编进 id 尾部的 $@ 负载 → 解出后直接用，
+  // 跳过 collectEmbeds 的 3 个 dooplayer API 往返（vidhide-only 时 play 本地零网络
+  // 立刻返回 Worker 地址）。负载缺失/损坏则剥离后走原流程，旧 id 完全兼容。
+  let fastEmbeds = null;
+  const fm = id.match(/\$@([A-Za-z0-9_-]+)$/);
+  if (fm) {
+    try {
+      const payload = JSON.parse(b64urlDecode(fm[1]) || '{}');
+      const urls = Array.isArray(payload.e) ? payload.e : [];
+      const list = urls.map(u => classifyEmbed(t(u))).filter(Boolean);
+      if (list.length) fastEmbeds = list;
+    } catch (e) { /* 负载坏了就当没有 */ }
+    id = id.slice(0, fm.index);
   }
   let postId = '';
   let durl = '';
@@ -423,7 +469,7 @@ async function play(reqIn) {
   if (!postId) return { parse: 0, url: '' };
   if (!durl) durl = REFERER;
 
-  const embeds = await collectEmbeds(postId);
+  const embeds = fastEmbeds || await collectEmbeds(postId);
 
   // 1) 只对带解码器的 playmate/vidara 竞速直解：最高优先级成功立即返回，
   //    低优先级先成功等 2.5s 宽限盼高优先级，整轮预算 13s
