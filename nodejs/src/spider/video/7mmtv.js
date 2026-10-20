@@ -33,9 +33,27 @@
 // (首字节 0x89, 其后为 188 对齐真 TS), 原生播放器不认 —— 配套
 // Worker 的 /s 带图片前缀剥离 (与 BigButtsHub 二轮同款已验逻辑);
 // VH(mmvh02) 线分片实测为干净 TS。
-// 无码破解 (reducing-mosaic) 分区详情页只有 SP 一条线: detail 时按
-// 番号站内搜索同片的其他分区版本 (抽样 3/3 命中 censored 孪生),
-// 借用其 SW/VH 线; 找不到才只剩 SP 兜底。
+// 2026-10-21 二轮 (真机反馈: 部分帖 SW/VH 点开播不了) 普查结论:
+// vidhide 系 embed 的 links 分三档 (hls4/hls3/hls2), 只有 hls4 档的
+// token 能被同出口 Worker 链用活; hls3/hls2 对一切非浏览器/机房出口
+// 一律 403/连接切断/502 (VM 与 Worker 出口双实证)。不少帖子的 embed
+// 根本没有 hls4 档 (如 censored 的 SSIS-832 三条 W 线全无 hls4) ——
+// 这类线经 Worker 必 502, 是死线。另有 hls4 档在、但分片后端整表
+// 死亡的 (redirector.cdnsync.cloud 全段 522, 如 censored SSIS-817
+// 的 VH 线)。SW 线 (qooglecdn 后端) 本轮抽测 100% 存活, VH 线分片
+// 后端 (cdnsync) 明显更脆。
+// 二轮 detail 策略: 对每条 W 线 embed 在蜘蛛侧抓 embed 页解包验档
+// (纯 JS Dean Edwards 解包, 与 Worker 同算法), 只保留有 hls4 的线;
+// 本帖 W 线全灭时按番号借同片其他分区版本的线 (借线触发条件由
+// "无 W 线" 放宽为 "无可用 W 线", SSIS-832/817 即靠借 reducing-
+// mosaic 版的 SW 线得救); 组装后对首条 W 线经 Worker 探活首分片,
+// 死则把第二条 W 线提到前面。探测失败 (网络异常) 一律按存活对待,
+// 绝不因探测误杀好线。
+// 无码破解 (reducing-mosaic) 等分区的部分帖子全站任何版本都没有
+// vidhide 线 (只有 SP/DO): 这类帖无可借之线, 只剩 SP/DO 嗅探兜底,
+// 属站方内容构成问题, 非蜘蛛可解 (如 FTHT-360、259LUXU-990)。
+// (一轮旧注 "无码破解详情页只有 SP 一条线" 不准确: 该分区多数帖
+//  有自己的 SW/VH 线, 少数帖才只有 SP。)
 import req from '../../util/req.js';
 
 const KEY = 'py_7mmtv';
@@ -658,6 +676,98 @@ function srvInfo(e) {
   return { name: 'SP', kind: 'S' };
 }
 
+// ---------- embed 验档 (与 mmtv-vidhide Worker 同算法的纯 JS 解包) ----------
+// vidhide 系 embed 页的 links 分 hls4/hls3/hls2 三档: 只有 hls4 能被
+// Worker 链用活, hls3/hls2 对非浏览器出口全拒。detail 时先在蜘蛛侧
+// 解包 embed 页验档, 无 hls4 的 embed 是必死线, 不组装进线路表。
+function jsUnescapeSingle(s) {
+  return s.replace(/\\(.)/g, (m, c) => {
+    if (c === 'n') return '\n';
+    if (c === 'r') return '\r';
+    if (c === 't') return '\t';
+    return c;
+  });
+}
+function unpackPacker(html) {
+  const m = String(html).match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\s*\(\s*'((?:[^'\\]|\\.)*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:[^'\\]|\\.)*)'\.split\('\|'\)/);
+  if (!m) return '';
+  let p = jsUnescapeSingle(m[1]);
+  const a = parseInt(m[2], 10);
+  const c = parseInt(m[3], 10);
+  const k = jsUnescapeSingle(m[4]).split('|');
+  const enc = (n) => (n < a ? '' : enc(Math.floor(n / a))) + ((n % a) > 35 ? String.fromCharCode((n % a) + 29) : (n % a).toString(36));
+  let i = c;
+  while (i--) {
+    if (k[i]) {
+      const word = k[i];
+      p = p.replace(new RegExp('\\b' + enc(i) + '\\b', 'g'), () => word);
+    }
+  }
+  return p;
+}
+function extractEmbedLinks(text) {
+  const links = {};
+  for (const m of String(text).matchAll(/"hls(\d+)"\s*:\s*"([^"]+)"/g)) {
+    links['hls' + m[1]] = m[2];
+  }
+  if (!Object.keys(links).length) {
+    const f = String(text).match(/"file"\s*:\s*"(https?:[^"]+\.m3u8[^"]*)"/) || String(text).match(/(https?:\/\/[^\s"'\\]+\.m3u8[^\s"'\\]*)/);
+    if (f) links.hls2 = f[1];
+  }
+  return links;
+}
+// true = 有 hls4 (可用); false = 明确无 hls4 (死线); 探测失败返回 true
+// (按存活对待, 不因网络抖动误杀)
+const tierCache = new Map();
+async function probeEmbedViable(embed, referer) {
+  if (tierCache.has(embed)) return tierCache.get(embed);
+  let viable = true;
+  try {
+    const html = await fetchText(embed, referer, 12000);
+    if (html) {
+      const links = extractEmbedLinks(unpackPacker(html) || html);
+      viable = !!links.hls4;
+      tierCache.set(embed, viable);
+      if (tierCache.size > 300) tierCache.clear();
+    }
+  } catch (e) { /* 探测异常 -> 按存活对待 */ }
+  return viable;
+}
+async function filterViableW(wEmbeds, referer) {
+  if (!wEmbeds.length) return [];
+  const flags = await Promise.all(wEmbeds.map(e => probeEmbedViable(e.embed, referer)));
+  return wEmbeds.filter((e, i) => flags[i]);
+}
+// 经 Worker 探活一条线的首分片: 'alive' | 'dead' | 'unknown'
+// (探活的 /v 请求同时给 Worker 的边缘缓存预热, 真 play 时更快)
+async function probeLineAlive(embed, referer) {
+  try {
+    if (typeof fetch !== 'function') return 'unknown';
+    const wurl = `${MMTV_WORKER}/v?u=${encodeURIComponent(embed)}&r=${encodeURIComponent(referer)}`;
+    let txt = await fetchText(wurl, referer, 30000);
+    if (!txt || !txt.includes('#EXTM3U')) return 'unknown';
+    let seg = '';
+    for (let hop = 0; hop < 2 && !seg; hop++) {
+      const line = txt.split('\n').map(s => s.trim()).find(s => s && !s.startsWith('#'));
+      if (!line) return 'unknown';
+      if (/\.m3u8($|\?)|\/p\?/.test(line)) {
+        txt = await fetchText(line, referer, 20000);
+        if (!txt || !txt.includes('#EXTM3U')) return 'unknown';
+      } else seg = line;
+    }
+    if (!seg) return 'unknown';
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort(), 25000);
+    try {
+      const r = await fetch(seg, { headers: { 'Range': 'bytes=0-0', 'User-Agent': UA }, signal: ctl.signal });
+      if (r.status !== 200 && r.status !== 206) return 'dead';
+      const buf = new Uint8Array(await r.arrayBuffer());
+      if (!buf.length) return 'unknown';
+      return buf[0] === 0x47 ? 'alive' : 'dead';
+    } finally { clearTimeout(to); }
+  } catch (e) { return 'unknown'; }
+}
+
 // ---------- 路由处理器 ----------
 async function init(reqIn) {
   return {};
@@ -699,15 +809,23 @@ function codeOf(url) {
   return m ? m[1] : '';
 }
 
-// 无码破解等只有 SP 的详情: 站内搜番号找其他分区的同片, 借其 embed
+// 站内搜番号找同片的其他分区版本, 借其可用的 W 线 embed (验档在
+// 本函数内做: 抓到一个孪生页就先验它的线, 有可用线立即返回, 不白
+// 抓第二个)。amateur/klive 的帖 URL 文件名是 content.html 无番号,
+// 无法按号搜, 跳过。
 const twinCache = new Map();
-async function findTwinEmbeds(code, selfUrl) {
-  if (!code || twinCache.has(code)) return twinCache.get(code) || [];
-  let embeds = [];
+async function findViableTwinEmbeds(code, selfUrl) {
+  if (!code || code === 'content') return [];
+  if (twinCache.has(code)) return twinCache.get(code);
+  let viable = [];
   try {
-    const html = await postForm(HOST + '/zh/searchform_search/all/index.html',
-      { search_keyword: code, search_type: 'searchall', op: 'search' }, selfUrl);
-    const cards = parseCards(html || '');
+    // 先走 GET 搜索 (与 search() 同端点, 可缓存、较快); 无卡再落 POST 表单搜索
+    let cards = parseCards(await getPage(`${HOST}/zh/searchall_search/all/${encodeURIComponent(code)}/1.html`, 60000, selfUrl) || '');
+    if (!cards.length) {
+      const html = await postForm(HOST + '/zh/searchform_search/all/index.html',
+        { search_keyword: code, search_type: 'searchall', op: 'search' }, selfUrl);
+      cards = parseCards(html || '');
+    }
     const pref = ['censored', 'chinese', 'uncensored', 'amateurjav', 'amateur', 'klive'];
     const twins = cards
       .map(c => c.vod_id)
@@ -717,12 +835,46 @@ async function findTwinEmbeds(code, selfUrl) {
       const thtml = await fetchText(tu, selfUrl, 12000);
       if (!thtml) continue;
       const te = extractEmbeds(thtml).filter(e => srvInfo(e).kind === 'W');
-      if (te.length) { embeds = te; break; }
+      if (!te.length) continue;
+      const tv = await filterViableW(te, selfUrl);
+      if (tv.length) { viable = tv; break; }
     }
   } catch (e) { /* 忽略, 只剩 SP 兜底 */ }
-  twinCache.set(code, embeds);
+  twinCache.set(code, viable);
   if (twinCache.size > 200) twinCache.clear();
-  return embeds;
+  return viable;
+}
+
+// 线路组装 helper: W 线 (已验档) + 本帖 S 线 -> 分组与顺序; 再经
+// Worker 探活 W 线首分片决定 W 线间顺序与"是否有活线"。
+// 返回 { order, anyW, wAlive } —— wAlive=false 表示无 W 线, 或探活
+// 的 W 线全被判死 (分片后端死亡), 调用方应尝试借线。
+function buildGroups(wEmbeds, sEmbeds) {
+  const groups = new Map();
+  for (const e of wEmbeds.concat(sEmbeds)) {
+    const info = srvInfo(e);
+    if (!groups.has(info.name)) groups.set(info.name, { kind: info.kind, parts: [] });
+    groups.get(info.name).parts.push(e);
+  }
+  for (const grp of groups.values()) grp.parts.sort((x, y) => x.part - y.part);
+  return groups;
+}
+async function orderWithProbe(groups, referer) {
+  const order = ['SW', 'VH', 'DO', 'SP'].filter(n => groups.has(n));
+  const wLines = order.filter(n => groups.get(n).kind === 'W');
+  if (!wLines.length) return { order, anyW: false, wAlive: false };
+  const st1 = await probeLineAlive(groups.get(wLines[0]).parts[0].embed, referer);
+  if (st1 === 'alive' || st1 === 'unknown') return { order, anyW: true, wAlive: true };
+  // 首条 W 线被判死
+  if (wLines.length > 1) {
+    const st2 = await probeLineAlive(groups.get(wLines[1]).parts[0].embed, referer);
+    if (st2 === 'alive') {
+      const rest = order.filter(n => n !== wLines[0] && n !== wLines[1]);
+      return { order: [wLines[1], wLines[0]].concat(rest), anyW: true, wAlive: true };
+    }
+    if (st2 === 'unknown') return { order, anyW: true, wAlive: true };
+  }
+  return { order, anyW: true, wAlive: false };
 }
 
 async function detail(reqIn) {
@@ -747,24 +899,26 @@ async function detail(reqIn) {
     }
   }
   const descM = html.match(/<meta name="description" content="([^"]*)"/);
-  let embeds = extractEmbeds(html);
-  if (!embeds.some(e => srvInfo(e).kind === 'W')) {
-    const twin = await findTwinEmbeds(code, durl);
-    if (twin.length) embeds = twin.concat(embeds);
+  const allEmbeds = extractEmbeds(html);
+  const ownS = allEmbeds.filter(e => srvInfo(e).kind !== 'W');
+  // W 线先验档: 无 hls4 的 embed 经 Worker 必死, 不进线路表
+  let wEmbeds = await filterViableW(allEmbeds.filter(e => srvInfo(e).kind === 'W'), durl);
+  let groups = buildGroups(wEmbeds, ownS);
+  let ord = await orderWithProbe(groups, durl);
+  if (!ord.wAlive) {
+    // 本帖无可用 W 线 (无 hls4 / 分片后端全死 / 根本没有 W 线):
+    // 借同片其他分区版本的可用线
+    const tv = await findViableTwinEmbeds(code, durl);
+    if (tv.length) {
+      wEmbeds = tv;
+      groups = buildGroups(wEmbeds, ownS);
+      ord = await orderWithProbe(groups, durl);
+    }
   }
-  // 线路组装: 按站方按钮顺序 SW/VH/DO/SP, 同线多 CD 分集
-  const order = ['SW', 'VH', 'DO', 'SP'];
-  const groups = new Map();
-  for (const e of embeds) {
-    const info = srvInfo(e);
-    if (!groups.has(info.name)) groups.set(info.name, { kind: info.kind, parts: [] });
-    groups.get(info.name).parts.push(e);
-  }
+  const lineOrder = ord.order;
   const fromArr = [], urlArr = [];
-  for (const lname of order) {
+  for (const lname of lineOrder) {
     const grp = groups.get(lname);
-    if (!grp) continue;
-    grp.parts.sort((x, y) => x.part - y.part);
     const eps = grp.parts.map((e, i) => {
       const epName = grp.parts.length > 1 ? `CD${e.part}` : (code || '正片');
       const pid = `${grp.kind}|${encodeURIComponent(e.embed)}|${encodeURIComponent(durl)}`;
