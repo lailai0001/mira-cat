@@ -23,6 +23,14 @@ import req from '../../util/req.js';
 //        但抽查 18 部剧 35 集 (修仙/都市/古装/家庭伦理/武侠等，含首集与末集)
 //        data-price 全部为 0、data-free=true，playback 均正常发授权。
 //        若日后某集 price>0，接口会回 402，play() 自动落 parse:1 嗅探集页面兜底。
+// 2026-10-20 翻页修复 (真机反馈: 除全部短剧外所有分类无法加载更多):
+//   服务端复测 (inject + 真实 HTTP) 29 分类 p1/p2 全部正确，问题出在分类 id
+//   回传环节: 'genre:urban'/'tag:romance' 含冒号，与能正常翻页的 'all' 的唯一
+//   差异就在冒号。改为无冒号 id ('g_'/'t_' 前缀)，category() 同时兼容旧冒号 id、
+//   百分号编码、裸 slug、中文名与 pg 页码字段，任何回传形态都能正确定位分类。
+//   附带修复: 卡片链接只认 season-1，导致已出到 season-2+ 的剧被整卡丢弃
+//   (校园少 2 部、绿帽少 4 部等)，改认 season-<数字>；单页满 24 条时不再误报
+//   第 2 页 (逆袭实为单页 24 条)。
 
 const KEY = 'py_youzidj';
 const NAME = '柚子短剧';
@@ -66,8 +74,8 @@ const TAGS = [
 
 const CATS = [
   { type_id: 'all', type_name: '全部短剧' },
-  ...GENRES.map(g => ({ type_id: 'genre:' + g.slug, type_name: g.name })),
-  ...TAGS.map(g => ({ type_id: 'tag:' + g.slug, type_name: g.name })),
+  ...GENRES.map(g => ({ type_id: 'g_' + g.slug, type_name: g.name })),
+  ...TAGS.map(g => ({ type_id: 't_' + g.slug, type_name: g.name })),
 ];
 
 function t(v) {
@@ -175,7 +183,7 @@ function parseCards(html) {
   const parts = String(html).split('<article class="drama-card');
   for (let i = 1; i < parts.length; i++) {
     const block = parts[i].slice(0, 6000);
-    const hm = block.match(/href="(https:\/\/youzidj\.com\/dramas\/[a-z0-9\-]+\/season-1\/)"/);
+    const hm = block.match(/href="(https:\/\/youzidj\.com\/dramas\/[a-z0-9\-]+\/season-\d+\/)"/);
     if (!hm) continue;
     const url = hm[1];
     if (seen.has(url)) continue;
@@ -202,14 +210,25 @@ function parsePagecount(html, page, got) {
   let pc = page || 1;
   const nums = [...String(html).matchAll(/\/page\/(\d+)\//g)].map(x => parseInt(x[1], 10)).filter(n => n > 0 && n < 10000);
   if (nums.length) pc = Math.max(pc, ...nums);
-  if (got >= 24) pc = Math.max(pc, (page || 1) + 1);
+  // 满页时也只在页面里真有更大页码链接才预告下一页 (逆袭单页正好 24 条，别误报)
+  if (got >= 24 && nums.some(n => n > (page || 1))) pc = Math.max(pc, (page || 1) + 1);
   return pc;
 }
 
 function catBase(tid) {
-  tid = String(tid || 'all');
-  if (tid.startsWith('genre:')) return SITE + '/dramas/category/' + tid.slice(6) + '/';
-  if (tid.startsWith('tag:')) return SITE + '/tags/' + tid.slice(4) + '/';
+  // 分类 id 容错: 新 id 'g_'/'t_' 前缀、旧 'genre:'/'tag:' id、裸 slug、中文名、
+  // 百分号编码形态全部认，任何回传变形都能定位到同一分类
+  let id = String(tid == null ? '' : tid).trim();
+  try { id = decodeURIComponent(id); } catch (e) { /* 保持原样 */ }
+  if (!id || id === 'all') return SITE + '/dramas/';
+  let m = id.match(/^(?:g_|genre:)(.+)$/);
+  if (m) return SITE + '/dramas/category/' + m[1] + '/';
+  m = id.match(/^(?:t_|tag:)(.+)$/);
+  if (m) return SITE + '/tags/' + m[1] + '/';
+  const g = GENRES.find(x => x.slug === id || x.name === id);
+  if (g) return SITE + '/dramas/category/' + g.slug + '/';
+  const tg = TAGS.find(x => x.slug === id || x.name === id);
+  if (tg) return SITE + '/tags/' + tg.slug + '/';
   return SITE + '/dramas/';
 }
 
@@ -237,7 +256,7 @@ async function home(reqIn) {
 async function category(reqIn) {
   const body = reqIn?.body || {};
   const tid = t(body.tid || body.id) || 'all';
-  const page = Math.max(1, parseInt(body.page, 10) || 1);
+  const page = Math.max(1, parseInt(body.page != null ? body.page : body.pg, 10) || 1);
   const base = catBase(tid);
   const url = page > 1 ? base + 'page/' + page + '/' : base;
   return buildList(url, page, 30);
@@ -284,7 +303,7 @@ async function detail(reqIn) {
   }
   if (!episodes.length) {
     // JSON-LD 兜底: 直接扫集链接
-    const re = /href="(https:\/\/youzidj\.com\/dramas\/[a-z0-9\-]+\/season-1-episode-(\d+)\/)"/g;
+    const re = /href="(https:\/\/youzidj\.com\/dramas\/[a-z0-9\-]+\/season-\d+-episode-(\d+)\/)"/g;
     const seen = new Set();
     let m;
     while ((m = re.exec(html)) !== null) {
@@ -365,7 +384,7 @@ async function play(reqIn) {
 async function search(reqIn) {
   const body = reqIn?.body || {};
   const wd = t(body.wd);
-  const page = Math.max(1, parseInt(body.page, 10) || 1);
+  const page = Math.max(1, parseInt(body.page != null ? body.page : body.pg, 10) || 1);
   if (!wd) return { page, pagecount: page, limit: 30, total: 0, list: [] };
   if (page > 1) return { page, pagecount: 1, limit: 30, total: 0, list: [] }; // 站方搜索无分页
   const url = SITE + '/search/?q=' + encodeURIComponent(wd);
