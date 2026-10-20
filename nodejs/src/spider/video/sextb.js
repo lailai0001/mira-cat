@@ -17,11 +17,18 @@ import req from '../../util/req.js';
 //       请求都必须带 Origin: {embed host} 才能 200，否则 403（仅 UA 无头 → 403；
 //       无 UA → 404；Referer 也救不了）。iOS 播放器无法自行补 Origin（被禁止
 //       自定义），所以 play 返回的 m3u8 直链在端内播不了。
-// 修复: play 返回本地代理地址 /proxy/m3u8，由代理请求源站时补齐
-//       Origin/Referer，把改写后的播放列表返回给播放器；子播放列表继续走
-//       /proxy/m3u8 递归改写，分片/密钥经 /proxy/res 二进制透传。
+// 修复 (v1): play 返回本地代理地址 /proxy/m3u8，代理补 Origin 改写列表，
+//       分片经 /proxy/res 二进制透传。VM 全链路通过，但用户真机仍无法播放。
+// 修复 (v2, 2026-10-20 复盘): 本地代理只碰播放列表（纯文本，小体积），
+//       分片/密钥一律改写为 CDN 绝对直链由播放器直连，不再二进制透传。
+//       依据: (1) 仓库内能真机跑通的代理先例 (javmobile、AvHub v2、ffm3u8)
+//       都只代理 m3u8 文本，无一透传分片二进制；AvHub v1 透传分片同样真机
+//       失败、删透传后恢复。(2) f4 CDN 分片只认 Origin (Referer 任何形式
+//       均 403，VM 矩阵实测)，而 play 返回的 header 会被播放器带到本次
+//       播放的各请求上，故 play 的 header 里保留 Origin/Referer/UA，
+//       分片直连时由播放器补齐。(3) 分片直连还省掉每片两次本地转发，
+//       避免本地代理串行透传 ~900KB/片 造成的缓冲卡死。
 //       代理失败时 302 降级到原始地址（与之前直连行为一致）。
-//       先例: avhub.js / javmobile.js 的同名代理路由。
 
 const KEY = 'py_sextb';
 const NAME = 'SexTB';
@@ -339,8 +346,9 @@ function absUrl(u, base) {
   try { return new URL(u, base).toString(); } catch (e) { return u; }
 }
 
-// 改写 m3u8: 子播放列表 (.txt/.m3u8) 继续走 /proxy/m3u8 递归改写,
-// 分片与 URI="..." (密钥/初始化段) 走 /proxy/res 二进制透传
+// 改写 m3u8: 子播放列表 (.txt/.m3u8) 继续走 /proxy/m3u8 递归改写 (文本);
+// 分片与 URI="..." (密钥/初始化段) 改写为 CDN 绝对直链，播放器直连
+// (Origin 由 play 返回的 header 补齐)，不走本地二进制透传 (见文件头 v2 说明)
 function rewriteM3u8(raw, m3u8Url, reqIn, referer, origin) {
   const lines = String(raw).split(/\r?\n/);
   const out = lines.map(line => {
@@ -350,16 +358,17 @@ function rewriteM3u8(raw, m3u8Url, reqIn, referer, origin) {
       if (s.includes('URI="')) {
         return line.replace(/URI="([^"]+)"/g, (all, uri) => {
           const abs = absUrl(uri.replace(/&amp;/g, '&'), m3u8Url);
-          const p = proxyUrl(reqIn, '/proxy/res', abs, referer, origin);
-          return p ? `URI="${p}"` : all;
+          return `URI="${abs}"`;
         });
       }
       return line;
     }
     const abs = absUrl(s.replace(/&amp;/g, '&'), m3u8Url);
-    const isPlaylist = /\.(m3u8|txt)(\?|$)/i.test(abs);
-    const p = proxyUrl(reqIn, isPlaylist ? '/proxy/m3u8' : '/proxy/res', abs, referer, origin);
-    return p || line;
+    if (/\.(m3u8|txt)(\?|$)/i.test(abs)) {
+      const p = proxyUrl(reqIn, '/proxy/m3u8', abs, referer, origin);
+      return p || abs;
+    }
+    return abs;
   });
   return out.join('\n');
 }
@@ -374,18 +383,6 @@ async function fetchText(url, headers) {
     if (r.ok) return await r.text();
   } catch (e) { /* ignore */ }
   return '';
-}
-
-async function fetchBuffer(url, headers) {
-  try {
-    const { data, status } = await req.get(url, { headers, timeout: 30000, responseType: 'arraybuffer' });
-    if (status === 200 && data) return Buffer.from(data);
-  } catch (e) { /* 换通道2 */ }
-  try {
-    const r = await fetch(url, { headers });
-    if (r.ok) return Buffer.from(await r.arrayBuffer());
-  } catch (e) { /* ignore */ }
-  return null;
 }
 
 // GET /proxy/m3u8?u={b64url 播放列表}&r={b64url referer}&o={b64url origin}
@@ -411,34 +408,6 @@ async function m3u8Proxy(request, reply) {
   reply.header('Content-Type', 'application/vnd.apple.mpegurl');
   reply.header('Cache-Control', 'no-cache');
   reply.send(rewriteM3u8(raw, target, request, referer, origin));
-}
-
-// GET /proxy/res?u={b64url 资源}&r={b64url referer}&o={b64url origin} —— 分片/密钥二进制透传
-async function resProxy(request, reply) {
-  const q = request?.query || {};
-  if (!q.u) { reply.code(400).send('missing u'); return; }
-  let target = '', referer = REFERER, origin = '';
-  try {
-    target = unb64url(q.u);
-    if (q.r) referer = unb64url(q.r) || referer;
-    if (q.o) origin = unb64url(q.o);
-  } catch (e) { reply.code(400).send('bad u'); return; }
-  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
-  const headers = { 'User-Agent': UA, 'Accept': '*/*', 'Referer': referer };
-  if (origin) headers['Origin'] = origin;
-  const buf = await fetchBuffer(target, headers);
-  if (!buf) {
-    reply.redirect(target);
-    return;
-  }
-  // 按后缀给合理 Content-Type: f4 分片伪装成 .png/.jpg/.jpeg/.webp, 实为 TS 流，
-  // iOS AVPlayer 系按 video/mp2t 更稳 (同 蜜桃 REX 分片强制 mp2t 先例)
-  const ct = /\.(m3u8|txt)(\?|$)/i.test(target) ? 'application/vnd.apple.mpegurl'
-    : /\.(ts|png|jpg|jpeg|webp|bin)(\?|$)/i.test(target) ? 'video/mp2t'
-    : 'application/octet-stream';
-  reply.header('Content-Type', ct);
-  reply.header('Cache-Control', 'no-cache');
-  reply.send(buf);
 }
 
 async function init(reqIn) {
@@ -581,7 +550,8 @@ async function play(reqIn) {
   if (embedUrl) {
     // f4 系 (f4scdn.com / f4jav.xyz): 解析 api/play 拿 playlist 直链。
     // CDN 全链路要求 Origin (实测无头 403)，播放器端补不了头: 走本地代理，
-    // 代理请求时补齐 Origin/Referer 并改写播放列表 (见 m3u8Proxy/resProxy)。
+    // 代理请求时补齐 Origin/Referer 并改写播放列表 (见 m3u8Proxy);
+    // 分片在改写后是 CDN 直链，靠返回 header 里的 Origin 让播放器直连时补齐。
     if (/f4scdn\.com|f4jav\.xyz/i.test(embedUrl)) {
       const res = await resolveF4(embedUrl, durl);
       if (res && /\.m3u8|\.txt/i.test(res.url)) {
@@ -655,9 +625,9 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
-      // HLS 本地代理 (GET): f4 CDN 要求 Origin 播放器端无法设置, 代理补头透传
+      // HLS 本地代理 (GET): 只代理播放列表文本, 代理请求源站时补 Origin;
+      // 分片改写为直链由播放器直连 (Origin 靠 play 的 header), 不透传二进制
       fastify.get('/proxy/m3u8', m3u8Proxy);
-      fastify.get('/proxy/res', resProxy);
     },
   };
 }
