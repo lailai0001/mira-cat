@@ -9,26 +9,25 @@ import req from '../../util/req.js';
 // 列表: / (最新) / /genre/{slug}/[/pg-N/]  tray-item 卡片
 // 卡片: div.tray-item > a[href="/{code}"] > img.tray-item-thumbnail (封面取 data-src，src 是 default-cover 占位图)
 // 详情: GET /{code}  filmId + 服务器列表 (button.btn-player.episode[data-source][data-id]，如 F4/SW/PM/DD/FL/US)
-// 播放: 1) 详情页默认 iframe 即 F4 服务器 (f4scdn.com/e/{id})；
-//       2) f4 系 embed 页 data-api -> GET {host}/api/play/{vid}?ab=0 (带 Origin 头) -> src playlist.txt 主播放列表；
-//       3) 其他服务器 POST /ajax/player {episode: episode_id, filmId} -> JSON.player HTML -> embed；
-//       4) 解不出的 embed 走 parse:1 嗅探。play 实时在用户手机上解析，token 按用户 IP 签发。
+// 播放 (v3): 全部走 parse:1 嗅探，不再解析直链、不再本地代理:
+//       1) 详情页默认 iframe 非 F4 -> 直接嗅探该 embed 页；
+//       2) 默认是 F4 (f4scdn.com/f4jav.xyz) -> 按按钮顺序跳过 F4，
+//          最多借 2 条非 F4 线路 (POST /ajax/player 快速版)，嗅探借到的 embed；
+//       3) 借不到 -> 嗅探 F4 自己的 embed 页兜底。
+//       play 只做 1 次详情页 GET + 至多 2 次 ajax POST，秒级返回。
 // 实测根因 (2026-10-20 VM 验证): f4 CDN 的 playlist.txt、子播放列表、每个分片
 //       请求都必须带 Origin: {embed host} 才能 200，否则 403（仅 UA 无头 → 403；
 //       无 UA → 404；Referer 也救不了）。iOS 播放器无法自行补 Origin（被禁止
 //       自定义），所以 play 返回的 m3u8 直链在端内播不了。
-// 修复 (v1): play 返回本地代理地址 /proxy/m3u8，代理补 Origin 改写列表，
-//       分片经 /proxy/res 二进制透传。VM 全链路通过，但用户真机仍无法播放。
-// 修复 (v2, 2026-10-20 复盘): 本地代理只碰播放列表（纯文本，小体积），
-//       分片/密钥一律改写为 CDN 绝对直链由播放器直连，不再二进制透传。
-//       依据: (1) 仓库内能真机跑通的代理先例 (javmobile、AvHub v2、ffm3u8)
-//       都只代理 m3u8 文本，无一透传分片二进制；AvHub v1 透传分片同样真机
-//       失败、删透传后恢复。(2) f4 CDN 分片只认 Origin (Referer 任何形式
-//       均 403，VM 矩阵实测)，而 play 返回的 header 会被播放器带到本次
-//       播放的各请求上，故 play 的 header 里保留 Origin/Referer/UA，
-//       分片直连时由播放器补齐。(3) 分片直连还省掉每片两次本地转发，
-//       避免本地代理串行透传 ~900KB/片 造成的缓冲卡死。
-//       代理失败时 302 降级到原始地址（与之前直连行为一致）。
+// 修复史: v1 本地代理透传分片、v2 只代理播放列表 + 分片直链靠 play 的
+//       header 补 Origin，两轮用户真机均无法播放——播放器不把 play 返回
+//       的 header (尤其 Origin) 透传到分片请求，f4 直链路在端内无解。
+// 修复 (v3, 2026-10-20): 删掉整个本地代理与 f4 直链解析，play 全面改走
+//       嗅探。依据: (1) 抽样 28 个视频默认 embed 26 个是 F4，非 F4 默认
+//       (hglink/streamhg 系，FC2 分类) 的 parse:1 嗅探真机已验证可播；
+//       (2) F4 embed 页是纯 fetch 驱动 (player.js 用 fetch(api/play) +
+//       fetch(playlist)，无自定义头)，网页上下文里浏览器自动带
+//       Origin: https://f4scdn.com，嗅探链路自洽。
 
 const KEY = 'py_sextb';
 const NAME = 'SexTB';
@@ -142,6 +141,21 @@ async function timedFetchText(url, headers, timeoutMs) {
   }
 }
 
+// 带超时的原生 fetch POST 取文本
+async function timedFetchPost(url, data, headers, timeoutMs) {
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), timeoutMs || 8000);
+  try {
+    const r = await fetch(url, { method: 'POST', headers, body: data, signal: ctl.signal });
+    if (!r.ok) return '';
+    return await r.text();
+  } catch (e) {
+    return '';
+  } finally {
+    clearTimeout(to);
+  }
+}
+
 // 单次取页面 (req 通道 + fetch 通道)，命中拦截页视为失败
 async function rawGet(url, headers, timeoutMs) {
   const to = timeoutMs || 25000;
@@ -208,43 +222,32 @@ async function getHtml(url, extraHeaders) {
   return '';
 }
 
-async function postJson(url, body, extraHeaders) {
-  const path = pathOf(url);
-  const hosts = hostOrder(url);
+// play 专用快速 POST /ajax/player: 只打详情页同域名，8s 超时，
+// req -> fetch 两通道各一次，失败立即放弃 (不做旧 postJson 的多域名多轮串行)
+async function postJsonFast(durl, body) {
+  let ajaxUrl = '';
+  try {
+    ajaxUrl = new URL(durl).origin + '/ajax/player';
+  } catch (e) { return ''; }
   const data = new URLSearchParams(body).toString();
-  for (const host of hosts) {
-    const headers = {
-      'User-Agent': UA,
-      'Referer': host + '/',
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      'Accept': 'application/json, text/javascript, */*; q=0.01',
-      'X-Requested-With': 'XMLHttpRequest',
-      ...(extraHeaders || {}),
-    };
-    // 若调用方给了 Referer (详情页)，换成当前域名同路径
-    if (headers.Referer && /sextb\.(net|cc)/i.test(headers.Referer) && !headers.Referer.startsWith(host)) {
-      headers.Referer = host + pathOf(headers.Referer);
+  const headers = {
+    'User-Agent': UA,
+    'Referer': durl,
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'X-Requested-With': 'XMLHttpRequest',
+  };
+  // 通道1: 框架 req
+  try {
+    const { data: res, status } = await req.post(ajaxUrl, data, { headers, timeout: 8000 });
+    if (status === 200 && res != null) {
+      const s = typeof res === 'string' ? res : JSON.stringify(res);
+      if (s && !/Your request was blocked/i.test(s)) return s;
     }
-    const full = host + path;
-    // 通道1: 框架 req
-    try {
-      const { data: res, status } = await req.post(full, data, { headers, timeout: 25000 });
-      if (status === 200 && res != null) {
-        const s = typeof res === 'string' ? res : JSON.stringify(res);
-        if (s && !isBlockedPage(s)) return s;
-      }
-    } catch (e) { /* 换通道2 */ }
-    // 通道2: 原生 fetch (带超时)
-    const ctl = new AbortController();
-    const to = setTimeout(() => ctl.abort(), 25000);
-    try {
-      const r = await fetch(full, { method: 'POST', headers, body: data, signal: ctl.signal });
-      if (r.ok) {
-        const txt = await r.text();
-        if (txt && !isBlockedPage(txt)) return txt;
-      }
-    } catch (e) { /* ignore */ } finally { clearTimeout(to); }
-  }
+  } catch (e) { /* 换通道2 */ }
+  // 通道2: 原生 fetch
+  const txt = await timedFetchPost(ajaxUrl, data, headers, 8000);
+  if (txt && !/Your request was blocked/i.test(txt)) return txt;
   return '';
 }
 
@@ -318,98 +321,6 @@ function buildList(url, page, limit) {
   });
 }
 
-// ---------- 本地 HLS 代理 (f4 CDN 必须 Origin 才能 200, 播放器端无法补头) ----------
-
-// base64url 编码/解码 (供代理 URL 的 query 参数)
-function b64url(s) {
-  try {
-    return Buffer.from(String(s), 'utf8').toString('base64')
-      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-  } catch (e) { return ''; }
-}
-
-function unb64url(s) {
-  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
-}
-
-// 构造本地代理地址 (js2p://_WEB_ 为 App 动态地址 scheme, 同 avhub/javmobile/ffm3u8 先例)
-function proxyUrl(reqIn, path, targetUrl, referer, origin) {
-  try {
-    const server = reqIn?.server;
-    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
-    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
-    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}&o=${b64url(origin || '')}`;
-  } catch (e) { return ''; }
-}
-
-function absUrl(u, base) {
-  try { return new URL(u, base).toString(); } catch (e) { return u; }
-}
-
-// 改写 m3u8: 子播放列表 (.txt/.m3u8) 继续走 /proxy/m3u8 递归改写 (文本);
-// 分片与 URI="..." (密钥/初始化段) 改写为 CDN 绝对直链，播放器直连
-// (Origin 由 play 返回的 header 补齐)，不走本地二进制透传 (见文件头 v2 说明)
-function rewriteM3u8(raw, m3u8Url, reqIn, referer, origin) {
-  const lines = String(raw).split(/\r?\n/);
-  const out = lines.map(line => {
-    const s = line.trim();
-    if (!s) return line;
-    if (s.startsWith('#')) {
-      if (s.includes('URI="')) {
-        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
-          const abs = absUrl(uri.replace(/&amp;/g, '&'), m3u8Url);
-          return `URI="${abs}"`;
-        });
-      }
-      return line;
-    }
-    const abs = absUrl(s.replace(/&amp;/g, '&'), m3u8Url);
-    if (/\.(m3u8|txt)(\?|$)/i.test(abs)) {
-      const p = proxyUrl(reqIn, '/proxy/m3u8', abs, referer, origin);
-      return p || abs;
-    }
-    return abs;
-  });
-  return out.join('\n');
-}
-
-async function fetchText(url, headers) {
-  try {
-    const { data, status } = await req.get(url, { headers, timeout: 20000 });
-    if (status === 200 && data) return typeof data === 'string' ? data : String(data);
-  } catch (e) { /* 换通道2 */ }
-  try {
-    const r = await fetch(url, { headers });
-    if (r.ok) return await r.text();
-  } catch (e) { /* ignore */ }
-  return '';
-}
-
-// GET /proxy/m3u8?u={b64url 播放列表}&r={b64url referer}&o={b64url origin}
-async function m3u8Proxy(request, reply) {
-  const q = request?.query || {};
-  if (!q.u) { reply.code(400).send('missing u'); return; }
-  let target = '', referer = REFERER, origin = '';
-  try {
-    target = unb64url(q.u);
-    if (q.r) referer = unb64url(q.r) || referer;
-    if (q.o) origin = unb64url(q.o);
-  } catch (e) { reply.code(400).send('bad u'); return; }
-  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
-  // f4 CDN 全链路必须带 Origin: {embed host}，否则 403
-  const headers = { 'User-Agent': UA, 'Accept': '*/*', 'Referer': referer };
-  if (origin) headers['Origin'] = origin;
-  const raw = await fetchText(target, headers);
-  if (!raw || !raw.includes('#EXTM3U')) {
-    // 降级: 302 重定向到原始地址 (与直连行为一致)
-    reply.redirect(target);
-    return;
-  }
-  reply.header('Content-Type', 'application/vnd.apple.mpegurl');
-  reply.header('Cache-Control', 'no-cache');
-  reply.send(rewriteM3u8(raw, target, request, referer, origin));
-}
-
 async function init(reqIn) {
   return {};
 }
@@ -448,47 +359,6 @@ function extractDefaultEmbed(html) {
   const m = html.match(/id="sextb-player"[\s\S]{0,500}?<iframe[^>]+src="(https?:\/\/[^"]+)"/) ||
             html.match(/id="sextb-player"[\s\S]{0,500}?<iframe[^>]+src="(\/\/[^"]+)"/);
   return m ? fixUrl(m[1]) : '';
-}
-
-// 解析 f4 系 embed: embed 页 data-video-id -> {host}/api/play/{vid}?ab=0 -> src (m3u8)
-async function resolveF4(embedUrl, durl) {
-  const html = await getHtml(embedUrl, { 'Referer': durl });
-  if (!html) return '';
-  const vm = html.match(/data-video-id="([^"]+)"/);
-  const am = html.match(/data-api="([^"]+)"/);
-  if (!vm || !am) return '';
-  const hostM = embedUrl.match(/^(https?:\/\/[^/]+)/);
-  if (!hostM) return '';
-  const apiUrl = hostM[1] + am[1] + (am[1].includes('?') ? '&' : '?') + 'ab=0';
-  const host = hostM[1];
-  let src = '';
-  const headers = {
-    'User-Agent': UA,
-    'Referer': embedUrl,
-    'Origin': host,
-    'Accept': 'application/json, text/javascript, */*; q=0.01',
-  };
-  // 通道1: 框架 req
-  try {
-    const { data, status } = await req.get(apiUrl, { headers, timeout: 25000 });
-    if (status === 200 && data) {
-      const json = typeof data === 'string' ? JSON.parse(data) : data;
-      if (json && json.src) src = t(json.src);
-    }
-  } catch (e) { /* 换通道2 */ }
-  // 通道2: 原生 fetch
-  if (!src) {
-    try {
-      const r = await fetch(apiUrl, { headers });
-      if (r.ok) {
-        const json = await r.json();
-        if (json && json.src) src = t(json.src);
-      }
-    } catch (e) { /* ignore */ }
-  }
-  if (!src) return '';
-  if (!/^https?:\/\//.test(src)) src = host + (src.startsWith('/') ? src : '/' + src);
-  return { url: src, origin: host, embed: embedUrl };
 }
 
 async function detail(reqIn) {
@@ -542,34 +412,27 @@ async function play(reqIn) {
   }
   const durl = /^https?:\/\//.test(id) ? id : fixUrl(id);
 
-  // 第1步: 抓详情页，拿默认 embed iframe（通常是 F4/f4scdn）
+  // 只抓 1 次详情页: 拿默认 embed + 服务器列表
   const html = await getHtml(durl);
   if (!html) return { parse: 0, url: '' };
   const embedUrl = extractDefaultEmbed(html);
+  const isF4 = (u) => /f4scdn\.com|f4jav\.xyz/i.test(u || '');
 
-  if (embedUrl) {
-    // f4 系 (f4scdn.com / f4jav.xyz): 解析 api/play 拿 playlist 直链。
-    // CDN 全链路要求 Origin (实测无头 403)，播放器端补不了头: 走本地代理，
-    // 代理请求时补齐 Origin/Referer 并改写播放列表 (见 m3u8Proxy);
-    // 分片在改写后是 CDN 直链，靠返回 header 里的 Origin 让播放器直连时补齐。
-    if (/f4scdn\.com|f4jav\.xyz/i.test(embedUrl)) {
-      const res = await resolveF4(embedUrl, durl);
-      if (res && /\.m3u8|\.txt/i.test(res.url)) {
-        const purl = proxyUrl(reqIn, '/proxy/m3u8', res.url, embedUrl, res.origin);
-        return {
-          parse: 0,
-          url: purl || res.url,
-          header: { 'User-Agent': UA, 'Referer': embedUrl, 'Origin': res.origin },
-        };
-      }
-    }
+  // 默认 embed 非 F4: 直接嗅探它 (hglink/streamhg 系真机已验证可播)
+  if (embedUrl && !isF4(embedUrl)) {
+    return { parse: 1, jx: 0, url: embedUrl, header: { 'User-Agent': UA, 'Referer': durl } };
   }
 
-  // 第2步: 逐个服务器 POST /ajax/player 拿 player HTML，找可解的 embed
+  // 默认是 F4 (或无默认 embed): 按按钮顺序跳过 F4，最多借 2 条非 F4 线路，
+  // POST /ajax/player 拿到 embed 后嗅探它
   const { filmId, episodes } = extractPlayerInfo(html);
   if (filmId && episodes.length) {
+    let tried = 0;
     for (const ep of episodes) {
-      const resp = await postJson(SITE + '/ajax/player', { episode: ep.episode, filmId }, { 'Referer': durl });
+      if (tried >= 2) break;
+      if (/^F4$/i.test(t(ep.name))) continue;
+      tried++;
+      const resp = await postJsonFast(durl, { episode: ep.episode, filmId });
       if (!resp) continue;
       let playerHtml = '';
       try {
@@ -580,25 +443,13 @@ async function play(reqIn) {
                  playerHtml.match(/<iframe[^>]+src="(\/\/[^"]+)"/);
       if (!em) continue;
       const eu = fixUrl(em[1]);
-      if (/f4scdn\.com|f4jav\.xyz/i.test(eu)) {
-        const res = await resolveF4(eu, durl);
-        if (res && /\.m3u8|\.txt/i.test(res.url)) {
-          const purl = proxyUrl(reqIn, '/proxy/m3u8', res.url, eu, res.origin);
-          return {
-            parse: 0,
-            url: purl || res.url,
-            header: { 'User-Agent': UA, 'Referer': eu, 'Origin': res.origin },
-          };
-        }
-      }
-      // 其他 embed (SW/PM/DD/FL/US 等): 交给嗅探
       if (/^https?:\/\//.test(eu)) {
         return { parse: 1, jx: 0, url: eu, header: { 'User-Agent': UA, 'Referer': durl } };
       }
     }
   }
 
-  // 第3步: 兜底，嗅探默认 embed 页
+  // 借不到: 嗅探 F4 自己的 embed 页兜底 (网页上下文自动带 Origin，链路自洽)
   if (embedUrl && /^https?:\/\//.test(embedUrl)) {
     return { parse: 1, jx: 0, url: embedUrl, header: { 'User-Agent': UA, 'Referer': durl } };
   }
@@ -625,9 +476,6 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
-      // HLS 本地代理 (GET): 只代理播放列表文本, 代理请求源站时补 Origin;
-      // 分片改写为直链由播放器直连 (Origin 靠 play 的 header), 不透传二进制
-      fastify.get('/proxy/m3u8', m3u8Proxy);
     },
   };
 }
