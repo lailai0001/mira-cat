@@ -25,6 +25,20 @@ import req from '../../util/req.js';
 //         FL/DD/其他 XFS 系: 通用解包提取 m3u8/mp4 + 探活通过才返回。
 //       每条线路解析都带探活（列表须 #EXTM3U、mp4 须 200/206），
 //       探活不过当没解出，继续下一条，避免返回死链堵住后面的机会。
+// 播放 (v5, 2026-10-20 晚): v4 真机仍全灭后重排 play 顺序与探活策略。
+//       复查证据: 已部署 Worker 的 /f4、/v 全链从 VM 逐跳实测均通（F4
+//       3 样本、SW 2 样本直到分片 0x47），所以问题不在链路本身，而在
+//       v4 play 的真机执行结构: (1) 默认线路不是最先试，占 70% 的默认
+//       F4 排在 SW/PM 两条借线（各含 ajax+探活）之后；(2) Worker 路径
+//       被蜘蛛侧探活门控，一次往返抖动/超时即误杀已验通的线路（JavGG
+//       的已验证形态是从不探活、直返 Worker 地址，且同机同账号真机
+//       可播）；(3) SW 有逐视频死链——只有 hls3/hls2 的视频其 CDN 拦
+//       CF 出口（实测 sgkx-010 的 /v 回 502: hls3/hls2 均 403），v4
+//       对此无后备。v5: 默认线最先（F4→/f4 直返不探活；SW→/v 快速
+//       探活 4s、失败去借 F4）；借线最多 2 条、F4 直返不探活；借来的
+//       SW 在 Worker 不通时留蜘蛛内 hls3 直链作最后手段（手机住宅
+//       出口可能过 hls3 的 ASN 门禁，不探活、交播放器试）；详情页无
+//       播放器标记时换镜像再抓一次（防 DDoS 拦截页毒死整条链）。
 // 实测根因 (2026-10-20 VM 验证): f4 CDN 的 playlist、子列表、每个分片
 //       请求都必须带 Origin: https://f4scdn.com 才能 200（UA-only 403、
 //       Referer 403）。其官方 api/play?ab=0 能拿签名 src，但 src 的列表与
@@ -329,8 +343,8 @@ async function timedFetchBytes(url, headers, timeoutMs, range) {
 }
 
 // 探活: 是真播放列表才认（#EXTM3U 开头）
-async function probePlaylist(url, headers) {
-  const r = await timedFetchBytes(url, headers, 7000);
+async function probePlaylist(url, headers, timeoutMs) {
+  const r = await timedFetchBytes(url, headers, timeoutMs || 7000);
   return r.status === 200 && r.text.includes('#EXTM3U');
 }
 
@@ -382,39 +396,60 @@ function codeOf(u) {
   } catch (e) { return ''; }
 }
 
-// SW / StreamHG 系（hglink.to、streamhg、trailerhg、earnvid、vidhide 等）:
-// 填了 Worker → 整链走 Worker /v；否则蜘蛛内解包: hglink 换 trailerhg 同
-// 代码 XFS 页 → 解包 links → hls3（无 token）优先、hls2（asn 绑定）其次，
-// 探活通过才返回。
-async function resolveStreamHg(embedUrl, durl) {
-  if (SEXTB_WORKER) {
-    const wurl = SEXTB_WORKER + '/v?u=' + encodeURIComponent(embedUrl) + '&r=' + encodeURIComponent(durl);
-    // 先探活 Worker 真能出列表再返回，避免 Worker 故障时堵住其他线路
-    if (await probePlaylist(wurl, { 'User-Agent': UA })) {
-      return { parse: 0, url: wurl, header: { 'User-Agent': UA } };
-    }
-    return null;
-  }
+// SW / StreamHG 系（hglink.to、streamhg、trailerhg、earnvid、vidhide 等）
+// v5 实测结论（2026-10-20 晚，对已部署 Worker 跑真实链）:
+//   - hls4 (/stream/): token 与抓 embed 页的网络身份绑定，铸/拉同出口才
+//     200 → Worker 全链可通（实测样本全链到分片）；跨身份 403。
+//   - hls3: CDN 按 ASN 拦机房/CF 出口（VM 直拉、jina、Worker /p 三方均
+//     403 "Website Access Blocked"），只有住宅/移动出口（手机）有机会
+//     → 蜘蛛内直解作最后手段时不探活门控（探活在机房出口必死、会误杀）。
+//   - hls2: asn 绑定 token，CF/VM 出口实测均 403，不作主力。
+// 因此 SW 主路径 = Worker /v（与 JavGG 已真机验证的形态一致: 直返地址）。
+function workerVUrl(embedUrl, durl) {
+  if (!SEXTB_WORKER) return '';
+  return SEXTB_WORKER + '/v?u=' + encodeURIComponent(embedUrl) + '&r=' + encodeURIComponent(durl);
+}
+
+function workerF4Url(embedUrl, durl) {
+  if (!SEXTB_WORKER) return '';
+  return SEXTB_WORKER + '/f4?u=' + encodeURIComponent(embedUrl) + '&r=' + encodeURIComponent(durl);
+}
+
+function isF4HostName(host) { return /f4scdn\.com|f4jav\.xyz/.test(host || ''); }
+function isSwHostName(host) { return /hglink\.to|streamhg|trailerhg|earnvid|vidhide/.test(host || ''); }
+
+// SW 蜘蛛内解包: hglink 换 trailerhg 同代码 XFS 页 → 解包 links。
+// 相对地址（hls4 的 /stream/...）按解包页（trailerhg）的域名补全。
+// 只解包、不探活，返回原始链接表（可能为空对象）。
+async function decodeStreamHgLinks(embedUrl, durl) {
   const host = hostOf(embedUrl);
   const code = codeOf(embedUrl);
-  if (!code) return null;
+  if (!code) return {};
   let pageUrl = embedUrl;
   if (/(^|\.)hglink\.to$/.test(host)) pageUrl = 'https://trailerhg.xyz/e/' + code;
   const html = await fetchEmbedText(pageUrl, durl, 12000);
-  if (!html) return null;
+  if (!html) return {};
   const unpacked = unpackDeanEdwards(html) || html;
   const links = extractHgLinks(unpacked);
+  for (const k of Object.keys(links)) {
+    if (links[k].startsWith('/')) {
+      try { links[k] = new URL(links[k], pageUrl).href; } catch (e) { /* ignore */ }
+    }
+  }
+  return links;
+}
+
+// SW 蜘蛛内直解: hls3（无 token）优先、hls4 次之、hls2 末选。
+// withProbe=true 时逐个探活（无 Worker 时的主路径）；false 时拿到第一条
+// 就返回（最后手段: 探活出口与播放器出口未必一致，不让探活误杀）。
+async function resolveStreamHgInSpider(embedUrl, durl, withProbe) {
+  const links = await decodeStreamHgLinks(embedUrl, durl);
   const heads = { 'User-Agent': UA };
-  if (links.hls3 && await probePlaylist(links.hls3, heads)) {
-    return { parse: 0, url: links.hls3, header: heads };
-  }
-  if (links.hls4 && await probePlaylist(links.hls4, heads)) {
-    return { parse: 0, url: links.hls4, header: heads };
-  }
-  // hls2 的 token 按解码方网络签发（asn=），探活过也只代表当前网络能拉，
-  // 仍返回作次选（同机同网时可播），排在 hls3/hls4 之后
-  if (links.hls2 && await probePlaylist(links.hls2, heads)) {
-    return { parse: 0, url: links.hls2, header: heads };
+  for (const key of ['hls3', 'hls4', 'hls2']) {
+    const u = links[key];
+    if (!u || !/^https?:\/\//.test(u)) continue;
+    if (withProbe && !(await probePlaylist(u, heads, 5000))) continue;
+    return { parse: 0, url: u, header: heads };
   }
   return null;
 }
@@ -509,19 +544,14 @@ async function resolveGeneric(embedUrl, durl) {
 async function resolveEmbed(embedUrl, durl) {
   const host = hostOf(embedUrl);
   if (!host) return null;
-  if (/f4scdn\.com|f4jav\.xyz/.test(host)) {
-    // F4: 只有 Worker 能过 Origin 墙；未部署直接放弃这条线。
-    // 部署了也要先探活 Worker 的 /f4 真能出列表再返回。
-    if (SEXTB_WORKER) {
-      const wurl = SEXTB_WORKER + '/f4?u=' + encodeURIComponent(embedUrl) + '&r=' + encodeURIComponent(durl);
-      if (await probePlaylist(wurl, { 'User-Agent': UA })) {
-        return { parse: 0, url: wurl, header: { 'User-Agent': UA } };
-      }
-    }
+  if (isF4HostName(host)) {
+    // F4 在 play() 里优先处理（Worker /f4 直返、不探活）；走到这里说明
+    // play 的优先路径已放弃这条线，直接判负。
     return null;
   }
-  if (/hglink\.to|streamhg|trailerhg|earnvid|vidhide/.test(host)) {
-    return resolveStreamHg(embedUrl, durl);
+  if (isSwHostName(host)) {
+    // SW 同样在 play() 里优先处理；这里只作兜底: 蜘蛛内解包 + 探活
+    return resolveStreamHgInSpider(embedUrl, durl, true);
   }
   if (/playmate/.test(host)) return resolvePlaymate(embedUrl);
   if (/shadowbyte|dstyladsg|vidara/.test(host)) return resolveVidara(embedUrl);
@@ -705,47 +735,116 @@ async function play(reqIn) {
   }
   const durl = /^https?:\/\//.test(id) ? id : fixUrl(id);
 
-  // 只抓 1 次详情页: 拿默认 embed + 服务器列表
-  const html = await getHtml(durl);
+  // 只抓 1 次详情页: 拿默认 embed + 服务器列表。
+  // 若抓到的页面没有播放器标记（疑似 DDoS 拦截页被当成正常页返回——
+  // isBlockedPage 不认 "DDOS Protection" 标题），换另一个镜像域名再抓
+  // 一次，避免整条 play 链被一张拦截页毒死（返回空=点开必播不了）。
+  let html = await getHtml(durl);
+  const hasPlayer = (h) => !!h && (h.includes('sextb-player') || h.includes('btn-player'));
+  if (html && !hasPlayer(html)) {
+    const alt = durl.replace(/sextb\.(cc|net)/i, (m, g) => 'sextb.' + (g.toLowerCase() === 'cc' ? 'net' : 'cc'));
+    if (alt !== durl) {
+      const h2 = await getHtml(alt);
+      if (hasPlayer(h2)) html = h2;
+    }
+  }
   if (!html) return { parse: 0, url: '' };
   const defEmbed = extractDefaultEmbed(html);
   const { filmId, episodes } = extractPlayerInfo(html);
 
-  // 线路优先级（按名称）: SW > PM > F4 > FL > DD > US > ST > PP，其余按页面顺序
-  const PREF = { SW: 0, PM: 1, F4: 2, FL: 3, DD: 4, US: 5, ST: 6, PP: 7 };
-  const lines = [];
-  const seenName = new Set();
+  const deadline = Date.now() + 30000;
+  const uaHead = { 'User-Agent': UA };
+  let firstEmbed = defEmbed || '';
+  let swLastResort = ''; // SW 蜘蛛内解出的 hls3 直链（借线全灭时的最后手段）
+
+  // —— 第一步: 默认线路（embed 已在详情页 HTML 里，零额外请求）——
+  // v4 的教训: 默认线排在借线之后试，每条借线都含 ajax+探活，占 70% 的
+  // 默认 F4 反而最后才轮到，慢且险（探活/超时误杀）。v5 默认线最先。
+  if (defEmbed) {
+    const dhost = hostOf(defEmbed);
+    if (isF4HostName(dhost)) {
+      // F4 默认: Worker /f4 全链已在真实部署上逐跳验通（api/play 收 CF
+      // 出口、列表/分片注入 Origin 后均 200）。学 JavGG 已真机验证的
+      // 形态——直接返回 Worker 地址、不探活（探活是蜘蛛侧多余的一次
+      // 往返，抖动/超时会误杀好线路，JavGG 从不探活且真机可播）。
+      const w = workerF4Url(defEmbed, durl);
+      if (w) return { parse: 0, url: w, header: uaHead };
+    } else if (isSwHostName(dhost)) {
+      const w = workerVUrl(defEmbed, durl);
+      if (w) {
+        // SW 的 Worker 链有逐视频死链（只有 hls3/hls2 的视频，其 CDN 拦
+        // CF 出口，/v 必 502）→ 只对 SW 做一次快速探活（4s），过不了
+        // 就落到第二步借 F4 线，不在这里判死。
+        if (await probePlaylist(w, uaHead, 4000)) {
+          return { parse: 0, url: w, header: uaHead };
+        }
+      } else {
+        const r = await resolveStreamHgInSpider(defEmbed, durl, true);
+        if (r) return r;
+      }
+    } else {
+      try {
+        const r = await resolveEmbed(defEmbed, durl);
+        if (r && r.url) return r;
+      } catch (e) { /* 落到借线 */ }
+    }
+  }
+
+  // —— 第二步: 借线（POST /ajax/player），最多 2 条 ——
+  // 优先级: F4 > SW > PM > FL > DD > US > ST > PP（F4 借线只需一次 ajax
+  // 就能直返 Worker 地址，最快；PM 次之；SW 的 Worker 链需探活确认）
+  const PREF = { F4: 0, SW: 1, PM: 2, FL: 3, DD: 4, US: 5, ST: 6, PP: 7 };
   const sorted = [...episodes].sort((a, b) => {
     const pa = PREF[t(a.name).toUpperCase()] ?? 90;
     const pb = PREF[t(b.name).toUpperCase()] ?? 90;
     return pa - pb;
   });
+  const seenName = new Set();
+  let borrowed = 0;
   for (const ep of sorted) {
+    if (borrowed >= 2 || Date.now() > deadline) break;
     const nm = t(ep.name).toUpperCase();
     if (seenName.has(nm)) continue;
     seenName.add(nm);
-    lines.push(ep);
-  }
-
-  const deadline = Date.now() + 45000;
-  let firstEmbed = defEmbed || '';
-  let tried = 0;
-  for (const ep of lines) {
-    if (tried >= 4 || Date.now() > deadline) break;
-    tried++;
-    // 第一条（页面默认线路）的 embed 已在详情 HTML 里，省一次 ajax
-    let embed = '';
-    if (episodes.length && ep.episode === episodes[0].episode && defEmbed) {
-      embed = defEmbed;
-    } else if (filmId) {
-      embed = await ajaxEmbed(durl, ep, filmId);
-    }
+    // 默认线路（episodes[0]）的 embed 已在第一步用过，同线跳过省一次 ajax
+    if (defEmbed && episodes.length && ep.episode === episodes[0].episode) continue;
+    if (!filmId) break;
+    borrowed++;
+    const embed = await ajaxEmbed(durl, ep, filmId);
     if (!embed) continue;
     if (!firstEmbed) firstEmbed = embed;
+    const host = hostOf(embed);
     try {
-      const resolved = await resolveEmbed(embed, durl);
-      if (resolved && resolved.url) return resolved;
+      if (isF4HostName(host)) {
+        const w = workerF4Url(embed, durl);
+        if (w) return { parse: 0, url: w, header: uaHead };
+        continue;
+      }
+      if (isSwHostName(host)) {
+        const w = workerVUrl(embed, durl);
+        if (w && await probePlaylist(w, uaHead, 4000)) {
+          return { parse: 0, url: w, header: uaHead };
+        }
+        // Worker 链对此视频不通: 蜘蛛内解 hls3 记下作最后手段（手机是
+        // 住宅/移动出口，hls3 的 ASN 门禁可能放行），先继续借其他线
+        if (!swLastResort) {
+          const links = await decodeStreamHgLinks(embed, durl);
+          if (links.hls3) swLastResort = links.hls3;
+        }
+        continue;
+      }
+      const r = await resolveEmbed(embed, durl);
+      if (r && r.url) return r;
     } catch (e) { /* 换下一条线路 */ }
+  }
+
+  // —— 第三步: SW 最后手段（蜘蛛内 hls3 直链，不探活、交播放器试）——
+  if (!swLastResort && defEmbed && isSwHostName(hostOf(defEmbed))) {
+    const links = await decodeStreamHgLinks(defEmbed, durl);
+    if (links.hls3) swLastResort = links.hls3;
+  }
+  if (swLastResort) {
+    return { parse: 0, url: swLastResort, header: uaHead };
   }
 
   // 全部线路解不出: 回到默认 embed 嗅探兜底（v3 行为）
