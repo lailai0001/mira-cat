@@ -57,7 +57,6 @@ import stripchat from './spider/video/stripchat.js';
 import hohoj from './spider/video/hohoj.js';
 import rip17 from './spider/video/rip17.js';
 import brazz from './spider/video/brazz.js';
-import bongacams from './spider/video/bongacams.js';
 import sakuralive from './spider/video/sakuralive.js';
 import bigbuttshub from './spider/video/bigbuttshub.js';
 
@@ -119,7 +118,7 @@ const spiders = [
     youzidj,
     stripchat,
     hohoj,
-    rip17, brazz, bongacams, sakuralive, bigbuttshub,];
+    rip17, brazz, sakuralive, bigbuttshub,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
