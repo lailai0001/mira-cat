@@ -41,13 +41,13 @@ import xingmengasmr from './spider/video/xingmengasmr.js';
 import avjoy from './spider/video/avjoy.js';
 import uu_video from './spider/video/uu_video.js';
 import kissjav from './spider/video/kissjav.js';
-import pornsub from './spider/video/pornsub.js';
 import javhd from './spider/video/javhd.js';
 import javgg from './spider/video/javgg.js';
 import javopen from './spider/video/javopen.js';
 import tubetubetube from './spider/video/tubetubetube.js';
 import javmobile from './spider/video/javmobile.js';
 import javmost from './spider/video/javmost.js';
+import javhdtoday from './spider/video/javhdtoday.js';
 
 const spiders = [
     missav_xptv,
@@ -93,13 +93,13 @@ const spiders = [
     avjoy,
     uu_video,
     kissjav,
-    pornsub,
     javhd,
     javgg,
     javopen,
     tubetubetube,
     javmobile,
-    javmost,];
+    javmost,
+    javhdtoday,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**

@@ -12,6 +12,9 @@ const KEY = 'py_javmobile';
 const NAME = 'JavMobile';
 const SITE = 'https://javmobile.net';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+// 手机 UA：helvid 的 token 按设备签发 (d=apple/d=chromium)，用手机 UA 取 token
+// 才能保证用户手机端（MiraPlayer 原生 UA）请求分片不 404
+const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 const REFERER = SITE + '/';
 
 // 8 个真实分类 (2026-10-20 从首页导航实测)
@@ -52,9 +55,10 @@ function fixUrl(u) {
 }
 
 // 双通道: 先框架 req，失败再原生 fetch
-async function getHtml(url, referer) {
+// ua: 覆盖默认 UA（取 helvid token 时必须用手机 UA，否则签出的 d=chromium token 在手机端分片 404）
+async function getHtml(url, referer, ua) {
   const headers = {
-    'User-Agent': UA,
+    'User-Agent': ua || UA,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
     'Referer': referer || REFERER,
@@ -123,8 +127,10 @@ async function buildList(url, page, limit, tid) {
   if (!html) return { page, pagecount: page, limit, total: 0, list: [] };
   const list = parseCards(html);
   let pc = parsePagecount(html);
-  // 首页（最新）没有翻页链接，但 /page/N/ 有效，默认给一个较大的页数让 App 能加载更多
-  if (tid === 'latest' && pc <= 1 && list.length >= limit) pc = 50;
+  // 最新：首页无翻页链接，且各页 HTML 里解析出的 pagecount 会随当前页码波动
+  // （如第2页只能看到 /page/2/，pagecount 就变成 2），导致 App 误判已到最后一页。
+  // 实测 /page/100/ 仍有 30 条，固定给 100。
+  if (tid === 'latest' && list.length > 0) pc = 100;
   return { page, pagecount: Math.max(pc, page), limit, total: list.length, list };
 }
 
@@ -150,9 +156,11 @@ function extractSources(html) {
 }
 
 // Server1: upload18 播放页 -> window.PLAYER_CONFIG.m3u8 (带1次重试, 站方偶发 chunked 截断)
+// 注意: 必须用手机 UA 请求，helvid 按 UA 签发 token (d=apple)；用桌面 UA 签出的
+// d=chromium token 在手机端请求分片会 404，导致播不全/无法快进
 async function resolveUpload18(embedUrl) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const html = await getHtml(embedUrl, REFERER);
+    const html = await getHtml(embedUrl, REFERER, MOBILE_UA);
     if (!html || !html.includes('window.PLAYER_CONFIG')) continue;
     const m = html.match(/window\.PLAYER_CONFIG\s*=\s*(\{.*?\});/s);
     if (!m) continue;
@@ -298,11 +306,12 @@ async function play(reqIn) {
   const r = await resolvePlay(durl);
   if (!r.url) return { parse: 0, url: '' };
   // Referer 必须与视频源站点一致 (helvid 只认 upload18.org, 否则 403)
+  // UA 必须用手机 UA：token 按设备签发 (d=apple)，与取 token 时的 UA 保持一致
   const referer = r.referer || REFERER;
   return {
     parse: r.parse,
     url: r.url,
-    header: { 'User-Agent': UA, 'Referer': referer },
+    header: { 'User-Agent': MOBILE_UA, 'Referer': referer },
   };
 }
 

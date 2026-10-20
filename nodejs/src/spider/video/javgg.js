@@ -55,7 +55,9 @@ function fixUrl(u) {
 
 // 双通道: 先框架 req，失败再原生 fetch
 // minLen: 最小有效长度 (HTML 页用 500，JSON API 用 10)
-async function getText(url, headers, minLen) {
+// 备用域名: javgg.net 被墙时自动切 javgg.co (2026-10-20 实测同站同结构)
+const BACKUP_SITE = 'https://javgg.co';
+async function getTextInner(url, headers, minLen) {
   const h = {
     'User-Agent': UA,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -83,6 +85,18 @@ async function getText(url, headers, minLen) {
   return '';
 }
 
+// 域名 failover: 主站抓不到时切备用域名再试
+async function getText(url, headers, minLen) {
+  let txt = await getTextInner(url, headers, minLen);
+  if (txt) return txt;
+  if (url.includes('javgg.net')) {
+    const backupUrl = url.replace('javgg.net', 'javgg.co');
+    txt = await getTextInner(backupUrl, headers, minLen);
+    if (txt) return txt;
+  }
+  return '';
+}
+
 // 解析列表卡片
 // 结构1: 列表页 article.item.movies > .poster > img[data-src] + .titlecontent + a[href="/jav/xxx/"]
 // 结构2: 搜索页 div.result-item > article > .image img[src] + .details .title a
@@ -99,7 +113,7 @@ function parseCards(html) {
   const re1 = /<article[^>]*class="[^"]*item movies[^"]*"[^>]*>([\s\S]*?)<\/article>/g;
   while ((m = re1.exec(html)) !== null) {
     const card = m[1];
-    const linkM = card.match(/<a[^>]*href="(https?:\/\/javgg\.net\/jav\/[^"]+\/)"/);
+    const linkM = card.match(/<a[^>]*href="(https?:\/\/javgg\.(net|co)\/jav\/[^"]+\/)"/);
     if (!linkM) continue;
     const imgM = card.match(/<img[^>]*data-src="([^"]+)"/) || card.match(/<img[^>]*src="([^"]+)"/);
     const titleM = card.match(/<div class="titlecontent">([\s\S]*?)<\/div>/);
@@ -110,7 +124,7 @@ function parseCards(html) {
   const re2 = /<div class="result-item">([\s\S]*?)<\/article>/g;
   while ((m = re2.exec(html)) !== null) {
     const card = m[1];
-    const linkM = card.match(/<a[^>]*href="(https?:\/\/javgg\.net\/jav\/[^"]+\/)"/);
+    const linkM = card.match(/<a[^>]*href="(https?:\/\/javgg\.(net|co)\/jav\/[^"]+\/)"/);
     if (!linkM) continue;
     const imgM = card.match(/<img[^>]*src="([^"]+)"/);
     const titleM = card.match(/<div class="title">\s*<a[^>]*>([\s\S]*?)<\/a>/);

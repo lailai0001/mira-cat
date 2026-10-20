@@ -10,9 +10,10 @@ import req from '../../util/req.js';
 // 标签: /tag/{TAG}/ (仅第1页可用，翻页 410，站点限制)
 // 搜索: /search/{kw}/[/page/N/]
 // 详情: /{CODE}/ 标题+封面从 JSON-LD 取
-// 播放: 详情页播放器经混淆 JS 调 POST /ri3123o235r/ 动态加载，播放器地址为 AES 加密 token；
-//       该接口对机房 IP tar-pit (65秒零字节)，GET 返回空，AES 密钥不在页面中，服务端无法直接取流。
-//       play 走 parse:1 由 MiraPlayer 内置 WebView 在手机端执行页面 JS 后嗅探真实视频流。
+// 播放: 两步走。1) 服务端 POST /ri3123o235r/ (必须带 X-Requested-With: XMLHttpRequest 头，
+//       否则被 tar-pit) 拿 embed 播放器地址 (dooplayer.com/mostplayer.com 等)；
+//       2) 把纯播放器 embed 页交给 MiraPlayer parse:1 嗅探 (比嗅探详情页更直接)。
+//       拿不到 embed 时降级嗅探详情页。
 
 const KEY = 'py_javmost';
 const NAME = 'JavMost';
@@ -100,6 +101,10 @@ async function getHtml(url) {
   return '';
 }
 
+async function init(reqIn) {
+  return {};
+}
+
 // 解析视频卡片: <a href="https://www.javmost.ws/{CODE}/" ... alt="标题"> ... data-src="封面"
 function parseCards(html) {
   const out = [];
@@ -184,8 +189,61 @@ function catUrl(tid, page) {
   }
 }
 
-async function init(reqIn) {
-  return {};
+// 从详情页提取 YWRz 加密参数
+function extractYwrz(html) {
+  const defs = {};
+  const re = /(YWRz\w+)\s*=\s*'([^']+)'/g;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    defs[m[1]] = m[2];
+  }
+  return defs;
+}
+
+// POST /ri3123o235r/ 获取 embed 播放器地址
+// 关键: 必须带 X-Requested-With: XMLHttpRequest 头，否则被 tar-pit
+async function fetchEmbedUrl(durl, html) {
+  const defs = extractYwrz(html);
+  if (!defs.YWRzNA || !defs.YWRzMQo) return '';
+  const params = new URLSearchParams({
+    group: defs.YWRzMg || '62',
+    part: '1',
+    code: defs.YWRzNA,
+    code2: defs.YWRzNQ || '',
+    code3: defs.YWRzNg || '',
+    value: defs.YWRzMQo,
+    sound: 'av',
+  });
+  const apiUrl = SITE + '/ri3123o235r/';
+  const headers = {
+    'User-Agent': UA,
+    'Referer': durl,
+    'X-Requested-With': 'XMLHttpRequest',
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+  };
+  const body = params.toString();
+  // 通道1: 框架 req
+  try {
+    const { data, status } = await req.post(apiUrl, body, { headers, timeout: 30000 });
+    if (status === 200 && data) {
+      const json = typeof data === 'string' ? JSON.parse(data) : data;
+      if (json && json.status === 'success' && json.data && json.data[0]) {
+        return t(json.data[0]).replace(/\\\//g, '/');
+      }
+    }
+  } catch (e) { /* 换通道2 */ }
+  // 通道2: 原生 fetch
+  try {
+    const r = await fetch(apiUrl, { method: 'POST', headers, body });
+    if (r.ok) {
+      const json = await r.json();
+      if (json && json.status === 'success' && json.data && json.data[0]) {
+        return t(json.data[0]).replace(/\\\//g, '/');
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return '';
 }
 
 async function home(reqIn) {
@@ -259,7 +317,22 @@ async function play(reqIn) {
   // id 可能是 "正片$https://..." 形式，取 $ 后面的完整 URL
   if (id.includes('$')) id = id.split('$').pop().trim();
   const durl = /^https?:\/\//.test(id) ? id : (SITE + '/' + id.replace(/^\/+|\/+$/g, '') + '/');
-  // 站点视频源经 JS ajax 动态加载(机房 IP 被 tar-pit)，由 MiraPlayer 内置嗅探在手机端执行页面 JS 后捕获真实流
+  // 第1步: 服务端 POST /ri3123o235r/ 拿 embed 播放器地址 (需 X-Requested-With 头)
+  const html = await getHtml(durl);
+  let embedUrl = '';
+  if (html) {
+    embedUrl = await fetchEmbedUrl(durl, html);
+  }
+  if (embedUrl && /^https?:\/\//.test(embedUrl)) {
+    // 第2步: 把纯播放器 embed 页交给 MiraPlayer 嗅探 (比嗅探详情页更直接，无需等 ajax)
+    return {
+      parse: 1,
+      jx: 0,
+      url: embedUrl,
+      header: { 'User-Agent': UA, 'Referer': durl },
+    };
+  }
+  // 拿不到 embed 则降级嗅探详情页
   return {
     parse: 1,
     jx: 0,

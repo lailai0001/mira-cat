@@ -505,12 +505,19 @@ async function category(reqIn) {
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const cats = await getCategories();
   const cat = cats.find(c => c.type_id === tid) || cats[0];
-  
-  const data = await apiCall('/api/v2/home/public/video/list', {
-    page: String(page), limit: '20', type: 'cate', typeId: cat.type_id, videoType: 'long',
-  });
+
+  // 热门(268) 用 type=hot 接口（851条，可翻页）；用 type=cate+typeId=268 只能拿到20条
+  // 站点前端 type 参数可选值：cate/label/collect/last/hot/good（从前端 JS 逆向）
+  let params;
+  if (cat.type_id === '268') {
+    params = { page: String(page), limit: '20', type: 'hot', videoType: 'long' };
+  } else {
+    params = { page: String(page), limit: '20', type: 'cate', typeId: cat.type_id, videoType: 'long' };
+  }
+
+  const data = await apiCall('/api/v2/home/public/video/list', params);
   const total = data?.total || 0;
-  // 防御：请求的页超出总数时直接返回空（API 对超页会返回第1页重复内容，如热门分类）
+  // 防御：请求的页超出总数时直接返回空（API 对超页会返回第1页重复内容）
   if (total > 0 && (page - 1) * 20 >= total) {
     return { page, pagecount: Math.ceil(total / 20) || 1, limit: 20, total, list: [] };
   }

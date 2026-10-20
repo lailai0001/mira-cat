@@ -75,19 +75,25 @@ async function getHtml(url) {
 
 // 解析列表卡片: div.a3 > a[href="/tube/.../"] > img + p标题
 // 注意: 详情页 URL 含完整路径，vod_id 存完整详情 URL
+// 注意: 2026-10-20 网站改版，HTML 属性去掉引号 (class=a3, href=..., src=...)，正则兼容两种格式
 function parseCards(html) {
   const out = [];
   const seen = new Set();
-  const re = /<a\s+href="(https?:\/\/(?:www\.)?tubetubetube\.com\/tube\/[^"]+\/|\/tube\/[^"]+\/)"[^>]*>\s*<img\s+src="([^"]+)"[^>]*>\s*<p>(?:<i[^>]*><\/i>)?([^<]*)<\/p>\s*<\/a>/g;
+  // href/src 可能带引号也可能不带：href="..." 或 href=...
+  const re = /<a\s+href=(?:"([^"]+)"|([^\s>]+))[^>]*>\s*<img\s+src=(?:"([^"]+)"|([^\s>]+))[^>]*>\s*<p>(?:<i[^>]*><\/i>)?([^<]*)<\/p>\s*<\/a>/g;
   let m;
   while ((m = re.exec(html)) !== null) {
-    const durl = fixUrl(m[1]);
+    const rawUrl = m[1] || m[2] || '';
+    const rawPic = m[3] || m[4] || '';
+    // 只收 /tube/ 开头的视频链接
+    if (!/\/tube\//.test(rawUrl)) continue;
+    const durl = fixUrl(rawUrl);
     if (seen.has(durl)) continue;
     seen.add(durl);
     out.push({
       vod_id: durl,
-      vod_name: clean(m[3]) || durl,
-      vod_pic: fixUrl(m[2]),
+      vod_name: clean(m[5]) || durl,
+      vod_pic: fixUrl(rawPic),
       vod_remarks: '',
     });
   }
@@ -95,11 +101,12 @@ function parseCards(html) {
 }
 
 // 翻页: div.a7 内 <a href="/tube/11/">11</a> 或 <a href="/r18/352">352</a> 取最大页码
+// 注意: 2026-10-20 改版后 class 无引号 (class=a7)
 function parsePagecount(html) {
-  const a7 = html.match(/<div class="a7">([\s\S]*?)<\/div>/);
+  const a7 = html.match(/<div class="?a7"?>((?:[\s\S]*?))<\/div>/);
   const scope = a7 ? a7[1] : html;
-  const pages = [...scope.matchAll(/<a[^>]+href="[^"]*\/(\d+)\/?"[^>]*>(\d+)<\/a>/g)]
-    .map(x => parseInt(x[2], 10))
+  const pages = [...scope.matchAll(/<a[^>]+href=(?:"[^"]*\/(\d+)\/?"|(\S*?\/(\d+)\/?\S*?))[^>]*>(\d+)<\/a>/g)]
+    .map(x => parseInt(x[4] || x[3] || x[1], 10))
     .filter(n => n > 0 && n < 100000);
   return pages.length ? Math.max(...pages) : 1;
 }
@@ -141,10 +148,14 @@ async function category(reqIn) {
   return buildList(catUrl(tid, page), page, 96);
 }
 
-// 从详情页提取 <video src="...mp4"> 直链与标题
+// 从详情页提取 mp4 直链
+// 旧结构: <video src="...mp4"> ; 新结构 (2026-10-20): <div class=mp4><a href="...mp4">
 function extractVideo(html) {
-  const m = html.match(/<video[^>]+src="([^"]+\.mp4[^"]*)"/i);
-  return m ? m[1] : '';
+  let m = html.match(/<video[^>]+src=(?:"([^"]+\.mp4[^"]*)"|([^\s>]+))/i);
+  if (m) return m[1] || m[2] || '';
+  m = html.match(/<div class="?mp4"?>[\s\S]*?<a[^>]+href=(?:"([^"]+\.mp4[^"]*)"|([^\s>]+\.mp4[^\s>]*))/i);
+  if (m) return m[1] || m[2] || '';
+  return '';
 }
 
 function extractDetailTitle(html) {
@@ -168,10 +179,12 @@ async function detail(reqIn) {
 
   const name = extractDetailTitle(html) || durl;
   let pic = '';
-  const posterM = html.match(/<video[^>]+poster="([^"]+)"/i);
-  if (posterM) pic = fixUrl(posterM[1]);
+  const posterM = html.match(/<video[^>]+poster=(?:"([^"]+)"|([^\s>]+))/i);
+  if (posterM) pic = fixUrl(posterM[1] || posterM[2] || '');
 
   const mp4 = extractVideo(html);
+  // 兜底: poster 可由 mp4 地址推导 (.mp4 -> .jpg)
+  if (!pic && mp4) pic = mp4.replace(/\.mp4(\?.*)?$/i, '.jpg');
   const flags = mp4 ? ['MP4'] : ['TubeTubeTube'];
   const urls = [`正片$${durl}`];
 
