@@ -8,7 +8,10 @@ import req from '../../util/req.js';
 //             标题取 img alt，时长 span.videoBox-time。
 //             vod_id 直接用帖子 id (详情页 /index.php/vod/detail/id/{id}.html)。
 //   分类: 最新更新 /index.php/label/new.html (分页 /index.php/label/new/page/{n}.html，41 页，28 条/页)
-//         热门推荐 /index.php/label/hot.html (单页 28 条)
+//         热门推荐 /index.php/label/hot.html (站方无分页，单页 28 条；/page/{n} 返回与第 1 页相同内容)
+//         注意: hot 页卡片结构与其它列表页不同——没有 <img>，封面是
+//         <div class="videoBox-cover" style="background-image: url(&quot;/upload/vod/...&quot;)">，
+//         标题在 <span class="title"> 里 (无 img alt)。parseCards 有对应兜底分支。
 //         onlyfans type 1 (5 页) / 网黄 type 2 (24 页) / 品牌 type 3 (6 页) / 业余 type 4 (24 页)
 //         type 分页 /index.php/vod/type/id/{tid}/page/{n}.html，20 条/页
 //         总页数从 layui-laypage-count "1/N" 或尾页 data-page 解析。
@@ -95,9 +98,19 @@ function parseCards(html) {
       const srcM = win.match(/<img[^>]+src="(\/upload\/[^"]+)"/);
       if (srcM) pic = fixUrl(srcM[1]);
     }
+    if (!pic) {
+      // hot 页卡片无 img，封面在 videoBox-cover 的 background-image 里 (URL 被 &quot; 实体包裹)
+      const bgM = win.match(/background-image:\s*url\((?:&quot;|"|')?([^&"')]+)(?:&quot;|"|')?\)/);
+      if (bgM) pic = fixUrl(bgM[1]);
+    }
     let title = '';
     const altM = win.match(/<img[^>]+alt="([^"]*)"/);
     if (altM) title = clean(altM[1]);
+    if (!title) {
+      // hot 页无 img alt，标题在 span.title
+      const ttM = win.match(/<span class="title">([^<]+)<\/span>/);
+      if (ttM) title = clean(ttM[1]);
+    }
     let remarks = '';
     const tm = win.match(/videoBox-time"[^>]*>([^<]+)</);
     if (tm) remarks = clean(tm[1]);
@@ -177,6 +190,11 @@ async function category(reqIn) {
   const tid = t(body.tid || body.id) || 'new';
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const cat = catOf(tid);
+  // 热门推荐站方无分页 (模板不渲染分页器，/page/{n} 返回与第 1 页相同内容)：
+  // 第 2 页起返回空列表并报 pagecount=1，避免客户端无限"加载更多"刷出重复内容
+  if (cat.kind === 'label' && cat.slug === 'hot' && page > 1) {
+    return { page, pagecount: 1, limit: 30, total: 0, list: [] };
+  }
   return buildList(catUrl(cat, page), page, 30);
 }
 
