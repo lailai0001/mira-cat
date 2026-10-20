@@ -41,6 +41,23 @@
 //   播放器不转发 header 给分片的限制对本源无影响: 各线均为 URL 自带
 //   令牌的直链, 分片不依赖蜘蛛给的 Referer (MaxStream 线 VM 实拉时
 //   带了 Referer, 未验无 Referer 形态 —— 真机风险项之一)。
+//
+// 2026-10-21 第三轮修复 (与 javhdporn 同病同方):
+//   真机故障根因 (VM 实测坐实): 本站 (与 javhdporn 同运营网络) 的
+//   Cloudflare 按 User-Agent 拉黑 HTTP 库特征 UA —— okhttp / Java /
+//   axios / node-fetch / python-requests 等一律 403, 只回 17B~5.5KB
+//   空壳页; 浏览器 UA 则 200 满页。App 运行时发出的请求带的正是
+//   这类被拉黑的 UA (蜘蛛设置的 Chrome UA 未能生效到站方), 于是
+//   真机上所有页面抓取都只拿到 403 空壳 -> 解析 0 卡 -> "有分类、
+//   无内容、点不开"。其他源 (Brazz/javideo/7mmtv) 的 CF 区没有
+//   这条规则, 故独这两站全灭。版本前缀 /v{n}/ 经实测不是病因:
+//   旧版本路径 (v2/v3/v9) 至今仍回真实内容页。
+//   对策: GET/POST 抓取全部改为多层兜底 + 内容校验 + 胜出层记忆:
+//   直连 req -> 直连 fetch -> jina 读页 (x-respond-with:html 取
+//   原始 HTML, 实测 1~2s 满页保真) -> allorigins -> codetabs;
+//   POST /api/play/ 走 直连 req -> 直连 fetch -> allorigins 转发。
+//   铸造链若最终仍拿不到线路, play 落 parse:1 嗅探详情页兜底
+//   (真机 WebView 是真实浏览器, 站方 cast 链可在页内原生跑通)。
 import req from '../../util/req.js';
 
 const KEY = 'py_bestjavporn';
@@ -1984,6 +2001,51 @@ function absUrl(u) {
 }
 
 // ---------- 基础传输: 框架 req 优先, 原生 fetch 兜底 ----------
+// ---------- 抓取层 (第三轮: 多层兜底 + 内容校验 + 胜出层记忆) ----------
+// 病因见文件头第三轮注释: 站方 CF 按 UA 拉黑库特征 UA, App 运行时
+// 直连只回 403 空壳。本层逐层试, 每层结果先过校验才采纳, 并记住
+// 胜出层供后续请求优先 (sticky)。校验分两档: 本站 www 页面用严档
+// (真页面 >12KB 且含 pornfhd.com 标记、无 CF 空壳特征); embed 等
+// 外站页面用宽档 (非空、够长、无空壳特征)。
+function isShellPage(s) {
+  return /Attention Required|Just a moment|cf-challenge|Checking your browser/i.test(s || '');
+}
+function isRealPage(html) {
+  if (!html || html.length < 12000) return false;
+  if (!html.includes('pornfhd.com')) return false;
+  return !isShellPage(html);
+}
+function validFor(url, html) {
+  if (!html) return false;
+  if (/^https:\/\/(www\.)?(bestjavporn\.com|javhdporn\.net)\//i.test(url)) return isRealPage(html);
+  return html.length > 800 && !isShellPage(html);
+}
+
+async function fetchRaw(url, headers, timeout) {
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), timeout);
+  try {
+    const r = await fetch(url, { headers, signal: ctl.signal, redirect: 'follow' });
+    if (!r.ok) return '';
+    return await r.text();
+  } catch (e) {
+    return '';
+  } finally { clearTimeout(to); }
+}
+
+async function getViaJina(url, headers, timeout) {
+  // jina 匿名读页偶发 401 (出口 IP 信誉), 立即重试一次常能过
+  for (let i = 0; i < 2; i++) {
+    const html = await fetchRaw('https://r.jina.ai/' + url, {
+      'User-Agent': headers['User-Agent'] || UA,
+      'x-respond-with': 'html',
+    }, 22000);
+    if (validFor(url, html)) return html;
+    if (i === 0) await new Promise((res) => setTimeout(res, 1200));
+  }
+  return '';
+}
+
 async function httpGet(url, opts = {}) {
   const headers = {
     'User-Agent': UA,
@@ -1992,20 +2054,67 @@ async function httpGet(url, opts = {}) {
     'Referer': opts.referer || REFERER,
   };
   const timeout = opts.timeout || 15000;
-  try {
-    const { data, status } = await req.get(url, { headers, timeout });
-    if ((!status || status === 200) && data != null && data !== '') {
-      return typeof data === 'string' ? data : JSON.stringify(data);
+  const layers = [
+    async () => { // 直连 req (axios)
+      try {
+        const { data, status } = await req.get(url, { headers, timeout });
+        if ((!status || status === 200) && data != null && data !== '') {
+          return typeof data === 'string' ? data : JSON.stringify(data);
+        }
+      } catch (e) { /* 落下一层 */ }
+      return '';
+    },
+    async () => fetchRaw(url, headers, timeout), // 直连 fetch
+    async () => getViaJina(url, headers), // jina 读页 (原始 HTML)
+    async () => fetchRaw('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), { 'User-Agent': UA }, 30000),
+    async () => fetchRaw('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), { 'User-Agent': UA }, 22000),
+  ];
+  const deadline = Date.now() + 70000;
+  const order = [];
+  if (httpGet._good >= 0) order.push(httpGet._good);
+  for (let i = 0; i < layers.length; i++) if (i !== httpGet._good) order.push(i);
+  let best = '';
+  for (const idx of order) {
+    if (Date.now() > deadline) break;
+    let html = '';
+    try { html = await layers[idx](); } catch (e) { html = ''; }
+    if (validFor(url, html)) {
+      httpGet._good = idx;
+      return html;
     }
-  } catch (e) { /* 落 fetch */ }
+    if (html && html.length > best.length) best = html;
+  }
+  return best;
+}
+httpGet._good = -1;
+
+function validPlayResp(text) {
+  if (!text) return false;
   try {
+    const j = JSON.parse(text);
+    return j && typeof j === 'object' && 'status' in j;
+  } catch (e) { return false; }
+}
+
+async function postViaAllorigins(url, bodyStr, headers, timeout) {
+  const relay = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url);
+  for (let i = 0; i < 3; i++) { // allorigins 偶发 502/522, 给三次机会
     const ctl = new AbortController();
-    const to = setTimeout(() => ctl.abort(), timeout);
+    const to = setTimeout(() => ctl.abort(), Math.max(timeout, 25000));
     try {
-      const r = await fetch(url, { headers, signal: ctl.signal, redirect: 'follow' });
-      if (r.ok) return await r.text();
-    } finally { clearTimeout(to); }
-  } catch (e) { /* 忽略 */ }
+      const r = await fetch(relay, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': headers['User-Agent'] || UA },
+        body: bodyStr,
+        signal: ctl.signal,
+      });
+      if (r.ok) {
+        const text = await r.text();
+        if (validPlayResp(text)) return text;
+      }
+    } catch (e) { /* 再试/落空 */ } finally { clearTimeout(to); }
+    if (i < 2) await new Promise((res) => setTimeout(res, 2000));
+  }
   return '';
 }
 
@@ -2022,7 +2131,8 @@ async function httpPostForm(url, bodyStr, opts = {}) {
   try {
     const { data, status } = await req.post(url, bodyStr, { headers, timeout });
     if ((!status || status === 200) && data != null && data !== '') {
-      return typeof data === 'string' ? data : JSON.stringify(data);
+      const text = typeof data === 'string' ? data : JSON.stringify(data);
+      if (validPlayResp(text)) return text;
     }
   } catch (e) { /* 落 fetch */ }
   try {
@@ -2030,10 +2140,13 @@ async function httpPostForm(url, bodyStr, opts = {}) {
     const to = setTimeout(() => ctl.abort(), timeout);
     try {
       const r = await fetch(url, { method: 'POST', headers, body: bodyStr, signal: ctl.signal, redirect: 'follow' });
-      if (r.ok) return await r.text();
+      if (r.ok) {
+        const text = await r.text();
+        if (validPlayResp(text)) return text;
+      }
     } finally { clearTimeout(to); }
-  } catch (e) { /* 忽略 */ }
-  return '';
+  } catch (e) { /* 落中转 */ }
+  return postViaAllorigins(url, bodyStr, headers, timeout);
 }
 
 // ---------- 页面缓存 (详情供 play 复用, 省一次整链) ----------
@@ -2356,6 +2469,12 @@ async function detail(reqIn) {
     fromNames.push(ln.host);
     playUrls.push('播放$' + durl + '@@' + ln.idx);
   });
+  if (!lines.length) {
+    // 铸造链没拿到线路 (多为抓取层被站方挡): 至少给一条嗅探线,
+    // 真机 WebView 是真实浏览器, 站方 cast 链可在详情页内原生跑通。
+    fromNames.push('网页嗅探');
+    playUrls.push('播放$' + durl + '@@sniff');
+  }
   return {
     list: [{
       vod_id: durl,
@@ -2370,20 +2489,29 @@ async function detail(reqIn) {
   };
 }
 
+function sniffResult(durl) {
+  // 最后兜底: 交给 App 的 WebView 嗅探 (真实浏览器环境可跑站方链)
+  return { parse: 1, jx: 0, url: durl, header: { 'User-Agent': UA, Referer: REFERER } };
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
   if (id.includes('$')) id = id.split('$').pop().trim();
+  // @@sniff 伪线 (detail 时铸造链没拿到线路才生成): 点播时先再试一次
+  // 完整铸造链 (中转有偶发性, 第二次常能成), 实在不行才落嗅探。
+  const sniffOnly = id.endsWith('@@sniff');
+  if (sniffOnly) id = id.slice(0, -'@@sniff'.length);
   const mm = id.match(/^(https?:\/\/\S+?)@@(\d+)$/);
   const durl = mm ? mm[1] : absUrl(id);
   const wantIdx = mm ? parseInt(mm[2], 10) : 0;
   const html = await getDetailHtml(durl);
-  if (!html) return { parse: 0, url: '' };
+  if (!html) return sniffResult(durl);
   const { postId, mpu } = extractPlaySeed(html);
-  if (!postId || !mpu) return { parse: 0, url: '' };
+  if (!postId || !mpu) return sniffResult(durl);
   const paths = await fetchEmbedPaths(postId, mpu, durl);
-  if (!paths.length) return { parse: 0, url: '' };
+  if (!paths.length) return sniffResult(durl);
   const order = paths.map((p, idx) => idx);
   // 与 detail 相同的排序口径: 先按 detail 时的 idx 顺序尝试想要的那条,
   // 拿不到再按顺序逐条兜底 (区域铸造偶发失败时换线还能播)。
@@ -2398,7 +2526,7 @@ async function play(reqIn) {
       return { parse: 0, url: src.file, header: { 'User-Agent': UA, 'Referer': embedUrl } };
     }
   }
-  return { parse: 0, url: '' };
+  return sniffResult(durl);
 }
 
 async function search(reqIn) {
