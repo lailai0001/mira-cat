@@ -1,16 +1,18 @@
 import req from '../../util/req.js';
 import crypto from 'crypto';
-import vm from 'vm';
 
 // JavOpen (py_javopen)
 // 站点: https://javopen.co/ (WordPress JAV 站)
 // 列表: GET /{slug}/[/page/N/]  slug: jav-censored/jav-uncensored/mgstage/amatuer-porn/asia-uncensored-hd/fc3ppv/usa-euro
 // 搜索: GET /?s={kw}
 // 详情: GET /video/{slug}/  提取 iframe (三种宿主, 见分类分布)
-// 播放 (2026-10-20 实测三宿主):
+// 播放 (2026-10-20 二轮修复: 全程纯字符串解码, 不执行站点 JS——App 运行时没有 vm 模块,
+//   上一轮靠 vm 执行 AAEncode/packer 脚本的写法在 App 里抛错, 是真机大部分播不了+慢的根源):
 //   vidaraa.cc/e/{filecode}: POST {host}/api/stream {filecode,device,codecs} -> streaming_url (m3u8, token 时效短, 实时获取)
-//   streamdesi.com/e/{code}: gdplayer 加密流, 已破: 抓 embed 页的 AAEncode 配置脚本 -> api-config/sources 两步 AES 解密拿直链
-//   morencius.com/embed/{code}: 解 jwplayer packer 拿 acek-cdn 的 m3u8 (部分文件站方已删)
+//   streamdesi.com/e/{code}: gdplayer 加密流: AAEncode 脚本纯解码 -> 内层 packer 纯解包
+//     -> 正则提取 apx/qsx/kaken/pd/ps -> api-config/sources 两步 + AES 解密拿直链
+//   morencius.com/embed/{code}: packer 纯解包 -> links.hls* 的 acek-cdn m3u8 (部分文件站方已删)
+//   任一解析失败一律落 parse:1 嗅探兜底, 不返空
 // 实测: 详情页只有 1 个默认 embed, ?tape=1~4 参数对 embed 无任何影响 (旧 tape 扫描逻辑已移除, 徒增 4 次整页请求)
 
 const KEY = 'py_javopen';
@@ -54,6 +56,13 @@ function fixUrl(u) {
   return u;
 }
 
+function fetchWithTimeout(url, opt, timeout) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout || 10000);
+  const o = Object.assign({}, opt || {}, { signal: ctrl.signal });
+  return fetch(url, o).finally(() => clearTimeout(timer));
+}
+
 async function getHtml(url) {
   const headers = {
     'User-Agent': UA,
@@ -62,12 +71,12 @@ async function getHtml(url) {
     'Referer': REFERER,
   };
   try {
-    const { data, status } = await req.get(url, { headers, timeout: 25000 });
+    const { data, status } = await req.get(url, { headers, timeout: 12000 });
     if (status === 200 && typeof data === 'string' && data.length > 1000) return data;
     if (status === 200 && data) return typeof data === 'string' ? data : '';
   } catch (e) { /* 换通道2 */ }
   try {
-    const r = await fetch(url, { headers });
+    const r = await fetchWithTimeout(url, { headers }, 12000);
     if (r.ok) {
       const txt = await r.text();
       if (txt.length > 1000) return txt;
@@ -85,13 +94,13 @@ async function postJson(url, body, referer) {
   };
   const payload = JSON.stringify(body);
   try {
-    const { data, status } = await req.post(url, payload, { headers, timeout: 25000 });
+    const { data, status } = await req.post(url, payload, { headers, timeout: 12000 });
     if (status === 200 && data) {
       return typeof data === 'string' ? JSON.parse(data) : data;
     }
   } catch (e) { /* 换通道2 */ }
   try {
-    const r = await fetch(url, { method: 'POST', headers, body: payload });
+    const r = await fetchWithTimeout(url, { method: 'POST', headers, body: payload }, 12000);
     if (r.ok) return await r.json();
   } catch (e) { /* ignore */ }
   return null;
@@ -215,30 +224,149 @@ function extractPlayer(html) {
   return null;
 }
 
-// 通用文本抓取 (req 优先, fetch 兜底), 带超时; 失败返回 ''
+// 通用文本抓取 (req 优先, fetch 兜底), 带硬超时; 失败返回 ''
 async function httpText(url, opt) {
   opt = opt || {};
-  const timeout = opt.timeout || 15000;
+  const timeout = opt.timeout || 10000;
   const headers = Object.assign({ 'User-Agent': UA, 'Accept': '*/*', 'Accept-Language': 'en-US,en;q=0.9' }, opt.headers || {});
   try {
     const { data, status } = await req.get(url, { headers, timeout });
     if (status === 200 && data) return typeof data === 'string' ? data : '';
   } catch (e) { /* 换通道2 */ }
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeout);
-    const r = await fetch(url, { headers, signal: ctrl.signal });
-    clearTimeout(timer);
+    const r = await fetchWithTimeout(url, { headers }, timeout);
     if (r.ok) {
       const txt = await r.text();
-      if (txt.length > 500) return txt;
+      if (txt.length > 200) return txt;
     }
   } catch (e) { /* ignore */ }
   return '';
 }
 
-// streamdesi (gdplayer) 的 AES 解密: base64 前16字节为 salt, 后为密文;
+// ============ 纯字符串解码器 (不执行任何站点 JS, 无 vm/eval/Function) ============
+
+// AAEncode 纯解码: 载荷是 +-连接的项, 每项或为 (ﾟДﾟ)[ﾟεﾟ]='\\'、(ﾟДﾟ)[ﾟoﾟ]='"',
+// 或由四个原子 (ﾟΘﾟ)=1 (ﾟｰﾟ)=4 (o^_^o)=3 (c^_^o)=0 组成的 + - * ^ 算术表达式 (=八进制数字)。
+// 拼接得到 "..." 字符串后按 JS 八进制转义解码, 即原始源码文本。
+// 原子值由 AAEncode 标准前导代码决定 (全版本恒定), 已用真实样本逐项验证。
+const AA_ATOMS = { '(ﾟΘﾟ)': 1, '(ﾟｰﾟ)': 4, '(o^_^o)': 3, '(c^_^o)': 0 };
+
+function aaEvalTerm(term) {
+  const s = term.replace(/\s+/g, '');
+  if (s === '(ﾟДﾟ)[ﾟεﾟ]') return '\\';
+  if (s === '(ﾟДﾟ)[ﾟoﾟ]') return '"';
+  let pos = 0;
+  const peek = () => s[pos] || '';
+  function parseXor() { let v = parseAdd(); while (peek() === '^') { pos++; v = (v ^ parseAdd()) | 0; } return v; }
+  function parseAdd() {
+    let v = parseMul();
+    while (peek() === '+' || peek() === '-') { const op = s[pos++]; const r = parseMul(); v = op === '+' ? v + r : v - r; }
+    return v;
+  }
+  function parseMul() { let v = parseUnary(); while (peek() === '*') { pos++; v = v * parseUnary(); } return v; }
+  function parseUnary() {
+    if (peek() === '-') { pos++; return -parseUnary(); }
+    if (peek() === '(') {
+      for (const a of Object.keys(AA_ATOMS)) {
+        if (s.startsWith(a, pos)) { pos += a.length; return AA_ATOMS[a]; }
+      }
+      pos++;
+      const v = parseXor();
+      if (peek() !== ')') throw new Error('aa: missing )');
+      pos++;
+      return v;
+    }
+    throw new Error('aa: bad char');
+  }
+  const v = parseXor();
+  if (pos !== s.length) throw new Error('aa: trailing');
+  return String(v);
+}
+
+function aaDecode(script) {
+  const src = String(script).replace(/\/\*[\s\S]*?\*\//g, '');
+  const m = src.match(/\(ﾟεﾟ\s*\+/);
+  if (!m) return '';
+  const start = m.index + m[0].length;
+  let depth = 0, end = -1;
+  for (let j = start; j < src.length; j++) {
+    const ch = src[j];
+    if (ch === '(' || ch === '[') depth++;
+    else if (ch === ')' || ch === ']') { if (depth === 0) { end = j; break; } depth--; }
+  }
+  if (end < 0) return '';
+  const payload = src.slice(start, end);
+  const terms = [];
+  let d = 0, cur = '';
+  for (const ch of payload) {
+    if (ch === '(' || ch === '[') d++;
+    else if (ch === ')' || ch === ']') d--;
+    if (ch === '+' && d === 0) { terms.push(cur); cur = ''; } else cur += ch;
+  }
+  if (cur.trim()) terms.push(cur);
+  let s = '';
+  for (const term of terms) { if (term.trim()) s += aaEvalTerm(term); }
+  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) s = s.slice(1, -1);
+  let out = '', k = 0;
+  while (k < s.length) {
+    const ch = s[k];
+    if (ch === '\\' && k + 1 < s.length && s[k + 1] >= '0' && s[k + 1] <= '7') {
+      const maxd = s[k + 1] <= '3' ? 3 : 2;
+      let digs = s[k + 1], n = k + 2;
+      while (digs.length < maxd && n < s.length && s[n] >= '0' && s[n] <= '7') { digs += s[n]; n++; }
+      out += String.fromCharCode(parseInt(digs, 8));
+      k = n;
+    } else if (ch === '\\' && k + 1 < s.length) {
+      const e = s[k + 1];
+      out += e === 'n' ? '\n' : e === 't' ? '\t' : e === 'r' ? '\r' : e;
+      k += 2;
+    } else { out += ch; k++; }
+  }
+  return out;
+}
+
+// Dean Edwards packer 纯解包: 解析 eval(function(p,a,c,k,e,d){...}('p',a,c,'k'.split('|')))
+// 用标准 e(c) 词元函数逐词替换 (替换值走函数形式, 避免 $ 模式被 replace 误读)。
+function jsUnescapeSq(str) {
+  return str.replace(/\\(.)/g, (m, c) => (c === 'n' ? '\n' : c === 't' ? '\t' : c === 'r' ? '\r' : c));
+}
+
+function packerToken(c, a) {
+  const r = c % a;
+  const tail = r > 35 ? String.fromCharCode(r + 29) : r.toString(36);
+  return (c < a ? '' : packerToken(Math.floor(c / a), a)) + tail;
+}
+
+function unpackPacker(text) {
+  const m = String(text).match(/function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('((?:[^'\\]|\\.)*)',(\d+),(\d+),'((?:[^'\\]|\\.)*)'\.split\('\|'\)/);
+  if (!m) return '';
+  let p = jsUnescapeSq(m[1]);
+  const a = parseInt(m[2], 10);
+  const c = parseInt(m[3], 10);
+  const k = jsUnescapeSq(m[4]).split('|');
+  for (let i = c - 1; i >= 0; i--) {
+    if (k[i]) {
+      const re = new RegExp('\\b' + packerToken(i, a) + '\\b', 'g');
+      const val = k[i];
+      p = p.replace(re, () => val);
+    }
+  }
+  return p;
+}
+
+// 从解包后的文本里按名取字符串赋值 (双引号/单引号都认)
+function pickAssign(text, name) {
+  let m = text.match(new RegExp('\\b' + name + '\\s*=\\s*"([^"]*)"'));
+  if (m) return m[1];
+  m = text.match(new RegExp("\\b" + name + "\\s*=\\s*'([^']*)'"));
+  return m ? m[1] : '';
+}
+
+// ============ streamdesi (gdplayer) ============
+
+// streamdesi 的 AES 解密: base64 前16字节为 salt, 后为密文;
 // key=PBKDF2(SHA256, password, salt, 10000, 48字节), 前32=key, 后16=iv, AES-256-CBC/Pkcs7
+// crypto 在 App 里由其他 spider 在用 (createDecipheriv); pbkdf2Sync 同模块, 失败抛错由外层落嗅探
 function dcxStreamDesi(payload, password) {
   const b = Buffer.from(String(payload).trim(), 'base64');
   const key = crypto.pbkdf2Sync(String(password), b.subarray(0, 16), 10000, 48, 'sha256');
@@ -246,69 +374,69 @@ function dcxStreamDesi(payload, password) {
   return Buffer.concat([d.update(b.subarray(16)), d.final()]).toString('utf-8');
 }
 
-// 在受限 vm 里运行站方内联 JS, 只取它设置的全局配置变量, 不给网络/进程访问
-function runSiteScript(scriptCode, pageUrl) {
-  const winT = { location: { href: pageUrl, pathname: new URL(pageUrl).pathname, origin: new URL(pageUrl).origin }, navigator: {} };
-  const elStub = () => ({ style: {}, setAttribute() {}, appendChild() {}, click() {}, submit() {}, remove() {} });
-  const docStub = {
-    createElement: elStub, querySelector: () => null, querySelectorAll: () => [],
-    getElementById: () => null, getElementsByTagName: () => [elStub()],
-    body: elStub(), documentElement: {}, cookie: '', addEventListener() {},
-  };
-  const sb = {
-    document: docStub, navigator: winT.navigator, location: winT.location,
-    console: { log() {}, error() {}, warn() {}, info() {} },
-    setTimeout, clearTimeout, setInterval, clearInterval,
-    atob: (s) => Buffer.from(String(s), 'base64').toString('binary'),
-    btoa: (s) => Buffer.from(String(s), 'binary').toString('base64'),
-    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
-    sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
-  };
-  sb.window = winT; winT.window = winT; winT.self = winT; winT.top = winT; winT.parent = winT; winT.document = docStub;
-  sb.globalThis = sb;
-  vm.createContext(sb);
-  vm.runInContext(scriptCode, sb, { timeout: 8000 });
-  return sb;
+// 从 embed 页提取 gdplayer 配置: 遍历内联脚本, AA 脚本先纯解码再解包, 普通 packer 脚本直接解包,
+// 拿到 apx/qsx/kaken/pd/ps 五个值才算成功
+function extractDesiConfig(html) {
+  const scripts = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/g)].map(x => x[1]);
+  for (const sc of scripts) {
+    const candidates = [];
+    try {
+      if (sc.includes('┻━┻')) {
+        const dec = aaDecode(sc);
+        if (dec) { candidates.push(unpackPacker(dec)); candidates.push(dec); }
+      } else if (sc.includes("split('|')")) {
+        candidates.push(unpackPacker(sc));
+      }
+    } catch (e) { /* 换下一个脚本 */ }
+    for (const txt of candidates) {
+      if (!txt) continue;
+      const cfg = {
+        apx: pickAssign(txt, 'apx'),
+        qsx: pickAssign(txt, 'qsx'),
+        kaken: pickAssign(txt, 'kaken'),
+        pd: pickAssign(txt, 'pd'),
+        ps: pickAssign(txt, 'ps'),
+      };
+      if (cfg.apx && cfg.qsx && cfg.kaken && cfg.pd !== '') return cfg;
+    }
+  }
+  return null;
 }
 
-// streamdesi 直链解析: /e/{code} -> AAEncode 配置脚本 -> api-config + sources 两步解密 -> 直链
-// 实测 4 个视频全部打通 (hls/mp4), 全链路约 2.7-3 秒
+// streamdesi 直链解析: /e/{code} -> 纯解码取配置 -> api-config + sources 两步 -> AES 解密拿直链
 async function resolveStreamDesi(code) {
   const pageUrl = 'https://streamdesi.com/e/' + code;
-  const html = await httpText(pageUrl, { headers: { Referer: REFERER } });
+  const html = await httpText(pageUrl, { headers: { Referer: REFERER }, timeout: 8000 });
   if (!html) return '';
-  const scripts = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/g)].map(x => x[1]);
-  const aa = scripts.find(s => s.includes('┻━┻'));
-  if (!aa) return '';
-  const g = runSiteScript(aa, pageUrl);
-  if (!g.apx || !g.qsx || !g.kaken || g.pd === undefined) return '';
-  const ps = String(g.ps).replace(/,+$/, '');
-  const apiConfig = Buffer.from(String(g.apx), 'base64').toString('utf-8');
-  const cfgUrl = apiConfig + g.qsx + '?p=' + encodeURIComponent(ps);
+  const cfg = extractDesiConfig(html);
+  if (!cfg) return '';
+  const ps = cfg.ps.replace(/,+$/, '');
+  let apiConfig = '';
+  try { apiConfig = Buffer.from(cfg.apx, 'base64').toString('utf-8'); } catch (e) { /* ignore */ }
+  if (!/^https?:\/\//.test(apiConfig)) return '';
+  const cfgUrl = apiConfig + cfg.qsx + '?p=' + encodeURIComponent(ps);
   const srcUrl = apiConfig.replace('-config', '') + '?p=' + encodeURIComponent(ps);
   // 必须先 config 后 sources (与站方播放器顺序一致; 实测并行会让 sources 的 token 失效)
-  const cfgResp = await httpText(cfgUrl, { headers: { Referer: pageUrl } });
+  const cfgResp = await httpText(cfgUrl, { headers: { Referer: pageUrl }, timeout: 8000 });
+  if (!cfgResp) return '';
   let srcResp = '';
   {
     const headers = { 'User-Agent': UA, 'Content-Type': 'text/plain', 'Referer': pageUrl };
     try {
-      const { data, status } = await req.post(srcUrl, g.kaken, { headers, timeout: 15000 });
+      const { data, status } = await req.post(srcUrl, cfg.kaken, { headers, timeout: 8000 });
       if (status === 200 && data) srcResp = typeof data === 'string' ? data : '';
     } catch (e) { /* 换通道2 */ }
     if (!srcResp) {
       try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 15000);
-        const r = await fetch(srcUrl, { method: 'POST', headers, body: g.kaken, signal: ctrl.signal });
-        clearTimeout(timer);
+        const r = await fetchWithTimeout(srcUrl, { method: 'POST', headers, body: cfg.kaken }, 8000);
         if (r.ok) srcResp = await r.text();
       } catch (e) { /* ignore */ }
     }
   }
-  if (!cfgResp || !srcResp) return '';
+  if (!srcResp) return '';
   let sources = [];
   try {
-    const sj = JSON.parse(dcxStreamDesi(srcResp, g.pd));
+    const sj = JSON.parse(dcxStreamDesi(srcResp, cfg.pd));
     sources = sj.sources || [];
   } catch (e) { return ''; }
   if (!sources.length) return '';
@@ -317,54 +445,41 @@ async function resolveStreamDesi(code) {
   const file = t(pick.file);
   if (!/^https?:\/\//.test(file)) return '';
   // file 是 streamdesi 的跳转器地址, 其 gt token 校验在多节点间不一致 (实测同一地址时好时坏);
-  // 服务端自己跟一次跳转, 直接返最终 CDN 地址 (实测 CDN 地址 5/5 稳定 200 + 分片可拉)
-  for (let i = 0; i < 4; i++) {
+  // 服务端自己跟一次跳转拿最终 CDN 地址 (稳定 200 + 分片可拉)。最多 2 次、无睡眠、单次 6s 硬超时;
+  // 跟不到也照返跳转器地址 (App 自己重试有机会命中好节点; 比嗅探强)
+  for (let i = 0; i < 2; i++) {
     try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 12000);
-      const r = await fetch(file, { headers: { 'User-Agent': UA, 'Referer': 'https://streamdesi.com/' }, redirect: 'manual', signal: ctrl.signal });
-      clearTimeout(timer);
+      const r = await fetchWithTimeout(file, { headers: { 'User-Agent': UA, 'Referer': 'https://streamdesi.com/' }, redirect: 'manual' }, 6000);
       if (r.status === 200) return file;
       const loc = r.headers.get('location');
       if (r.status >= 300 && r.status < 400 && loc) return loc;
-    } catch (e) { /* 重试 */ }
-    await new Promise(r => setTimeout(r, 600));
+    } catch (e) { /* 再试一次或放弃 */ }
   }
-  // 跳转拿不到也照返跳转器地址 (App 自己重试有机会命中好节点; 比老嗅探强)
   return file;
 }
 
-// morencius 直链解析: /embed/{code} 的 packer 里抓 jwplayer.setup 的 sources[0].file (acek-cdn 的 m3u8)
+// ============ morencius ============
+
+// morencius 直链解析: packer 纯解包 -> links.hls4/hls3/hls2 优先取 acek-cdn 的 m3u8
 async function resolveMorencius(embedUrl) {
-  const html = await httpText(embedUrl, { headers: { Referer: REFERER } });
+  const html = await httpText(embedUrl, { headers: { Referer: REFERER }, timeout: 8000 });
   if (!html || /no longer available|expired or has been deleted/i.test(html)) return '';
   const scripts = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/g)].map(x => x[1]);
   const packed = scripts.find(s => s.includes("split('|')") && s.includes('function(p,a,c,k,e,d)'));
   if (!packed) return '';
-  let setupArg = null;
-  const jwStub = () => ({ setup: (cfg) => { setupArg = cfg; }, on() {}, once() {} });
-  const jq = function () { return { on() {}, ready() {}, click() {} }; };
-  jq.cookie = () => {};
-  jq.ajaxSetup = () => {};
-  const winT = { location: { href: embedUrl, pathname: new URL(embedUrl).pathname, origin: new URL(embedUrl).origin }, navigator: {} };
-  const docStub = { createElement: () => ({ style: {}, setAttribute() {} }), querySelector: () => null, getElementById: () => null, getElementsByTagName: () => [], body: {}, cookie: '', addEventListener() {} };
-  const sb = {
-    document: docStub, navigator: winT.navigator, location: winT.location,
-    console: { log() {}, error() {}, warn() {}, info() {} },
-    jwplayer: jwStub, $: jq, jQuery: jq,
-    setTimeout, clearTimeout, setInterval, clearInterval,
-    localStorage: { getItem: () => null, setItem() {} },
-  };
-  sb.window = sb; sb.self = sb; sb.globalThis = sb;
-  try {
-    vm.createContext(sb);
-    vm.runInContext(packed, sb, { timeout: 8000 });
-  } catch (e) { return ''; }
-  const files = (setupArg && setupArg.sources) || [];
-  const hls = files.find(s => s && /hls|\.m3u8/i.test(String(s.type || '') + ' ' + String(s.file || '')));
-  const pick = hls || files[0];
-  const file = pick && t(pick.file);
-  return file && /^https?:\/\//.test(file) ? file : '';
+  let txt = '';
+  try { txt = unpackPacker(packed); } catch (e) { return ''; }
+  if (!txt) return '';
+  // jwplayer setup 用的是 links.hls4||links.hls3||links.hls2, 按同序取
+  const links = {};
+  for (const m of txt.matchAll(/"(hls\d+)":"(https?:\/\/[^"]+)"/g)) links[m[1]] = m[2];
+  for (const key of ['hls4', 'hls3', 'hls2', 'hls1']) {
+    if (links[key]) return links[key];
+  }
+  const anyM = txt.match(/https?:\/\/[^\s"'\\]+\.m3u8[^\s"'\\]*/);
+  if (anyM) return anyM[0];
+  const fileM = txt.match(/file\s*:\s*"(https?:\/\/[^"]+)"/);
+  return fileM ? fileM[1] : '';
 }
 
 async function fetchStreamUrl(host, filecode, referer) {
@@ -419,7 +534,10 @@ async function play(reqIn) {
   // 只抓一次详情页拿默认 embed (实测 ?tape= 参数不改变 embed, 不再逐个扫 tape)
   const html = await getHtml(baseUrl);
   const p = html ? extractPlayer(html) : null;
-  if (!p || !p.embedUrl) return { parse: 0, url: '' };
+  if (!p || !p.embedUrl) {
+    // 连 embed 都没拿到: 详情页本身交嗅探, 不返空
+    return { parse: 1, url: baseUrl, header: { 'User-Agent': UA, 'Referer': REFERER } };
+  }
 
   // 1. vidaraa: api/stream 拿直链 (最可靠, 实测100%)
   if (p.isVidaraa && p.filecode) {
@@ -433,7 +551,7 @@ async function play(reqIn) {
     }
   }
 
-  // 2. streamdesi: gdplayer 加密流已破, 解密拿直链 (亚洲无码/OnlyFans/欧美三分类的唯一宿主)
+  // 2. streamdesi: gdplayer 加密流, 纯解码 (AAEncode+packer) 拿直链 (亚洲无码/OnlyFans/欧美三分类的唯一宿主)
   //    usa-euro 的少数视频直链是 mp4: 源站 CDN 当前 404 (站方问题), 直链照返, App 侧至少有机会直达
   if (p.isStreamdesi && p.filecode) {
     try {
@@ -448,7 +566,7 @@ async function play(reqIn) {
     } catch (e) { /* 失败落嗅探 */ }
   }
 
-  // 3. morencius: packer 解包拿 m3u8 直链 (文件被站方删除的解不出, 落嗅探)
+  // 3. morencius: packer 纯解包拿 m3u8 直链 (文件被站方删除的解不出, 落嗅探)
   if (p.isMorencius) {
     try {
       const file = await resolveMorencius(p.embedUrl);
