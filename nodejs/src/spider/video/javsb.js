@@ -4,15 +4,22 @@
 // 该函数不在任何可抓到的客户端资源里, 明文 sign 实测被源站回 "erro time";
 // 故 play 先按官方链实试 (硬超时, 总耗时 <8s), 失败立即 parse:1 嗅探官方播放器页。
 //
-// 抓取通道 (2026-10-20 第四版): 真机上单通道 (框架 req) 抓本站页面全灭,
-// 但同机其他 CF 站正常、VM 内同代码全通 —— 拦截在"真机请求特征 x 本站 CF 规则"层。
-// 改为三层递进, 任一层拿到"能通过校验的真页面"即停:
-//   L1 框架 req + 桌面浏览器头 (原通道)
-//   L2 原生 fetch + iOS Safari 头 (与真机系统 TLS 栈特征一致的档案)
-//   L3 经自有 Worker 中转抓取 (WORKER_FETCH, 需在 Cloudflare 部署同名 Worker;
-//      未部署时该层 DNS/连接快速失败并自动跳过, 不影响 L1/L2)
-// 校验口径: 列表页必须含卡片标记, 抓到拦截页/空壳 (解析 0 卡) 也算失败、继续下一层。
-// 另带会话级 Cookie 罐: 任一层响应给了 Set-Cookie 就存下并回放。
+// 抓取通道 (2026-10-20 第五版): 真机上 App 内两种栈 (框架 req 桌面头 / 原生 fetch
+// iOS 头) 抓本站页面全灭, 同机抓其他 CF 站正常、VM 内同代码全通 —— 拦截在
+// "真机请求特征 x 本站 CF 区域规则"层, 且两栈在 App 内共用同一底层网络栈,
+// 换头换栈都绕不过去。自有 Worker 中转也已实测判死 (本站 CF 专拦 Workers 出口,
+// 回 Attention Required 页)。本版改为三层递进 + 粘性记忆 + 页面缓存:
+//   L1 框架 req + 桌面头直连 (原通道; 在能直连的网络下是不限量的首选)
+//   L2 r.jina.ai 公开抓取中转 (带 x-return-format: html 时返回原始 DOM,
+//      与直连页面同构, 现有解析器可直接吃; 2026-10-20 实测分类/详情/搜索/
+//      榜单/token 接口全部 200 且内容新鲜)
+//   L3 原生 fetch + iOS Safari 头 (最后兜底)
+// 粘性记忆: 记住上一层成功的是哪层, 下次先试它 (真机上首个页面付一次
+// 全链试探成本, 之后直达 jina, 不再每页先撞 L1)。
+// 页面缓存: 列表/搜索 120s、详情 300s —— jina 免费层约 20 次/分钟/IP,
+// 缓存 + 粘性把正常浏览的 jina 调用压到很低, 也顺带加速翻页返回。
+// 校验口径不变: 列表页必须含卡片标记, 拦截页/空壳 (解析 0 卡) 也算失败。
+// 另带会话级 Cookie 罐: 任一层响应给了 Set-Cookie 就存下并回放 (仅直连层)。
 import req from '../../util/req.js';
 
 const KEY = 'py_javsb';
@@ -21,8 +28,8 @@ const HOST = 'https://jav.sb';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const UA_IOS = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 const REFERER = HOST + '/';
-// L3 中转 Worker (暂定名 javsb-fetch; 部署后把抓取改走 https://javsb-fetch.li768435813.workers.dev/?url=<目标URL>)
-const WORKER_FETCH = 'https://javsb-fetch.li768435813.workers.dev/?url=';
+// L2 抓取中转: 公开服务 r.jina.ai, 目标 URL 直接拼在其后
+const JINA = 'https://r.jina.ai/';
 
 // 分类: type_id 为 javtype 的 Type slug; new/rank_* 为 label 页 (见 catUrl)
 const CATS = [
@@ -59,7 +66,7 @@ function absUrl(u) {
   return HOST + (u.startsWith('/') ? u : '/' + u);
 }
 
-// ---------- 会话 Cookie 罐 ----------
+// ---------- 会话 Cookie 罐 (仅直连 jav.sb 时回放) ----------
 const cookieJar = new Map(); // host -> "k=v; k2=v2"
 
 function jarStore(host, setCookies) {
@@ -99,12 +106,12 @@ function safariHeaders(referer) {
   };
 }
 
-// ---------- 单次抓取 (两种栈) ----------
+// ---------- 单次抓取 (三层) ----------
 async function viaReq(url, headers, timeoutMs) {
   const host = new URL(url).host;
   const h = { ...headers };
   const ck = jarHeader(host);
-  if (ck && !/javsb-fetch\./.test(host)) h['Cookie'] = ck;
+  if (ck) h['Cookie'] = ck;
   const { data, status, headers: rh } = await req.get(url, { headers: h, timeout: timeoutMs });
   if (rh) jarStore(host, rh['set-cookie']);
   if (status && status !== 200) return '';
@@ -119,7 +126,7 @@ async function viaFetch(url, headers, timeoutMs) {
     const host = new URL(url).host;
     const h = { ...headers };
     const ck = jarHeader(host);
-    if (ck && !/javsb-fetch\./.test(host)) h['Cookie'] = ck;
+    if (ck) h['Cookie'] = ck;
     const r = await fetch(url, { headers: h, signal: ctl.signal, redirect: 'follow' });
     try {
       const sc = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : r.headers.get('set-cookie');
@@ -134,23 +141,73 @@ async function viaFetch(url, headers, timeoutMs) {
   }
 }
 
-// ---------- 三层递进抓取 ----------
+// L2: r.jina.ai 中转。x-return-format: html 返回目标页原始 DOM (text/plain 承载),
+// 与直连 HTML 同构; JSON 接口会被包进 <pre> 里, 由 parseJsonLoose 剥出。
+async function viaJina(url, timeoutMs) {
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const r = await fetch(JINA + url, {
+      headers: { 'User-Agent': UA, 'Accept': '*/*', 'x-return-format': 'html' },
+      signal: ctl.signal,
+      redirect: 'follow',
+    });
+    if (!r.ok) return ''; // 含 429 限流: 本层失败, 由外层落其他层/空结果
+    return await r.text();
+  } catch (e) {
+    return '';
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+// ---------- 页面缓存 ----------
+const pageCache = new Map(); // url -> { t, s }
+const TTL_LIST = 120000;   // 列表/首页/搜索: 120s
+const TTL_DETAIL = 300000; // 详情: 300s (play 紧跟 detail, 命中即省一次中转)
+
+function cacheGet(url, ttl) {
+  const e = pageCache.get(url);
+  if (e && Date.now() - e.t < ttl) return e.s;
+  return '';
+}
+
+function cacheSet(url, s) {
+  pageCache.set(url, { t: Date.now(), s });
+  if (pageCache.size > 80) pageCache.delete(pageCache.keys().next().value);
+}
+
+// ---------- 三层递进抓取 (粘性层记忆) ----------
 // validate(txt) 通过才算拿到真内容; 全部层失败返回 ''。
-// slices: 每层超时上限 (ms), 依次 [L1 req, L2 fetch, L3 Worker 中转 fetch]
-async function getText(url, validate, slices) {
+// slices: 每层超时上限 (ms), 依次 [L1 req 直连, L2 jina 中转, L3 fetch]
+// ttl: >0 时先查页面缓存、成功后写入缓存。
+let goodLayer = -1;
+
+async function getText(url, validate, slices, ttl) {
   const ok = typeof validate === 'function' ? validate : (s) => !!s;
-  const [s1, s2, s3] = slices || [9000, 6000, 5000];
-  try {
-    const txt = await viaReq(url, desktopHeaders(), s1);
-    if (txt && ok(txt)) return txt;
-  } catch (e) { /* 下一层 */ }
-  const txt2 = await viaFetch(url, safariHeaders(), s2);
-  if (txt2 && ok(txt2)) return txt2;
-  try {
-    const wurl = WORKER_FETCH + encodeURIComponent(url);
-    const txt3 = await viaFetch(wurl, { 'User-Agent': UA, 'Accept': '*/*' }, s3);
-    if (txt3 && ok(txt3)) return txt3;
-  } catch (e) { /* 未部署/失败: 跳过 */ }
+  if (ttl) {
+    const cached = cacheGet(url, ttl);
+    if (cached && ok(cached)) return cached;
+  }
+  const [s1, s2, s3] = slices || [6000, 12000, 6000];
+  const layers = [
+    () => viaReq(url, desktopHeaders(), s1),
+    () => viaJina(url, s2),
+    () => viaFetch(url, safariHeaders(), s3),
+  ];
+  const order = goodLayer >= 0
+    ? [goodLayer, ...[0, 1, 2].filter(i => i !== goodLayer)]
+    : [0, 1, 2];
+  for (const i of order) {
+    try {
+      const txt = await layers[i]();
+      if (txt && ok(txt)) {
+        goodLayer = i;
+        if (ttl) cacheSet(url, txt);
+        return txt;
+      }
+    } catch (e) { /* 下一层 */ }
+  }
   return '';
 }
 
@@ -161,8 +218,17 @@ const isDetailPage = (s) => s.includes('og:title') || s.includes('/static/player
 // 搜索页校验: 有卡片最好; 无结果页也是真页面 (足够长且含站内标记) 一并接受, 避免空结果白等三层
 const isSearchPage = (s) => isListPage(s) || (s.length > 3000 && s.includes('javtype'));
 
-function getHtml(url, validate) {
-  return getText(url, validate || isListPage);
+function getHtml(url, validate, ttl) {
+  return getText(url, validate || isListPage, undefined, ttl == null ? TTL_LIST : ttl);
+}
+
+// ---------- JSON 宽松解析 (直连是裸 JSON, jina 会包 <pre>) ----------
+function parseJsonLoose(s) {
+  if (!s) return null;
+  try { return JSON.parse(s); } catch (e) { /* 继续 */ }
+  const m = String(s).match(/\{[\s\S]*\}/);
+  if (m) { try { return JSON.parse(m[0]); } catch (e) { /* 落空 */ } }
+  return null;
 }
 
 // ---------- 列表解析 ----------
@@ -170,6 +236,7 @@ function getHtml(url, validate) {
 // 卡片: <div class="thumbnail group"> ... <a href="/jav/{slug}-1-1.html">
 //   <img data-src="/upload/vod/*.jpg" alt="片名"> ... <span ...>时长</span>
 // 按卡片起始标签切块解析, 每块窗口给足 4000 字符, 保证最后一张卡不丢。
+// jina HTML 与直连 HTML 同构 (实测卡片字段逐一对齐), 同一解析器通用。
 function parseCards(html) {
   const out = [];
   const seen = new Set();
@@ -269,7 +336,7 @@ async function detail(reqIn) {
   const id = t(body.id);
   if (!id) return { list: [] };
   const durl = /^https?:\/\//.test(id) ? id : absUrl(id);
-  const html = await getHtml(durl, isDetailPage);
+  const html = await getHtml(durl, isDetailPage, TTL_DETAIL);
   if (!html) return { list: [] };
   const name = og(html, 'title');
   const pic = og(html, 'image');
@@ -292,14 +359,15 @@ async function detail(reqIn) {
 async function tryOfficialStream(hash, playerUrl, deadline) {
   const budget = (cap) => Math.max(300, Math.min(cap, deadline - Date.now()));
   if (Date.now() >= deadline) return '';
-  const asJson = (s) => { try { return !!JSON.parse(s); } catch (e) { return false; } };
-  // 第1步: 换 token (三层通道, 总预算内)
+  const hasToken = (s) => { const j = parseJsonLoose(s); return !!(j && j.token); };
+  const hasFile = (s) => { const j = parseJsonLoose(s); return !!(j && j.m3u8_file); };
+  // 第1步: 换 token (三层通道, 总预算内; slices 依次 [req, jina, fetch])
   let token = '', ts = '';
   try {
-    const txt = await getText(`${HOST}/token.php?file=${encodeURIComponent(hash)}`, asJson,
-      [budget(3000), budget(2000), budget(1500)]);
-    const j = JSON.parse(txt);
-    token = t(j.token); ts = t(j.ts);
+    const txt = await getText(`${HOST}/token.php?file=${encodeURIComponent(hash)}`, hasToken,
+      [budget(2000), budget(3500), budget(1500)]);
+    const j = parseJsonLoose(txt);
+    token = t(j && j.token); ts = t(j && j.ts);
   } catch (e) { /* 落嗅探 */ }
   if (!token) return '';
   if (Date.now() >= deadline) return '';
@@ -307,9 +375,9 @@ async function tryOfficialStream(hash, playerUrl, deadline) {
   const key = `${hash}@${Math.floor(Date.now() / 1000)}`;
   try {
     const url = `${HOST}/save_m3u8_cache.php?file=${encodeURIComponent(hash)}&token=${encodeURIComponent(token)}&ts=${encodeURIComponent(ts)}&sign=${encodeURIComponent(key)}`;
-    const txt = await getText(url, asJson, [budget(2500), budget(2000), budget(1500)]);
-    const j = JSON.parse(txt);
-    const f = t(j.m3u8_file);
+    const txt = await getText(url, hasFile, [budget(2000), budget(3000), budget(1500)]);
+    const j = parseJsonLoose(txt);
+    const f = t(j && j.m3u8_file);
     if (f && /m3u8/i.test(f)) return f + (f.includes('sign=') ? '' : `&sign=${key}`);
   } catch (e) { /* 落嗅探 */ }
   return '';
@@ -326,7 +394,8 @@ async function play(reqIn) {
   const durl = /^https?:\/\//.test(id) ? id : absUrl(id);
   const deadline = Date.now() + 7500; // play 总耗时 <8s 有界
   const remain = () => Math.max(300, deadline - Date.now());
-  const html = await getText(durl, isDetailPage, [Math.min(3000, remain()), Math.min(2500, remain()), Math.min(2000, remain())]);
+  const html = await getText(durl, isDetailPage,
+    [Math.min(2500, remain()), Math.min(6000, remain()), Math.min(2000, remain())], TTL_DETAIL);
   const { playerUrl, hash } = html ? extractPlayer(html) : { playerUrl: '', hash: '' };
   if (hash && playerUrl) {
     const direct = await tryOfficialStream(hash, playerUrl, deadline);
