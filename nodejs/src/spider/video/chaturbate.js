@@ -12,24 +12,33 @@ import req from '../../util/req.js';
 //       标签类逐个查过 total_count (68~1446, 实时浮动), 其余大类均数百至数千。
 // 封面: 列表自带 img = https://thumb.live.mmcdn.com/riw/{username}.jpg?{时间戳} (房间快照, 无头直取 200
 //       image/jpeg 已实测), 真实 https 直链, 不经本地代理 (App 图片加载走不了 js2p 本地地址, 既有教训)。
-// 详情: GET https://chaturbate.com/{username}/ 页面内嵌 window.initialRoomDossier (JS 字符串里的 JSON),
-//       含 room_status/room_title/num_viewers/hls_source; 房间已下线时页面 404、无 dossier, 优雅降级。
-// 播放: 点播时现抓房间页取 dossier.hls_source (带短时效 token 的 LL-HLS 主列表, 最高 1080p 多档):
-//       room_status 必须为 'public' 且 hls_source 非空才返 (实测 hidden 房 hls_source 为空字符串);
-//       主列表→变体 chunklist→init 段 (ftyp) /媒体分片 (moof) 2026-10-21 VM 无头全链实测 200。
-//       流是 LL-HLS + fMP4 (与 StripChat 的 fMP4 形态同类, 该形态已在本 App 真机通过; LL-HLS 的
-//       EXT-X-PART 低延迟分片个别播放器兼容性只能真机定)。列表/分片域 (live.mmcdn.com) 对机房出口
-//       无拦截实测, 主列表正文里全是站方 https 地址, 无需 Worker 代办 (与 StripChat 需 Mouflon
-//       解密的情形不同, 本站分片是明文 fMP4)。
-// 抓取兜底: req → fetch → r.jina.ai 中转 三层 (列表是 JSON 接口、播放才抓 HTML, 年龄/地区门若只拦
-//       HTML 也不影响列表; VM 出口实测全程无年龄门/地区门 200 直达)。
+// 详情/播放取数 (第二版): GET /api/chatvideocontext/{username}/ —— 站方房间上下文 JSON (约 5KB,
+//       实测 200~270ms), 含 room_status/room_title/num_viewers/hls_source, 与房间页内嵌
+//       initialRoomDossier 同源同值 (hls 仅边缘节点不同)。第一版抓整页 HTML (约 195KB,
+//       dossier 在 88% 偏移处) 取数慢, 第二版改走此接口, 房间页解析保留作兜底;
+//       不存在的用户名接口回 404、下线房 room_status='offline', 守卫语义不变。
+// 播放 (第二版, 针对真机反馈"加载慢 + 分辨率低"):
+//       主列表 (llhls.m3u8) 是多档 LL-HLS: 变体按 240p→1080p 升序排列 (360/540/720/1080,
+//       1080p 档分片实拉码率与标注 BANDWIDTH 吻合, 是真高清), 且音视频分离 —— 视频变体经
+//       AUDIO 组引用独立的音频列表 (audio_aac_96/128), 视频媒体列表本身不含音频。
+//       第一版直返主列表, 播放器自选档位会从低档起播/停在低档 (真机表现为分辨率低)。
+//       第二版 play 返回本地一跳代理 /proxy/master 的地址 (js2p://_WEB_ 形态, 同仓
+//       avhub/celebjihad 先例): 代理拉主列表后只保留最高档变体 (按高度→码率) + 其音频组,
+//       正文 URI 全部改写为 mmcdn 的 https 绝对地址 (不嵌本地地址, 吸取 StripChat 教训),
+//       播放器无低档可选、直接锁最高清; 代理拉取失败时 302 跳回原始主列表 (退回第一版行为)。
+//       守卫不变: room_status 必须 'public' 且 hls_source 非空才返 (hidden 房 hls_source 为空)。
+//       流是 LL-HLS + fMP4 (EXT-X-PART 低延迟分片), 媒体列表/分片仍由播放器直连 mmcdn,
+//       明文无加密、无需 Worker 代办。主列表 token 75s 后复拉仍 200 (实测), 代理内缓存 60s。
+// 抓取兜底: req → fetch → r.jina.ai 中转 三层 (列表/上下文是 JSON 接口、播放才抓 HTML 兜底,
+//       年龄/地区门若只拦 HTML 也不影响列表; VM 出口实测全程无年龄门/地区门 200 直达)。
 // 搜索: 站方 roomlist 的 keywords 参数即站内搜索 (实测部分匹配用户名, total 上限 500), 直接复用。
 
 const KEY = 'py_chaturbate';
 const NAME = 'Chaturbate';
 const HOST = 'https://chaturbate.com';
 const API = HOST + '/api/ts/roomlist/room-list/';
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+const CTX_API = HOST + '/api/chatvideocontext/';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const REFERER = HOST + '/';
 const PAGE_SIZE = 90;
 const TIMEOUT = 12000;
@@ -195,14 +204,32 @@ async function category(reqIn) {
 
 // ---------- 详情 / 播放 ----------
 
-// 抓房间页, 解出 initialRoomDossier; 房间下线/不存在时返回 null
+// 取房间播放信息 {room_status, room_title, num_viewers, hls_source};
+// 主通道: /api/chatvideocontext/{username}/ JSON (约 5KB, 快);
+// 兜底: 房间页内嵌 initialRoomDossier (约 195KB HTML, 慢)。
+// 房间不存在/已下线且无任何信息时返回 null。
 async function getDossier(username) {
+  const j = await fetchJson(CTX_API + encodeURIComponent(username) + '/');
+  if (j && typeof j === 'object' && ('room_status' in j || 'hls_source' in j)) {
+    return {
+      room_status: t(j.room_status),
+      room_title: t(j.room_title),
+      num_viewers: j.num_viewers || 0,
+      hls_source: t(j.hls_source),
+    };
+  }
   const html = await fetchText(`${HOST}/${encodeURIComponent(username)}/`, 15000);
   if (!html) return null;
   const m = html.match(/initialRoomDossier\s*=\s*"((?:[^"\\]|\\.)*)"/);
   if (!m) return null;
   try {
-    return JSON.parse(JSON.parse('"' + m[1] + '"'));
+    const d = JSON.parse(JSON.parse('"' + m[1] + '"'));
+    return {
+      room_status: t(d.room_status),
+      room_title: t(d.room_title),
+      num_viewers: d.num_viewers || 0,
+      hls_source: t(d.hls_source),
+    };
   } catch (e) { return null; }
 }
 
@@ -237,6 +264,135 @@ async function detail(reqIn) {
   return { list: [vod] };
 }
 
+// ---------- 主列表锁定最高档 (本地一跳代理) ----------
+
+function b64url(s) {
+  return Buffer.from(String(s), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function unb64url(s) {
+  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+}
+
+// 本地代理地址 (js2p://_WEB_ 为 App 动态地址 scheme, 同 avhub/celebjihad 先例)
+function proxyUrl(reqLike, path, targetUrl) {
+  try {
+    const server = reqLike?.server;
+    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
+    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
+    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}`;
+  } catch (e) { return ''; }
+}
+
+function absUrl(u, base) {
+  try { return new URL(u, base).toString(); } catch (e) { return u; }
+}
+
+// 把主列表裁到最高档: 只保留最佳变体 (高度优先, 其次码率) + 它引用的音频组,
+// 所有 URI 改写为以主列表地址为基准的绝对地址。正文不含任何本地地址。
+function filterMaster(raw, baseUrl) {
+  const lines = String(raw).split(/\r?\n/);
+  const head = [];
+  const mediaByGroup = new Map();
+  const variants = [];
+  let pendingInf = null;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXT-X-MEDIA:')) {
+      const g = /GROUP-ID="([^"]+)"/.exec(line);
+      if (g) {
+        if (!mediaByGroup.has(g[1])) mediaByGroup.set(g[1], []);
+        mediaByGroup.get(g[1]).push(line);
+      }
+      continue;
+    }
+    if (line.startsWith('#EXT-X-STREAM-INF:')) { pendingInf = line; continue; }
+    if (line.startsWith('#')) {
+      if (line === '#EXTM3U' || line.startsWith('#EXT-X-VERSION') || line.startsWith('#EXT-X-INDEPENDENT-SEGMENTS')) head.push(line);
+      continue;
+    }
+    // 普通行 = 变体 URI (跟在 STREAM-INF 后)
+    if (pendingInf) {
+      const res = /RESOLUTION=(\d+)x(\d+)/.exec(pendingInf);
+      const bw = /BANDWIDTH=(\d+)/.exec(pendingInf);
+      const audio = /AUDIO="([^"]+)"/.exec(pendingInf);
+      variants.push({
+        inf: pendingInf,
+        uri: line,
+        h: res ? parseInt(res[2], 10) : 0,
+        bw: bw ? parseInt(bw[1], 10) : 0,
+        audio: audio ? audio[1] : '',
+      });
+      pendingInf = null;
+    }
+  }
+  if (!variants.length) return '';
+  variants.sort((a, b) => (b.h - a.h) || (b.bw - a.bw));
+  const top = variants[0];
+  const out = ['#EXTM3U'];
+  for (const h of head) { if (h !== '#EXTM3U') out.push(h); }
+  if (top.audio && mediaByGroup.has(top.audio)) {
+    for (const ml of mediaByGroup.get(top.audio)) {
+      out.push(ml.replace(/URI="([^"]+)"/, (mm, u) => `URI="${absUrl(u, baseUrl)}"`));
+    }
+  }
+  out.push(top.inf);
+  out.push(absUrl(top.uri, baseUrl));
+  return out.join('\n') + '\n';
+}
+
+// 主列表拉取 (req → fetch 两层即可, mmcdn 无年龄门; 不走 jina 以免改写文本)
+async function fetchPlaylist(url, timeout = 8000) {
+  try {
+    const { data, status } = await req.get(url, {
+      headers: { 'User-Agent': UA, 'Accept': '*/*', 'Referer': REFERER },
+      timeout,
+    });
+    if (status === 200 && data != null) return typeof data === 'string' ? data : JSON.stringify(data);
+  } catch (e) { /* 换通道2 */ }
+  try {
+    const ctl = new AbortController();
+    const tm = setTimeout(() => ctl.abort(), timeout);
+    const r = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': '*/*', 'Referer': REFERER }, signal: ctl.signal });
+    clearTimeout(tm);
+    if (r.ok) return await r.text();
+  } catch (e) { /* ignore */ }
+  return '';
+}
+
+const masterCache = new Map(); // url -> { text, exp }
+const MASTER_CACHE_TTL = 60000;
+
+// GET /proxy/master?u={b64url 主列表地址} —— 返回裁到最高档的主列表;
+// 拉取/裁剪失败时 302 跳回原始主列表, 播放器退回自选档行为 (不劣于第一版)。
+async function masterProxy(request, reply) {
+  const q = request?.query || {};
+  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  try { target = unb64url(q.u); } catch (e) { reply.code(400).send('bad u'); return; }
+  let host = '';
+  try { host = new URL(target).hostname; } catch (e) { /* ignore */ }
+  if (!/^https:\/\//.test(target) || !(host === 'live.mmcdn.com' || host.endsWith('.live.mmcdn.com'))) {
+    reply.code(400).send('bad u'); return;
+  }
+  const nowMs = Date.now();
+  const hit = masterCache.get(target);
+  if (hit && hit.exp > nowMs) {
+    reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+    reply.header('Cache-Control', 'no-cache');
+    reply.send(hit.text);
+    return;
+  }
+  const raw = await fetchPlaylist(target);
+  const filtered = raw && raw.includes('#EXT-X-STREAM-INF') ? filterMaster(raw, target) : '';
+  if (!filtered) { reply.redirect(target); return; }
+  if (masterCache.size > 64) masterCache.delete(masterCache.keys().next().value);
+  masterCache.set(target, { text: filtered, exp: nowMs + MASTER_CACHE_TTL });
+  reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+  reply.header('Cache-Control', 'no-cache');
+  reply.send(filtered);
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   const username = cleanId(body.id);
@@ -244,9 +400,12 @@ async function play(reqIn) {
   const d = await getDossier(username);
   // 只有公开房才有游客流; hidden/private/away 等状态 hls_source 为空, 如实空返
   if (!d || d.room_status !== 'public' || !t(d.hls_source)) return { parse: 0, url: '' };
+  const master = t(d.hls_source);
+  // 直返主列表会让播放器从低档起播; 改走本地代理裁到最高档。代理地址构造失败时退回直返。
+  const url = proxyUrl(reqIn, '/proxy/master', master) || master;
   return {
     parse: 0,
-    url: t(d.hls_source),
+    url,
     header: { 'User-Agent': UA, 'Referer': REFERER },
   };
 }
@@ -271,6 +430,8 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
+      // 主列表裁档代理 (GET): 只处理 m3u8 文本, 媒体列表/分片保持 mmcdn 直连
+      fastify.get('/proxy/master', masterProxy);
     },
   };
 }
