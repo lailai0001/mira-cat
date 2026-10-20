@@ -48,6 +48,7 @@ import javmobile from './spider/video/javmobile.js';
 import javmost from './spider/video/javmost.js';
 import javhdtoday from './spider/video/javhdtoday.js';
 import cableav from './spider/video/cableav.js';
+import avhub from './spider/video/avhub.js';
 
 const spiders = [
     missav_xptv,
@@ -99,7 +100,8 @@ const spiders = [
     javmobile,
     javmost,
     javhdtoday,
-    cableav,];
+    cableav,
+    avhub,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
