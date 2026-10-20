@@ -1,8 +1,14 @@
 // JAVSB (https://jav.sb) -> CatPawOpen spider
 // MacCMS/Madou 模板站: 列表卡片 div.thumbnail, 详情 og 标签 + 官方播放器 iframe。
-// 播放: 官方链 token.php -> save_m3u8_cache.php 的 sign 由父页面 encrypt() 生成,
-// 该函数不在任何可抓到的客户端资源里, 明文 sign 实测被源站回 "erro time";
-// 故 play 先按官方链实试 (硬超时, 总耗时 <8s), 失败立即 parse:1 嗅探官方播放器页。
+// 播放 (2026-10-20 第五轮重做): sign 算法已逆向坐实 —— 播放器页的
+// parent.encrypt(ky) = base62( ky 各字节 XOR 0x7B 后按大端整数编码 ),
+// ky = "{hash}@{unix秒}", 字母表 0-9a-zA-Z。证据: Wayback 归档的 40 组
+// 真实 (file,ts,sign) 三元组全量反解一致 + VM 直连实测官方链 200 通过。
+// save_m3u8_cache.php 另有 raw 形态: ?file&raw=1&sign 直接回播放列表
+// 本体 (冷缓存视频实测), 故 play 一步到位: 现场算 sign 拼 raw 地址,
+// 经抓取栈校验列表真实可取 (#EXTM3U) 后 parse:0 直返; 校验不过再走
+// 经典两步 token -> save 取 m3u8_file; 全灭才落 parse:1 嗅探 (同前)。
+// sign 时间窗实测 ±3600s 内可用, 播放器随后自取列表无压力。
 //
 // 抓取通道 (2026-10-20 第六版): 真机双状态 (VPN 开/关) 直连全灭、第三轮的
 // jina 单中转也全灭。复核结论: 第三轮实现无 URL/编码类低级错误, 但有三个结构
@@ -524,36 +530,73 @@ async function detail(reqIn) {
   };
 }
 
-// 官方取流链: token.php -> save_m3u8_cache.php (sign 明文实试, 站方 encrypt 生成的 sign 拿不到)
-// 成功返回最终 m3u8 地址, 任何一步失败返回 '' (由 play 落嗅探)
+// ---------- 官方取流 (第五轮: sign 算法已复现) ----------
+// encrypt(ky): ky 各字节 XOR 0x7B -> 字节串按大端整数做 base62 编码,
+// 字母表 0-9a-zA-Z。逐字节进位实现 (不用 BigInt, 任何 JS 引擎可跑),
+// 与站方结果逐字一致 (归档 40 组真实三元组 + VM 直连实测双重校验)。
+const SIGN_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+function javsbSign(plain) {
+  let digits = [0];
+  for (let i = 0; i < plain.length; i++) {
+    let carry = (plain.charCodeAt(i) ^ 123) & 0xff;
+    for (let j = 0; j < digits.length; j++) {
+      const v = digits[j] * 256 + carry;
+      digits[j] = v % 62;
+      carry = Math.floor(v / 62);
+    }
+    while (carry > 0) { digits.push(carry % 62); carry = Math.floor(carry / 62); }
+  }
+  while (digits.length > 1 && digits[digits.length - 1] === 0) digits.pop();
+  let out = '';
+  for (let j = digits.length - 1; j >= 0; j--) out += SIGN_ALPHABET[digits[j]];
+  return out;
+}
+
+// 官方取流: 现场算 sign, 一步取 raw 播放列表地址; 失败再走经典两步链。
+// 成功返回可播地址 (parse:0), 任何一步失败返回 '' (由 play 落嗅探)。
 async function tryOfficialStream(hash, playerUrl, deadline) {
   const budget = (cap) => Math.max(300, Math.min(cap, deadline - Date.now()));
   if (Date.now() >= deadline) return '';
+  const key = javsbSign(`${hash}@${Math.floor(Date.now() / 1000)}`);
+  const isPl = (s) => typeof s === 'string' && s.includes('#EXTM3U');
+  // 路 A (主): raw 形态 —— save 接口带 raw=1 直接回播放列表本体。
+  // 经抓取栈校验只为证明 sign 与地址真实可用, 返回给播放器的是地址本身
+  // (播放器自取列表; 列表内分片为源站 CDN 上的 .jpg 伪装 TS)。
+  // 层序以直连 fetch 先行: 实测 jina 对该地址回 422 (拒非 HTML 内容),
+  // 而原生 fetch 直连可取; 真机上直连层与播放器同网络, 通即代表可播。
+  const rawUrl = `${HOST}/save_m3u8_cache.php?file=${encodeURIComponent(hash)}&raw=1&sign=${key}`;
+  try {
+    const txt = await fetchVia(rawUrl, isPl, {
+      layers: ['directFetch', 'directReq', 'jinaHtmlFetch', 'jinaHtmlReq'],
+      budgetMs: Math.max(600, Math.min(4500, deadline - Date.now())), stickyKey: 'token',
+      caps: { directFetch: budget(2500), directReq: budget(2000), jinaHtmlFetch: budget(1500), jinaHtmlReq: budget(1500) },
+    });
+    if (txt) return rawUrl;
+  } catch (e) { /* 落路 B */ }
+  if (Date.now() >= deadline - 1200) return '';
+  // 路 B (备): 经典两步 token -> save -> m3u8_file (官网播放器的最终地址形态)
+  const PLAY_LAYERS = [...TOKEN_LAYERS, 'directFetch'];
   const hasToken = (s) => { const j = parseJsonLoose(s); return !!(j && j.token); };
   const hasFile = (s) => { const j = parseJsonLoose(s); return !!(j && j.m3u8_file); };
-  // 第1步: 换 token (中转短链, 整个 play 的剩余预算内)
   let token = '', ts = '';
   try {
     const txt = await fetchVia(`${HOST}/token.php?file=${encodeURIComponent(hash)}`, hasToken, {
-      layers: TOKEN_LAYERS, budgetMs: Math.max(600, deadline - Date.now()), stickyKey: 'token',
-      caps: { jinaHtmlReq: budget(2500), directReq: budget(2000), jinaHtmlFetch: budget(1500) },
+      layers: PLAY_LAYERS, budgetMs: Math.max(600, deadline - Date.now()), stickyKey: 'token',
+      caps: { jinaHtmlReq: budget(2000), directReq: budget(1500), jinaHtmlFetch: budget(1200), directFetch: budget(1200) },
     });
     const j = parseJsonLoose(txt);
     token = t(j && j.token); ts = t(j && j.ts);
   } catch (e) { /* 落嗅探 */ }
-  if (!token) return '';
-  if (Date.now() >= deadline) return '';
-  // 第2步: 换 m3u8, sign 按播放器页同式拼 {hash}@{unix秒}
-  const key = `${hash}@${Math.floor(Date.now() / 1000)}`;
+  if (!token || Date.now() >= deadline) return '';
   try {
-    const url = `${HOST}/save_m3u8_cache.php?file=${encodeURIComponent(hash)}&token=${encodeURIComponent(token)}&ts=${encodeURIComponent(ts)}&sign=${encodeURIComponent(key)}`;
+    const url = `${HOST}/save_m3u8_cache.php?file=${encodeURIComponent(hash)}&token=${encodeURIComponent(token)}&ts=${encodeURIComponent(ts)}&sign=${key}`;
     const txt = await fetchVia(url, hasFile, {
-      layers: TOKEN_LAYERS, budgetMs: Math.max(600, deadline - Date.now()), stickyKey: 'token',
-      caps: { jinaHtmlReq: budget(2000), directReq: budget(1500), jinaHtmlFetch: budget(1200) },
+      layers: PLAY_LAYERS, budgetMs: Math.max(600, deadline - Date.now()), stickyKey: 'token',
+      caps: { jinaHtmlReq: budget(2000), directReq: budget(1500), jinaHtmlFetch: budget(1200), directFetch: budget(1200) },
     });
     const j = parseJsonLoose(txt);
     const f = t(j && j.m3u8_file);
-    if (f && /m3u8/i.test(f)) return f + (f.includes('sign=') ? '' : `&sign=${key}`);
+    if (f && /m3u8/i.test(f)) return absUrl(f) + (f.includes('sign=') ? '' : `&sign=${key}`);
   } catch (e) { /* 落嗅探 */ }
   return '';
 }
