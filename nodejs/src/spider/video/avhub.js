@@ -1,27 +1,33 @@
 import req from '../../util/req.js';
-import crypto from 'crypto';
 
 // AvHub (py_avhub)
 // 站点: https://avhub360.com/ (国产/JAV 站，无反爬，服务端渲染)
-// 列表翻页 (2026-10-20 重新实测):
+// 列表翻页 (2026-10-20 两轮实测, 29 个分类第 1/2 页全部通过):
 //   /new[/{page}]  /popular/today[/{page}]
 //   标签: /tags/{id} 第1页, /tags/{id}/latest/{page} 第2页起 (pagecount 从翻页区"最后»"解析, 如 tag171 有 1049 页)
 //   主题: /theme/detail/{id} 第1页, /theme/detail/{id}/update/{page} 第2页起 (theme3 有 649 页, theme58 有 12 页)
 //         /theme/detail/11/hot[/{page}] (60 页)
-//   /popular (热门) 真单页, 无翻页
+//   /popular (热门) 本身是 /popular/week 的别名, 翻页走 /popular/week/{page} (共 40 页);
+//         第一轮误判为单页 (tpl=null) 导致 App 里"热门"加载不出更多内容, 本轮修正。
 // 卡片: <a href="/videos/{code}" data-mv-id> > img (封面在 data-src 或 z-image-loader-url, 懒加载)
 // 封面: image.cpckgr.cn 上的图是 AES-128-CBC 加密的 (key f5d965df75336270, iv 97b60394abc2fbe1,
-//       CryptoJS 默认 PKCS7 填充, 解密后即 JPEG; VM 实测 4 张封面全部解密为合法 JPEG)。
-//       App 直接加载密文无法解码, 这是"所有内容无封面"的病因。
-//       修复: 列表/详情的封面 URL 全部走本地代理 /proxy/img, 代理拉取密文->解密->以 image/jpeg 返回。
-// 详情: /videos/{code} (标题 og:title, 封面 og:image 为 /seo/default/ 统一占位图, 不可用)
-// 播放: GET /media/{code} (带 Referer) -> 302 跳转到 jw-hls.wgmyvq.cn 的 m3u8 直链 (带时效 auth_key, 需实时解析)
-//       m3u8 为标准 AES-128 HLS, 但 CDN 返回的 Content-Type 是 text/plain, iOS 原生播放器 (AVPlayer)
-//       会拒绝非标准 MIME 的播放列表 —— 这是"所有内容无法播放"的病因。
-//       修复: play 返回本地代理地址 /proxy/m3u8, 代理只修正 Content-Type
-//       (application/vnd.apple.mpegurl)。实测 CDN 分片/密钥为公开绝对地址 (无头也 200),
-//       保持直连不再经过代理, 避免 2300+ 分片走本地二进制透传的失败与卡顿;
-//       仅把相对 URI 解析为绝对。代理失败时 302 降级到原始 m3u8 (与之前行为一致)。
+//       CryptoJS 默认 PKCS7 填充, 解密后即 JPEG)。
+//       第一轮用本地 /proxy/img 解密出图, 但 App 的图片加载走 js2p 本地地址拿不到图 (chigua57 的
+//       既有教训: 图片必须走真实 https 地址)。本轮改走用户自建 Worker (同 hl818/bagua 的方案):
+//       该 Worker 有域名白名单 (pic.jtzatly.cn / pic.drleao.cn 已放行, image.cpckgr.cn 未放行会 400),
+//       而 cpckgr 与 jtzatly 是同路径镜像 —— 把封面域名换成 pic.jtzatly.cn 再拼 Worker 地址。
+//       VM 实测 4 张 AvHub 封面经此路径返回的字节与本地解密逐字节一致 (200, image/jpeg, ffd8 魔数)。
+// 详情: /videos/{code} (标题 og:title, 封面 og:image 为 /seo/default/ 统一占位图, 不可用; 真封面取页面 JSON 的 videoCover)
+// 播放: GET /media/{code} (带 Referer) 的行为按视频托管类型分三种 (VM 实测):
+//       (a) cloud_01/m3m/videos5 型: 302 跳 jw-hls.wgmyvq.cn 的 m3u8 直链, 可直拉, 但 Content-Type
+//           是 text/plain, iOS AVPlayer 会拒绝 —— 需本地代理只改 Content-Type (分片/密钥公开直连)。
+//       (b) fangzhou 型 (fz 开头 code, 标签分类里占多数): /media 像抽奖 —— 约一半概率直接 200 返回
+//           真 m3u8 (分片在 fangz-pic*.bedfpk.cn, 无加密, 公开直拉), 另一半 302 跳到
+//           jw-hls 的 /fangzhou/manifests/playback/ 网关, 该网关拉取必 502 (死链)。
+//           第一轮代码拿第一个 302 就走, 抽到死链即全灭 —— 这是"多数分类无法播放"的根因。
+//       修复: play 只返回本地代理 /proxy/m3u8 (u=/media 地址), 由代理在播放时解析:
+//           循环请求 /media (最多 5 次), 拿到 200 真 m3u8 或可拉取的 302 目标即返回 (改 CT + 相对地址转绝对);
+//           抽到死网关就换一次 /media 重抽 (每次 auth_key 都是新的)。全部失败才 302 降级到最后的目标地址。
 // 搜索: /search/{kw}[/{page}] (24条/页)
 
 const KEY = 'py_avhub';
@@ -35,7 +41,7 @@ const REFERER = SITE + '/';
 const CATS = [
   { type_id: 'new', type_name: '最新发布', first: '/new', tpl: '/new/{p}', pc: 500 },
   { type_id: 'today', type_name: '今日热门', first: '/popular/today', tpl: '/popular/today/{p}', pc: 100 },
-  { type_id: 'popular', type_name: '热门', first: '/popular', tpl: null, pc: 1 },
+  { type_id: 'popular', type_name: '热门', first: '/popular', tpl: '/popular/week/{p}', pc: 40 },
   { type_id: 'theme:3', type_name: '中文字幕', first: '/theme/detail/3', tpl: '/theme/detail/3/update/{p}', pc: 649 },
   { type_id: 'theme:11', type_name: '高清无码', first: '/theme/detail/11/hot', tpl: '/theme/detail/11/hot/{p}', pc: 60 },
   { type_id: 'theme:58', type_name: 'AI短剧', first: '/theme/detail/58', tpl: '/theme/detail/58/update/{p}', pc: 12 },
@@ -282,12 +288,17 @@ function absUrl(u, base) {
   try { return new URL(u, base).toString(); } catch (e) { return u; }
 }
 
-// 封面 URL 改走本地解密代理 (仅 cpckgr 加密图; 其他图直连)
+// 封面解密出图: 走用户自建 Worker (真实 https 地址; App 图片加载走不了本地 js2p 代理)。
+// Worker 有域名白名单, image.cpckgr.cn 未放行 (实测 400 Invalid URL); cpckgr 与 pic.jtzatly.cn
+// 是同路径镜像 (jtzatly 已放行), 先换域名再拼 Worker 地址 (与 hl818/bagua 的 IMG_PROXY 拼法一致)。
+const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
 function picProxy(pic, reqIn) {
   pic = t(pic);
-  if (!pic || !/cpckgr\.cn/i.test(pic)) return pic;
-  const p = proxyUrl(reqIn, '/proxy/img', pic, REFERER);
-  return p || pic;
+  if (!pic) return pic;
+  if (/workers\.dev/i.test(pic)) return pic;
+  if (!/cpckgr\.cn/i.test(pic)) return pic;
+  const swapped = pic.replace(/^[a-z]+:\/\/[^/]*cpckgr\.cn/i, 'https://pic.jtzatly.cn');
+  return IMG_PROXY + encodeURIComponent(swapped);
 }
 
 // m3u8 仅修正相对地址 -> 绝对地址; 分片/密钥本就是公开绝对地址, 保持直连不经代理
@@ -325,73 +336,36 @@ async function fetchText(url, headers) {
   return '';
 }
 
-async function fetchBuffer(url, headers) {
+// 手动重定向版文本请求: 返回 { status, location, body } (req 优先, fetch 兜底)
+async function fetchManual(url, headers) {
   try {
-    const { data, status } = await req.get(url, { headers, timeout: 30000, responseType: 'arraybuffer' });
-    if (status === 200 && data) return Buffer.from(data);
-  } catch (e) { /* 换通道2 */ }
-  try {
-    const r = await fetch(url, { headers });
-    if (r.ok) return Buffer.from(await r.arrayBuffer());
-  } catch (e) { /* ignore */ }
-  return null;
-}
-
-// GET /proxy/m3u8?u={b64url m3u8}&r={b64url referer}
-async function m3u8Proxy(request, reply) {
-  const q = request?.query || {};
-  if (!q.u) { reply.code(400).send('missing u'); return; }
-  let m3u8Url = '';
-  let referer = REFERER;
-  try {
-    m3u8Url = unb64url(q.u);
-    if (q.r) referer = unb64url(q.r) || referer;
-  } catch (e) { reply.code(400).send('bad u'); return; }
-  if (!/^https?:\/\//.test(m3u8Url)) { reply.code(400).send('bad u'); return; }
-  const headers = { 'User-Agent': UA, 'Accept': '*/*', 'Referer': referer };
-  const raw = await fetchText(m3u8Url, headers);
-  if (!raw || !raw.includes('#EXTM3U')) {
-    // 降级: 302 重定向到原始 m3u8 (与直连行为一致)
-    reply.redirect(m3u8Url);
-    return;
+    const resp = await req.get(url, {
+      headers, timeout: 20000, maxRedirects: 0,
+      validateStatus: s => s >= 200 && s < 400,
+    });
+    const loc = (resp.headers && (resp.headers.location || resp.headers.Location)) || '';
+    const body = typeof resp.data === 'string' ? resp.data : (resp.data ? String(resp.data) : '');
+    return { status: resp.status, location: loc, body };
+  } catch (e) {
+    const r2 = e && e.response;
+    if (r2 && r2.status >= 300 && r2.status < 400) {
+      const loc = (r2.headers && (r2.headers.location || r2.headers.Location)) || '';
+      return { status: r2.status, location: loc, body: '' };
+    }
   }
-  reply.header('Content-Type', 'application/vnd.apple.mpegurl');
-  reply.header('Cache-Control', 'no-cache');
-  reply.send(rewriteM3u8(raw, m3u8Url));
-}
-
-// ---------- 封面解密代理 (AES-128-CBC 加密图 -> 明文图片) ----------
-
-const IMG_KEY = Buffer.from('f5d965df75336270', 'utf8');
-const IMG_IV = Buffer.from('97b60394abc2fbe1', 'utf8');
-
-// 解密封面: 站方用 CryptoJS 默认 PKCS7 填充; 万一遇到零填充图, 再走 NoPadding + 去尾 0 兜底
-function decryptCover(enc) {
   try {
-    const d = crypto.createDecipheriv('aes-128-cbc', IMG_KEY, IMG_IV);
-    return Buffer.concat([d.update(enc), d.final()]);
-  } catch (e) { /* 走兜底 */ }
-  try {
-    const d = crypto.createDecipheriv('aes-128-cbc', IMG_KEY, IMG_IV);
-    d.setAutoPadding(false);
-    const dec = Buffer.concat([d.update(enc), d.final()]);
-    let end = dec.length;
-    while (end > 0 && dec[end - 1] === 0) end--;
-    return dec.subarray(0, end);
-  } catch (e) { return null; }
+    const r = await fetch(url, { headers, redirect: 'manual' });
+    const loc = r.headers.get('location') || '';
+    const body = r.status === 200 ? await r.text() : '';
+    return { status: r.status, location: loc, body };
+  } catch (e) { /* ignore */ }
+  return { status: 0, location: '', body: '' };
 }
 
-function imageCT(buf) {
-  if (!buf || buf.length < 4) return 'image/jpeg';
-  if (buf[0] === 0xff && buf[1] === 0xd8) return 'image/jpeg';
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
-  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
-  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'image/gif';
-  return 'image/jpeg';
-}
-
-// GET /proxy/img?u={b64url 封面图}&r={b64url referer} —— 拉取加密图, 解密后以图片类型返回
-async function imgProxy(request, reply) {
+// GET /proxy/m3u8?u={b64url 目标}&r={b64url referer}
+// 目标是 /media/{code} 时: 循环解析 (fangzhou 型 /media 是抽奖: 200 真 m3u8 或 302 死网关, 抽到死链重抽);
+// 目标是直链 m3u8 时: 拉取后只改 Content-Type 返回。分片/密钥一律保持公开直连, 不经代理。
+async function m3u8Proxy(request, reply) {
   const q = request?.query || {};
   if (!q.u) { reply.code(400).send('missing u'); return; }
   let target = '';
@@ -401,65 +375,53 @@ async function imgProxy(request, reply) {
     if (q.r) referer = unb64url(q.r) || referer;
   } catch (e) { reply.code(400).send('bad u'); return; }
   if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
-  const headers = { 'User-Agent': UA, 'Accept': 'image/*,*/*;q=0.8', 'Referer': referer };
-  const enc = await fetchBuffer(target, headers);
-  if (!enc) {
-    reply.redirect(target);
-    return;
-  }
-  const dec = decryptCover(enc);
-  if (!dec) {
-    // 解密失败 (可能站点改了密钥): 降级直出原图, 不比现状更差
-    reply.redirect(target);
-    return;
-  }
-  reply.header('Content-Type', imageCT(dec));
-  reply.header('Cache-Control', 'public, max-age=86400');
-  reply.send(dec);
-}
-
-// /media/{code} -> 302 -> 带 auth_key 的 m3u8 直链 (auth_key 时效, 必须实时解析)
-async function resolveMedia(code) {
-  const mediaUrl = SITE + '/media/' + code;
-  const headers = {
-    'User-Agent': UA,
-    'Accept': '*/*',
-    'Referer': SITE + '/videos/' + code,
+  const headers = { 'User-Agent': UA, 'Accept': '*/*', 'Referer': referer };
+  const sendList = (raw, base) => {
+    reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+    reply.header('Cache-Control', 'no-cache');
+    reply.send(rewriteM3u8(raw, base));
   };
-  // 通道1: 框架 req (禁止跟随重定向, 读 location)
-  try {
-    const resp = await req.get(mediaUrl, {
-      headers, timeout: 20000, maxRedirects: 0,
-      validateStatus: s => s >= 200 && s < 400,
-    });
-    const loc = (resp.headers && (resp.headers.location || resp.headers.Location)) || '';
-    if (loc && /\.m3u8/i.test(loc)) return loc;
-    if (typeof resp.data === 'string' && resp.data.includes('#EXTM3U')) return mediaUrl;
-  } catch (e) {
-    const loc = e && e.response && e.response.headers && (e.response.headers.location || e.response.headers.Location);
-    if (loc && /\.m3u8/i.test(loc)) return loc;
+
+  const mediaM = target.match(/\/media\/([A-Za-z0-9\-_]+)/);
+  if (!mediaM) {
+    const raw = await fetchText(target, headers);
+    if (raw && raw.includes('#EXTM3U')) { sendList(raw, target); return; }
+    reply.redirect(target);
+    return;
   }
-  // 通道2: 原生 fetch 手动重定向
-  try {
-    const r = await fetch(mediaUrl, { headers, redirect: 'manual' });
-    const loc = r.headers.get('location') || '';
-    if (loc && /\.m3u8/i.test(loc)) return loc;
-  } catch (e) { /* ignore */ }
-  return '';
+
+  let lastLoc = '';
+  for (let i = 0; i < 5; i++) {
+    const res = await fetchManual(target, headers);
+    if (res.status === 200 && res.body && res.body.includes('#EXTM3U')) {
+      sendList(res.body, target);
+      return;
+    }
+    const loc = res.location ? absUrl(res.location, target) : '';
+    if (loc) {
+      lastLoc = loc;
+      const raw = await fetchText(loc, headers);
+      if (raw && raw.includes('#EXTM3U')) { sendList(raw, loc); return; }
+      // 目标拉不到 (fangzhou 死网关 502 等): 换一次 /media 重抽
+    }
+    // status 异常/无跳转: 也重抽 (每次 /media 都是新 auth_key/新后端节点)
+  }
+  // 全部尝试失败: 降级 302 到最后一次的跳转目标 (与旧行为一致, 不比现状更差)
+  reply.redirect(lastLoc || target);
 }
 
 async function play(reqIn) {
   const body = reqIn?.body || {};
   const code = codeFromId(body.id);
   if (!code) return { parse: 0, url: '' };
-  const m3u8 = await resolveMedia(code);
-  if (!m3u8) return { parse: 0, url: '' };
+  const mediaUrl = SITE + '/media/' + code;
   const referer = SITE + '/videos/' + code;
-  // 走本地代理: 修正 CDN 返回的 text/plain Content-Type (iOS AVPlayer 会拒绝), 分片/密钥经代理透传
-  const purl = proxyUrl(reqIn, '/proxy/m3u8', m3u8, referer);
+  // 只返回本地代理地址, 由 /proxy/m3u8 在播放时实时解析 /media (含 fangzhou 抽奖重抽逻辑)。
+  // play 本身不再发上游请求, 返回更快; 代理地址构造失败才降级直连 /media。
+  const purl = proxyUrl(reqIn, '/proxy/m3u8', mediaUrl, referer);
   return {
     parse: 0,
-    url: purl || m3u8,
+    url: purl || mediaUrl,
     header: { 'User-Agent': UA, 'Referer': REFERER },
   };
 }
@@ -485,10 +447,8 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
-      // m3u8 代理 (GET): 只修正 Content-Type, 分片/密钥保持直连
+      // m3u8 代理 (GET): 播放时实时解析 /media + 只修正 Content-Type, 分片/密钥保持直连
       fastify.get('/proxy/m3u8', m3u8Proxy);
-      // 封面解密代理 (GET): AES 加密封面解密后以图片类型返回
-      fastify.get('/proxy/img', imgProxy);
     },
   };
 }
