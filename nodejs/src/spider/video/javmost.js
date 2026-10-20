@@ -3,13 +3,16 @@ import req from '../../util/req.js';
 // JavMost (py_javmost)
 // 站点: https://www.javmost.ws/ (JAV 在线站，无反爬，列表/详情直抓)
 // 列表: / (最新, 25条/页, 翻页 /category/all/page/N/)
+// 注意: / (最新) 与 /category/all/ (全部) 是站点本身设计的同一页面，内容完全一致，非 spider bug
 // 分类: /category/{all|censor|uncensor}/[/page/N/] (25条/页)
 // 热门: /topview|/topdaily|/topweek|/topmonth (25条/页, 翻页 /{slug}/all/page/N/)
 // 系列: /code/{CODE}/[/page/N/] (25条/页)
+// 标签: /tag/{TAG}/ (仅第1页可用，翻页 410，站点限制)
 // 搜索: /search/{kw}/[/page/N/]
 // 详情: /{CODE}/ 标题+封面从 JSON-LD 取
-// 播放: 官方取源 ajax 接口对机房 IP tar-pit 永不响应，play 走 parse:1 由 MiraPlayer 内置嗅探详情页
-//       (手机端执行页面 JS 调取源并嗅探真实视频流)
+// 播放: 详情页播放器经混淆 JS 调 POST /ri3123o235r/ 动态加载，播放器地址为 AES 加密 token；
+//       该接口对机房 IP tar-pit (65秒零字节)，GET 返回空，AES 密钥不在页面中，服务端无法直接取流。
+//       play 走 parse:1 由 MiraPlayer 内置 WebView 在手机端执行页面 JS 后嗅探真实视频流。
 
 const KEY = 'py_javmost';
 const NAME = 'JavMost';
@@ -17,12 +20,15 @@ const SITE = 'https://www.javmost.ws';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const REFERER = SITE + '/';
 
-// 16 个真实分类 (2026-10-20 从站点导航与番号索引实测)
+// 17 个真实分类 (2026-10-20 从站点导航与番号索引实测)
+// 注意: latest(最新) 与 all(全部) 是站点本身的同一页面，内容一致
+// tag:REDUCING 为"减少马赛克/无码流出"标签页 (与 tag:MOSAIC 内容完全相同，只收录其一)
 const CATS = [
   { type_id: 'latest', type_name: '最新' },
   { type_id: 'all', type_name: '全部' },
   { type_id: 'censor', type_name: '有码' },
   { type_id: 'uncensor', type_name: '无码' },
+  { type_id: 'tag:REDUCING', type_name: '无码流出' },
   { type_id: 'topview', type_name: '小时热门' },
   { type_id: 'topdaily', type_name: '日热门' },
   { type_id: 'topweek', type_name: '周热门' },
@@ -140,6 +146,11 @@ function buildList(url, page, limit) {
 
 function catUrl(tid, page) {
   page = Math.max(1, page);
+  // 标签分类: tag:REDUCING -> /tag/REDUCING/ (仅第1页，翻页 410)
+  if (tid.startsWith('tag:')) {
+    const tag = tid.slice(4);
+    return `${SITE}/tag/${encodeURIComponent(tag)}/`;
+  }
   // 系列分类: code:SNIS -> /code/SNIS/
   if (tid.startsWith('code:')) {
     const code = tid.slice(5);
@@ -186,7 +197,10 @@ async function category(reqIn) {
   const body = reqIn?.body || {};
   const tid = t(body.tid || body.id) || 'latest';
   const page = Math.max(1, parseInt(body.page, 10) || 1);
-  return buildList(catUrl(tid, page), page, 25);
+  const res = await buildList(catUrl(tid, page), page, 25);
+  // 标签页翻页 410，只保留第1页
+  if (tid.startsWith('tag:')) res.pagecount = 1;
+  return res;
 }
 
 async function detail(reqIn) {

@@ -46,7 +46,6 @@ import javhd from './spider/video/javhd.js';
 import javgg from './spider/video/javgg.js';
 import javopen from './spider/video/javopen.js';
 import tubetubetube from './spider/video/tubetubetube.js';
-import avgle from './spider/video/avgle.js';
 import javmobile from './spider/video/javmobile.js';
 import javmost from './spider/video/javmost.js';
 
@@ -99,7 +98,6 @@ const spiders = [
     javgg,
     javopen,
     tubetubetube,
-    avgle,
     javmobile,
     javmost,];
 const spiderPrefix = '/spider'; // API 路由前缀

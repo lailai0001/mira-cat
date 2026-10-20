@@ -117,12 +117,14 @@ function parsePagecount(html) {
   return max;
 }
 
-async function buildList(url, page, limit) {
+async function buildList(url, page, limit, tid) {
   limit = limit || 30;
   const html = await getHtml(url);
   if (!html) return { page, pagecount: page, limit, total: 0, list: [] };
   const list = parseCards(html);
-  const pc = parsePagecount(html);
+  let pc = parsePagecount(html);
+  // 首页（最新）没有翻页链接，但 /page/N/ 有效，默认给一个较大的页数让 App 能加载更多
+  if (tid === 'latest' && pc <= 1 && list.length >= limit) pc = 50;
   return { page, pagecount: Math.max(pc, page), limit, total: list.length, list };
 }
 
@@ -166,10 +168,11 @@ async function resolveUpload18(embedUrl) {
 }
 
 // Server2: audinifer embed 页 -> 解 pack 混淆 JS 取 m3u8
+// 注意: 站方 packer 用单引号包裹 payload: }('PAYLOAD',36,497,'SYMTAB'.split('|')))
 function unpackAudinifer(html) {
-  const m = html.match(/eval\(function\(p,a,c,k,e,d\)\{.*?\"\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)\)\)/s);
+  const m = html.match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('((?:[^'\\]|\\.)*)',(\d+),(\d+),'((?:[^'\\]|\\.)*)'\.split\('\|'\)\)/);
   if (!m) return '';
-  let p = m[1];
+  let p = m[1].replace(/\\'/g, "'").replace(/\\\\/g, '\\');
   const a = parseInt(m[2], 10);
   const c = parseInt(m[3], 10);
   const k = m[4].split('|');
@@ -196,29 +199,31 @@ async function resolveAudinifer(embedUrl) {
 }
 
 // 解析播放地址 (实时解析, token 时效约 30 分钟)
+// 返回 { url, parse, referer }: referer 必须与取源站点一致,
+// helvid.com 会 403 掉 Referer 为 javmobile.net 的请求, 必须用 upload18.org
 async function resolvePlay(durl) {
   const html = await getHtml(durl);
-  if (!html) return { url: '', parse: 0 };
+  if (!html) return { url: '', parse: 0, referer: '' };
   const sources = extractSources(html);
   // 优先 Server1 (upload18, 直链 m3u8)
   for (const s of sources) {
     if (/upload18\.org/i.test(s)) {
       const m3u8 = await resolveUpload18(s);
-      if (m3u8) return { url: m3u8, parse: 0 };
+      if (m3u8) return { url: m3u8, parse: 0, referer: s };
     }
   }
   // 兜底 Server2 (audinifer, 解混淆)
   for (const s of sources) {
     if (/audinifer\.com/i.test(s)) {
       const m3u8 = await resolveAudinifer(s);
-      if (m3u8) return { url: m3u8, parse: 0 };
+      if (m3u8) return { url: m3u8, parse: 0, referer: s };
       // 解不出来就返回 embed 页走嗅探
-      return { url: s, parse: 1 };
+      return { url: s, parse: 1, referer: s };
     }
   }
   // 都没有则返回第一个源走嗅探
-  if (sources.length) return { url: sources[0], parse: 1 };
-  return { url: '', parse: 0 };
+  if (sources.length) return { url: sources[0], parse: 1, referer: sources[0] };
+  return { url: '', parse: 0, referer: '' };
 }
 
 async function init(reqIn) {
@@ -234,7 +239,7 @@ async function category(reqIn) {
   const body = reqIn?.body || {};
   const tid = t(body.tid || body.id) || 'latest';
   const page = Math.max(1, parseInt(body.page, 10) || 1);
-  return buildList(catUrl(tid, page), page, 30);
+  return buildList(catUrl(tid, page), page, 30, tid);
 }
 
 async function detail(reqIn) {
@@ -292,10 +297,12 @@ async function play(reqIn) {
 
   const r = await resolvePlay(durl);
   if (!r.url) return { parse: 0, url: '' };
+  // Referer 必须与视频源站点一致 (helvid 只认 upload18.org, 否则 403)
+  const referer = r.referer || REFERER;
   return {
     parse: r.parse,
     url: r.url,
-    header: { 'User-Agent': UA, 'Referer': REFERER },
+    header: { 'User-Agent': UA, 'Referer': referer },
   };
 }
 

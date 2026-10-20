@@ -177,31 +177,64 @@ async function detail(reqIn) {
   const descM = html.match(/<meta property="og:description" content="([^"]+)"/);
   if (descM) content = clean(descM[1]);
 
-  // post_id 用于播放 API
+  // post_id 用于播放 API（play 时实时从详情页取，不拼进 vod_play_url，
+  // 避免 URL 里多一个 $ 破坏播放器的 名称$地址 切分）
   const postM = html.match(/data-post='(\d+)'/);
   const postId = postM ? postM[1] : '';
 
-  const playId = postId ? `${postId}$${durl}` : durl;
   return {
     list: [{
       vod_id: durl,
       vod_name: name || durl,
       vod_pic: pic,
+      vod_remarks: '',
       vod_content: content,
       vod_play_from: 'JavGG',
-      vod_play_url: `正片$${playId}`,
+      vod_play_url: `正片$${durl}`,
     }],
   };
 }
 
-// 播放: dooplayer API → embed 页 → f4s api/play → m3u8 (需 Origin)
-// id 格式: "正片$postId$durl" / "postId$durl" / 完整 durl / 纯 postId
+// f4s 系 embed 链路: embed 页 data-video-id -> {host}/api/play/{vid} -> m3u8
+// 成功返回 {parse:0,...}，失败返回 null（换下一个 server 或走嗅探）
+async function tryF4sChain(embedUrl, durl) {
+  try {
+    const embedHost = new URL(embedUrl).origin;
+    const embedHtml = await getText(embedUrl, { 'Referer': durl });
+    if (!embedHtml) return null;
+    const vidM = embedHtml.match(/data-video-id="([a-f0-9-]+)"/);
+    if (!vidM) return null; // 非 f4s 系（vidhide/streamhg/playmate 等混淆播放器）
+    const vid = vidM[1];
+    const apiM = embedHtml.match(/data-api="([^"]+)"/);
+    const playApi = apiM ? (apiM[1].startsWith('/') ? embedHost + apiM[1] : apiM[1]) : `${embedHost}/api/play/${vid}`;
+    const srcUrl = `${playApi}?ab=0&r=${encodeURIComponent(durl)}`;
+    const srcText = await getText(srcUrl, { 'Accept': 'application/json', 'Referer': embedUrl }, 10);
+    if (!srcText) return null;
+    const srcJson = JSON.parse(srcText);
+    const src = t(srcJson.src || srcJson.url);
+    if (!src || !/^https?:\/\//.test(src)) return null;
+    // m3u8 必须带 Origin 才能访问 (f4s 锁定)
+    return {
+      parse: 0,
+      url: src,
+      header: { 'User-Agent': UA, 'Referer': embedUrl, 'Origin': embedHost },
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// 播放: 依次试 dooplayer server 1~3
+// f4s 系 -> api/play 拿 m3u8 直链(parse:0)；其他混淆播放器 -> 返回 embed 页走嗅探(parse:1)
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
   if (id.startsWith('正片$')) id = id.slice(3);
-  // id 可能是 "postId$durl" 形式，先整体匹配
+  if (/\.m3u8(\?|$)/i.test(id)) {
+    return { parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': REFERER } };
+  }
+  // id 可能是 "postId$durl" / 完整 durl / 纯 postId
   let postId = '';
   let durl = '';
   const pm = id.match(/^(\d+)\$(https?:\/\/.+)$/);
@@ -219,46 +252,31 @@ async function play(reqIn) {
   if (!postId) return { parse: 0, url: '' };
   if (!durl) durl = REFERER;
 
-  try {
-    // 1. dooplayer API 取 embed 地址 (优先 server 1: f4scom)
-    const apiUrl = `${SITE}/wp-json/dooplayer/v2/${postId}/movie/1`;
-    const apiText = await getText(apiUrl, { 'Accept': 'application/json' }, 10);
-    if (!apiText) return { parse: 0, url: '' };
-    const apiJson = JSON.parse(apiText);
-    const embedUrl = t(apiJson.embed_url);
-    if (!embedUrl || !/^https?:\/\//.test(embedUrl)) return { parse: 0, url: '' };
-    const embedHost = new URL(embedUrl).origin;
-
-    // 2. embed 页解析 data-video-id / data-api
-    const embedHtml = await getText(embedUrl, { 'Referer': durl });
-    if (!embedHtml) return { parse: 0, url: '' };
-    const vidM = embedHtml.match(/data-video-id="([a-f0-9-]+)"/);
-    const apiM = embedHtml.match(/data-api="([^"]+)"/);
-    if (!vidM) return { parse: 0, url: '' };
-    const vid = vidM[1];
-    const playApi = apiM ? (apiM[1].startsWith('/') ? embedHost + apiM[1] : apiM[1]) : `${embedHost}/api/play/${vid}`;
-
-    // 3. 取播放地址 (ab=0 绕过 adblock 检测)
-    const srcUrl = `${playApi}?ab=0&r=${encodeURIComponent(durl)}`;
-    const srcText = await getText(srcUrl, { 'Accept': 'application/json', 'Referer': embedUrl }, 10);
-    if (!srcText) return { parse: 0, url: '' };
-    const srcJson = JSON.parse(srcText);
-    const src = t(srcJson.src || srcJson.url);
-    if (!src || !/^https?:\/\//.test(src)) return { parse: 0, url: '' };
-
-    // 4. m3u8 必须带 Origin 才能访问 (f4s 锁定)
-    return {
-      parse: 0,
-      url: src,
-      header: {
-        'User-Agent': UA,
-        'Referer': embedUrl,
-        'Origin': embedHost,
-      },
-    };
-  } catch (e) {
-    return { parse: 0, url: '' };
+  let firstEmbed = '';
+  for (let srv = 1; srv <= 3; srv++) {
+    let apiText = '';
+    try {
+      apiText = await getText(`${SITE}/wp-json/dooplayer/v2/${postId}/movie/${srv}`, { 'Accept': 'application/json' }, 10);
+    } catch (e) { continue; }
+    if (!apiText) continue;
+    let embedUrl = '';
+    try { embedUrl = t(JSON.parse(apiText).embed_url); } catch (e) { continue; }
+    if (!embedUrl || !/^https?:\/\//.test(embedUrl)) continue;
+    if (!firstEmbed) firstEmbed = embedUrl;
+    // f4s 系 embed 路径形如 /e/{code}；vidhide/playmate 的 /embed/ 直接跳过抓取
+    let direct = null;
+    try {
+      if (new URL(embedUrl).pathname.startsWith('/e/')) {
+        direct = await tryF4sChain(embedUrl, durl);
+      }
+    } catch (e) { /* ignore */ }
+    if (direct) return direct;
   }
+  // 没有 f4s 直链：把 embed 页交给播放器嗅探（手机端执行播放器 JS 后捕获真实流）
+  if (firstEmbed) {
+    return { parse: 1, url: firstEmbed, header: { 'User-Agent': UA, 'Referer': durl } };
+  }
+  return { parse: 0, url: '' };
 }
 
 async function search(reqIn) {

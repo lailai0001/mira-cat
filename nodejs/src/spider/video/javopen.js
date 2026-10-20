@@ -91,18 +91,28 @@ async function postJson(url, body, referer) {
   return null;
 }
 
-// 解析视频卡片: a[href="/video/{slug}/"] > img[src,alt] + h3 > a 标题
+// 解析视频卡片: a[href="/video/{slug}/"] > img[src|data-src,alt] + h3 > a 标题
+// 注意: 站点用 perfmatters 懒加载，从第5张开始 src 是空白 SVG 占位图，真实地址在 data-src
 function parseCards(html) {
   const out = [];
   const seen = new Set();
-  const re = /<a\s[^>]*href="(https?:\/\/javopen\.co\/video\/[^"]+\/)"[^>]*>\s*<img[^>]+src="([^"]+)"[^>]*alt="([^"]*)"/g;
+  const re = /<a\s[^>]*href="(https?:\/\/javopen\.co\/video\/[^"]+\/)"[^>]*>\s*<img([^>]+)>/g;
   let m;
   while ((m = re.exec(html)) !== null) {
     const durl = m[1];
     if (seen.has(durl)) continue;
     seen.add(durl);
-    const pic = m[2] || '';
-    let title = clean(m[3] || '');
+    const imgTag = m[2];
+    // 优先 data-src（懒加载真实地址），其次 src（排除 data:image 占位图）
+    let pic = '';
+    const dsrcM = imgTag.match(/data-src="([^"]+)"/);
+    if (dsrcM) pic = dsrcM[1];
+    else {
+      const srcM = imgTag.match(/src="([^"]+)"/);
+      if (srcM && !srcM[1].startsWith('data:')) pic = srcM[1];
+    }
+    const altM = imgTag.match(/alt="([^"]*)"/);
+    let title = clean(altM ? altM[1] : '');
     // 尝试从后面的 h3 取完整标题
     const win = html.slice(m.index, m.index + 3000);
     const h3M = win.match(/<h3[^>]*>\s*<a[^>]*>([\s\S]*?)<\/a>\s*<\/h3>/);
