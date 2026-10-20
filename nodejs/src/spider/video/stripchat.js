@@ -21,9 +21,15 @@ import crypto from 'crypto';
 //     enc = 文件名里 _([^_]+)_(\d+).mp4 的第一组; 解密 = reverse(enc) → 补 = 后 base64 解码 →
 //     与 SHA256(pdkey) 的 32 字节循环 XOR → 得明文字串替换回原 URL。
 //   pdkey 按 pschId 查 PSCH_KEYS 表 (公开社区资料给出的映射对, 其中 Ook7quaiNgiyuhai 一对已本次实测验证)。
-//   play() 不发任何上游请求 (0 请求, 最快), 只返回本地代理 /proxy/hls 的地址 (js2p 方案, 同 avhub 先例):
-//   代理只改写播放列表文本 —— 主列表选 pkey、把变体地址改指代理; 媒体列表解密分片地址、删 MOUFLON 行;
-//   分片与 init 段保持 CDN 绝对地址直连 (实测不带任何自定义头 200, 播放器不透传 header 也没关系), 二进制不经代理。
+// 第二轮 (2026-10-20 真机反馈第一轮播不了后逐跳定位): 上游与解密均复测健康 (今日真实主列表 pschId 仍在表中、
+//   媒体列表带参 200、解密分片/init 段无头 200), 本地普通 fastify 里整条链也全通; 断点在 App 内特有的一环 ——
+//   第一轮改写出的主列表里, 变体地址是又一个 js2p 本地代理地址 (播放列表正文里嵌 js2p 地址), 这是本仓库唯一
+//   没在真机通过过的形态 (真机通过的 avhub/JavGG-Worker 方案, 播放列表正文里全是 https 地址)。
+//   修法: play() 改返用户自有 Worker (stripchat-hls) 的 /master/{id} —— Worker 一次代办 主列表→选 pkey→拉
+//   媒体列表→解密, 返回的媒体列表正文全是 CDN 的 https 地址, 分片/init 直连; 与 JavGG vidhide Worker 同
+//   形态 (真机已播通)。Worker 代码见同目录 stripchat-hls-worker.js, 需用户在 Cloudflare 部署后生效。
+//   本地代理 /proxy/hls 保留为回退 (STRIPCHAT_WORKER 留空时用), 且已改造成"一跳版": 代理内部自己解析主
+//   列表的变体并直接返回媒体列表, 返回正文同样全是 https, 不再嵌套 js2p 地址; 仅一跳解析失败时才退回旧嵌套改写。
 // 搜索: 站内搜索 (magic-search) 走前端专用服务; /api/front/models 的 username/searchQuery/tag 等参数实测均被忽略
 //       (返回未过滤的默认列表), 没有可用的公开搜索接口, search 返回空列表。
 
@@ -35,6 +41,10 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const REFERER = 'https://zh.stripchat.com/';
 const PAGE_SIZE = 60;
 const TIMEOUT = 10000;
+
+// 播放列表代办 Worker (用户自有 Cloudflare Worker, 部署名 stripchat-hls; 见同目录 stripchat-hls-worker.js)。
+// 非空: play() 走 Worker; 留空: 回退本地代理 /proxy/hls (一跳版)。
+const STRIPCHAT_WORKER = 'https://stripchat-hls.li768435813.workers.dev';
 
 // Mouflon: pschId -> pdkey (公开已知映射对; 站方会不定期轮换, 轮换后需更新此表)
 const PSCH_KEYS = {
@@ -282,6 +292,15 @@ async function play(reqIn) {
   const raw = t(body.id);
   const id = raw.includes('$') ? raw.split('$').pop() : raw;
   if (!/^\d+$/.test(id)) return { parse: 0, url: '' };
+  // 首选 Worker 代办 (返回正文全 https 的媒体列表); play 本身 0 上游请求
+  if (STRIPCHAT_WORKER) {
+    return {
+      parse: 0,
+      url: `${STRIPCHAT_WORKER}/master/${id}`,
+      header: { 'User-Agent': UA, 'Referer': REFERER },
+    };
+  }
+  // 回退: 本地代理一跳版
   const master = `${EDGE}/hls/${id}/master/${id}.m3u8`;
   const url = proxyUrl(reqIn, '/proxy/hls', master, '');
   return {
@@ -323,9 +342,36 @@ function pickPkey(masterText) {
   return '';
 }
 
-// GET /proxy/hls?u={b64url 播放列表地址}&k={pschId, 媒体列表用}
-// 主列表: 选 pkey, 变体地址改指本代理, 删 MOUFLON 行
-// 媒体列表: 解密 MOUFLON:URI 分片地址替换占位行, 删 MOUFLON 行; 分片/init 段保持 CDN 直连
+// 媒体列表改写: 解密 MOUFLON:URI 分片地址替换占位行, URI="" 转绝对地址, 删 MOUFLON 行;
+// 分片/init 段保持 CDN 绝对地址直连, 返回正文全是 https
+function rewriteMedia(rawText, base, pdkey) {
+  const out = [];
+  let pending = '';
+  for (const line of String(rawText).split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s) continue;
+    if (s.startsWith('#EXT-X-MOUFLON:URI:')) {
+      const u = s.slice('#EXT-X-MOUFLON:URI:'.length);
+      pending = pdkey ? mouflonDecryptUrl(u, pdkey) : u;
+      continue;
+    }
+    if (s.startsWith('#EXT-X-MOUFLON')) continue;
+    if (s.startsWith('#')) {
+      if (s.includes('URI="')) {
+        out.push(line.replace(/URI="([^"]+)"/g, (all, uri) => `URI="${absUrl(uri.replace(/&amp;/g, '&'), base)}"`));
+      } else out.push(line);
+      continue;
+    }
+    out.push(pending || absUrl(s.replace(/&amp;/g, '&'), base));
+    pending = '';
+  }
+  return out.join('\n') + '\n';
+}
+
+// GET /proxy/hls?u={b64url 播放列表地址}&k={pschId, 媒体列表用} —— 本地回退通道 (STRIPCHAT_WORKER 留空时用)
+// 主列表: 一跳版 —— 代理内部选 pkey、取第一个变体、带参拉媒体列表, 直接返回改写后的媒体列表
+//         (返回正文全是 https, 不再把本地代理地址嵌进播放列表 —— 第一轮嵌套形态真机播不了);
+//         仅一跳解析失败时才退回旧嵌套改写。媒体列表: 直接 rewriteMedia。
 async function hlsProxy(request, reply) {
   const q = request?.query || {};
   if (!q.u) { reply.code(400).send('missing u'); return; }
@@ -342,6 +388,23 @@ async function hlsProxy(request, reply) {
 
   if (raw.includes('#EXT-X-STREAM-INF')) {
     const chosen = pickPkey(raw) || pkey;
+    const pdkey = chosen ? PSCH_KEYS[chosen] : null;
+    if (chosen && pdkey) {
+      let variant = '';
+      for (const line of raw.split(/\r?\n/)) {
+        const s = line.trim();
+        if (s && !s.startsWith('#')) { variant = absUrl(s.replace(/&amp;/g, '&'), target); break; }
+      }
+      if (variant) {
+        const mediaUrl = variant + (variant.includes('?') ? '&' : '?') + 'psch=v2&pkey=' + encodeURIComponent(chosen);
+        const mediaRaw = await fetchText(mediaUrl, 8000);
+        if (mediaRaw && mediaRaw.includes('#EXTM3U') && !mediaRaw.includes('#EXT-X-STREAM-INF')) {
+          reply.send(rewriteMedia(mediaRaw, variant, pdkey));
+          return;
+        }
+      }
+    }
+    // 一跳失败的最后兜底: 旧嵌套改写 (变体改指本代理)
     const out = [];
     for (const line of raw.split(/\r?\n/)) {
       const s = line.trim();
@@ -355,28 +418,7 @@ async function hlsProxy(request, reply) {
     return;
   }
 
-  const pdkey = pkey ? PSCH_KEYS[pkey] : null;
-  const out = [];
-  let pending = '';
-  for (const line of raw.split(/\r?\n/)) {
-    const s = line.trim();
-    if (!s) continue;
-    if (s.startsWith('#EXT-X-MOUFLON:URI:')) {
-      const u = s.slice('#EXT-X-MOUFLON:URI:'.length);
-      pending = pdkey ? mouflonDecryptUrl(u, pdkey) : u;
-      continue;
-    }
-    if (s.startsWith('#EXT-X-MOUFLON')) continue;
-    if (s.startsWith('#')) {
-      if (s.includes('URI="')) {
-        out.push(line.replace(/URI="([^"]+)"/g, (all, uri) => `URI="${absUrl(uri.replace(/&amp;/g, '&'), target)}"`));
-      } else out.push(line);
-      continue;
-    }
-    out.push(pending || absUrl(s.replace(/&amp;/g, '&'), target));
-    pending = '';
-  }
-  reply.send(out.join('\n') + '\n');
+  reply.send(rewriteMedia(raw, target, pkey ? PSCH_KEYS[pkey] : null));
 }
 
 export default function createSpider() {
