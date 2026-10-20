@@ -56,6 +56,8 @@ import youzidj from './spider/video/youzidj.js';
 import stripchat from './spider/video/stripchat.js';
 import hohoj from './spider/video/hohoj.js';
 import rip17 from './spider/video/rip17.js';
+import brazz from './spider/video/brazz.js';
+import bongacams from './spider/video/bongacams.js';
 
 const spiders = [
     missav_xptv,
@@ -115,7 +117,7 @@ const spiders = [
     youzidj,
     stripchat,
     hohoj,
-    rip17,];
+    rip17, brazz, bongacams,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
