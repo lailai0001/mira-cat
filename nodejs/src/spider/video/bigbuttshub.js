@@ -16,6 +16,10 @@ import req from '../../util/req.js';
 //     放行 (hls2 连接层切断、hls3 回 403 Website Access Blocked、hls4 仅
 //     "抓 embed 与拉流同一出口"才 200) —— 与 JavGG/SexTB 实证一致:
 //     App 内解码直返必死, 走全链代理 Worker (见下方 BBH_WORKER)。
+//     2026-10-21 第二轮实证补正: hls4 的分片是"图片伪装"段 (tiktokcdn 的
+//     PNG 文件, 70 字节 PNG 头 + 188 对齐真 TS), 原生播放器不认此前缀,
+//     必须由 Worker 在回吐前剥离 —— 第一轮漏检, 是真机全灭的直接原因之一
+//     (另一个是 Worker 未部署, 高清线地址 404/1042)。
 //   - streamcash.to /embed/{id}: 3/5。embed 页内 __PCr 是 base64 的 JSON,
 //     src = cdn.streamcash.to/videos/{id}/index.m3u8 (单档媒体列表),
 //     播放列表/分片全部无头实拉 200 (分片 0x47 真 TS) → 蜘蛛直解作保底线。
@@ -33,16 +37,17 @@ const NAME = 'BigButtsHub';
 const SITE = 'https://bigbuttshub.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const REFERER = SITE + '/';
-// vidhide 全链代理 Worker 基址 (需用户把 newsrc3/bigbuttshub-vidhide-worker.js
+// vidhide 全链代理 Worker 基址 (需用户把 fixed9/bigbuttshub-vidhide-worker.js
 // 部署为同名 Worker 后生效; 名字暂定 bigbuttshub-vidhide, 用户可改, 改名后同步此行)。
-// 留空则高清线回退蜘蛛内解包/嗅探; 直连线 (streamcash) 不依赖此常量。
+// 第一轮的同名 Worker 旧稿没有"图片前缀剥离", 必须用第二轮新版覆盖部署;
+// 未部署时高清线地址不可达, 直连线 (streamcash) 不依赖此常量、照常能播。
 const BBH_WORKER = 'https://bigbuttshub-vidhide.li768435813.workers.dev';
 
 // 分类 (2026-10-20 实测收割: 站内分类 62 + 标签 66 (站内计数>=10) + 演员 59
 // (演员索引前 3 页); tid 前缀 c_/t_/a_, 子级 slug 的 / 编码为 ~)
+// 2026-10-21 删除 c_adult-time 与 c_all-anal: 站方 wp-json 计数分别为 2 与 3
+// 条帖、分类页 /page/2/ 直接 404 —— 站方本就没有更多内容 (非分页故障)。
 const CATS = [
-  { type_id: 'c_adult-time', type_name: "Adult Time" },
-  { type_id: 'c_all-anal', type_name: "All Anal" },
   { type_id: 'c_amateur', type_name: "Amateur" },
   { type_id: 'c_anal-mom', type_name: "Anal Mom" },
   { type_id: 'c_anal-only', type_name: "Anal Only" },
