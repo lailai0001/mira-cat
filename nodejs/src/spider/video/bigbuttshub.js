@@ -1611,137 +1611,152 @@ function extractDetailMeta(html) {
 }
 
 // ===== Spider =====
-function createSpider() {
+// mira-cat 框架外壳 (meta + fastify 路由, 与仓库其他蜘蛛同方言);
+// 上方业务函数与下方 handler 方法体均由第三轮原稿平移, 逻辑未改。
+// TVBox 式 homeVod 在本框架无对应路由, 其内容 (首页第一页列表)
+// 已包含在 home 的返回中, 故未保留。
+
+async function init(reqIn) {
+  return {};
+}
+
+async function home(reqIn) {
+  const classes = CATS.map(c => ({ type_id: c.type_id, type_name: c.type_name }));
+  const r = await fetchPostCards('', 1);
+  if (r.list.length) {
+    return { class: classes, list: r.list };
+  }
+  // REST 不可用时 HTML 首页保命
+  const html = await getText(SITE + '/', {}, 5000);
+  return { class: classes, list: html ? parseCards(html) : [] };
+}
+
+async function category(reqIn) {
+  const body = reqIn?.body || {};
+  const tid = t(body.tid || body.id);
+  const pg = body.page;
+  const page = parseInt(pg, 10) || 1;
+  const cat = CATS.find(c => c.type_id === tid) || CATS[0];
+  const taxParam = cat.type_id.charAt(0) === 'c' ? 'categories' : cat.type_id.charAt(0) === 't' ? 'tags' : 'actors';
+  const r = await fetchPostCards(taxParam + '=' + cat.n, page);
+  if (r.list.length || page > 1) return listResult(r, page);
+  // 第 1 页 REST 失败 → HTML 归档保命 (仅此时用, 分页不保证)
+  const html = await getText(catHtmlUrl(cat), {}, 5000);
+  const list = html ? parseCards(html) : [];
+  return { page: 1, pagecount: 1, limit: PER_PAGE, total: list.length, list };
+}
+
+async function detail(reqIn) {
+  const ids = (reqIn?.body || {}).id;
+  const durl = Array.isArray(ids) ? ids[0] : ids;
+  const html = await getText(durl, { Referer: REFERER }, 5000);
+  if (!html) {
+    return {
+      list: [{
+        vod_id: durl,
+        vod_name: durl,
+        vod_pic: '',
+        vod_play_from: '备用',
+        vod_play_url: '正片$x:' + durl,
+      }],
+    };
+  }
+  const info = extractDetailMeta(html);
+  const emb = extractEmbeds(html);
+
+  // 逐条验 vidhide embed: 已删的直接跳过 (最多验 3 条防拖慢)
+  let vid = '';
+  let vidState = 'unknown';
+  const vidCandidates = emb.vidhide.slice(0, 3);
+  for (const e of vidCandidates) {
+    const st = await vetVidhide(e);
+    if (st !== 'dead') { vid = e; vidState = st; break; }
+  }
+  let vidScore = 0;
+  if (vid) vidScore = vidState === 'weak' ? 25 : 100;
+
+  const cands = [];
+  if (emb.streamcash.length) cands.push({ score: 80, name: '直连', entry: '正片$s:' + emb.streamcash[0] });
+  if (vid) cands.push({ score: vidScore, name: '高清', entry: '正片$w:' + vid });
+  if (emb.byse.length) cands.push({ score: 60, name: '高清B', entry: '正片$b:' + emb.byse[0] });
+  // 备用嗅探: 优先未分类宿主; Byse 帖不再重复嗅探同一 SPA
+  // (b: 失败时自身就会回退嗅探该页)
+  if (emb.sniff.length) cands.push({ score: 20, name: '备用', entry: '正片$x:' + emb.sniff[0] });
+  else cands.push({ score: 10, name: '备用', entry: '正片$x:' + durl });
+  cands.sort((a, b) => b.score - a.score);
+
   return {
-    key: KEY,
-    name: NAME,
-
-    async init(cfg) {
-      return { code: 1, msg: 'ok' };
-    },
-
-    async home(filter) {
-      const classes = CATS.map(c => ({ type_id: c.type_id, type_name: c.type_name }));
-      const r = await fetchPostCards('', 1);
-      if (r.list.length) {
-        return { class: classes, list: r.list };
-      }
-      // REST 不可用时 HTML 首页保命
-      const html = await getText(SITE + '/', {}, 5000);
-      return { class: classes, list: html ? parseCards(html) : [] };
-    },
-
-    async homeVod() {
-      const r = await fetchPostCards('', 1);
-      return { list: r.list };
-    },
-
-    async category(tid, pg, filter, extend) {
-      const page = parseInt(pg, 10) || 1;
-      const cat = CATS.find(c => c.type_id === tid) || CATS[0];
-      const taxParam = cat.type_id.charAt(0) === 'c' ? 'categories' : cat.type_id.charAt(0) === 't' ? 'tags' : 'actors';
-      const r = await fetchPostCards(taxParam + '=' + cat.n, page);
-      if (r.list.length || page > 1) return listResult(r, page);
-      // 第 1 页 REST 失败 → HTML 归档保命 (仅此时用, 分页不保证)
-      const html = await getText(catHtmlUrl(cat), {}, 5000);
-      const list = html ? parseCards(html) : [];
-      return { page: 1, pagecount: 1, limit: PER_PAGE, total: list.length, list };
-    },
-
-    async detail(ids) {
-      const durl = Array.isArray(ids) ? ids[0] : ids;
-      const html = await getText(durl, { Referer: REFERER }, 5000);
-      if (!html) {
-        return {
-          list: [{
-            vod_id: durl,
-            vod_name: durl,
-            vod_pic: '',
-            vod_play_from: '备用',
-            vod_play_url: '正片$x:' + durl,
-          }],
-        };
-      }
-      const info = extractDetailMeta(html);
-      const emb = extractEmbeds(html);
-
-      // 逐条验 vidhide embed: 已删的直接跳过 (最多验 3 条防拖慢)
-      let vid = '';
-      let vidState = 'unknown';
-      const vidCandidates = emb.vidhide.slice(0, 3);
-      for (const e of vidCandidates) {
-        const st = await vetVidhide(e);
-        if (st !== 'dead') { vid = e; vidState = st; break; }
-      }
-      let vidScore = 0;
-      if (vid) vidScore = vidState === 'weak' ? 25 : 100;
-
-      const cands = [];
-      if (emb.streamcash.length) cands.push({ score: 80, name: '直连', entry: '正片$s:' + emb.streamcash[0] });
-      if (vid) cands.push({ score: vidScore, name: '高清', entry: '正片$w:' + vid });
-      if (emb.byse.length) cands.push({ score: 60, name: '高清B', entry: '正片$b:' + emb.byse[0] });
-      // 备用嗅探: 优先未分类宿主; Byse 帖不再重复嗅探同一 SPA
-      // (b: 失败时自身就会回退嗅探该页)
-      if (emb.sniff.length) cands.push({ score: 20, name: '备用', entry: '正片$x:' + emb.sniff[0] });
-      else cands.push({ score: 10, name: '备用', entry: '正片$x:' + durl });
-      cands.sort((a, b) => b.score - a.score);
-
-      return {
-        list: [{
-          vod_id: durl,
-          vod_name: info.title || durl,
-          vod_pic: info.pic,
-          vod_year: info.year,
-          vod_remarks: info.dur,
-          vod_content: info.desc,
-          vod_play_from: cands.map(c => c.name).join('$$$'),
-          vod_play_url: cands.map(c => c.entry).join('$$$'),
-        }],
-      };
-    },
-
-    async play(flag, id, vipFlags) {
-      const body = t(id);
-      const kind = body.slice(0, 2);
-      const target = body.slice(2);
-      const headers = { 'User-Agent': UA, 'Referer': REFERER };
-      // vidhide 线: 全链走 Worker 代理
-      if (kind === 'w:' && /^https?:\/\//.test(target)) {
-        return {
-          parse: 0,
-          url: BBH_WORKER + '/v?u=' + encodeURIComponent(target),
-          header: { 'User-Agent': UA, 'Referer': BBH_WORKER + '/' },
-        };
-      }
-      // streamcash 线: 设备侧现场铸造 /pass 直链
-      if (kind === 's:' && /^https?:\/\//.test(target)) {
-        const direct = await resolveStreamcash(target);
-        if (direct) {
-          return { parse: 0, url: direct, header: { 'User-Agent': UA, 'Referer': 'https://streamcash.to/' } };
-        }
-        return { parse: 1, url: target, header: headers };
-      }
-      // Byse 线: 设备侧现场铸造 API 直链; 失败回退嗅探其 SPA 页
-      if (kind === 'b:' && /^https?:\/\//.test(target)) {
-        const direct = await resolveByse(target);
-        if (direct) {
-          return { parse: 0, url: direct, header: { 'User-Agent': UA, 'Referer': target } };
-        }
-        return { parse: 1, url: target, header: headers };
-      }
-      // 默认: 交播放器嗅探 (x: 目标恒为完整 URL: embed 或详情页)
-      return { parse: 1, url: target || body, header: headers };
-    },
-
-    async search(wd, quick, pg) {
-      const page = parseInt(pg, 10) || 1;
-      const r = await fetchPostCards('search=' + encodeURIComponent(wd || ''), page);
-      if (r.list.length || page > 1) return listResult(r, page);
-      const html = await getText(SITE + '/?s=' + encodeURIComponent(wd || ''), {}, 5000);
-      const list = html ? parseCards(html) : [];
-      return { page: 1, pagecount: 1, limit: PER_PAGE, total: list.length, list };
-    },
+    list: [{
+      vod_id: durl,
+      vod_name: info.title || durl,
+      vod_pic: info.pic,
+      vod_year: info.year,
+      vod_remarks: info.dur,
+      vod_content: info.desc,
+      vod_play_from: cands.map(c => c.name).join('$$$'),
+      vod_play_url: cands.map(c => c.entry).join('$$$'),
+    }],
   };
 }
 
-export default createSpider;
+async function play(reqIn) {
+  const reqBody = reqIn?.body || {};
+  let id = t(reqBody.id);
+  if (id.startsWith('正片$')) id = id.slice(3);
+  const body = t(id);
+  const kind = body.slice(0, 2);
+  const target = body.slice(2);
+  const headers = { 'User-Agent': UA, 'Referer': REFERER };
+  // vidhide 线: 全链走 Worker 代理
+  if (kind === 'w:' && /^https?:\/\//.test(target)) {
+    return {
+      parse: 0,
+      url: BBH_WORKER + '/v?u=' + encodeURIComponent(target),
+      header: { 'User-Agent': UA, 'Referer': BBH_WORKER + '/' },
+    };
+  }
+  // streamcash 线: 设备侧现场铸造 /pass 直链
+  if (kind === 's:' && /^https?:\/\//.test(target)) {
+    const direct = await resolveStreamcash(target);
+    if (direct) {
+      return { parse: 0, url: direct, header: { 'User-Agent': UA, 'Referer': 'https://streamcash.to/' } };
+    }
+    return { parse: 1, url: target, header: headers };
+  }
+  // Byse 线: 设备侧现场铸造 API 直链; 失败回退嗅探其 SPA 页
+  if (kind === 'b:' && /^https?:\/\//.test(target)) {
+    const direct = await resolveByse(target);
+    if (direct) {
+      return { parse: 0, url: direct, header: { 'User-Agent': UA, 'Referer': target } };
+    }
+    return { parse: 1, url: target, header: headers };
+  }
+  // 默认: 交播放器嗅探 (x: 目标恒为完整 URL: embed 或详情页)
+  return { parse: 1, url: target || body, header: headers };
+}
+
+async function search(reqIn) {
+  const body = reqIn?.body || {};
+  const wd = t(body.wd);
+  const pg = body.page;
+  const page = parseInt(pg, 10) || 1;
+  const r = await fetchPostCards('search=' + encodeURIComponent(wd || ''), page);
+  if (r.list.length || page > 1) return listResult(r, page);
+  const html = await getText(SITE + '/?s=' + encodeURIComponent(wd || ''), {}, 5000);
+  const list = html ? parseCards(html) : [];
+  return { page: 1, pagecount: 1, limit: PER_PAGE, total: list.length, list };
+}
+
+export default function createSpider() {
+  return {
+    meta: { key: KEY, name: NAME, type: 3 },
+    api: async (fastify) => {
+      fastify.post('/init', init);
+      fastify.post('/home', home);
+      fastify.post('/category', category);
+      fastify.post('/detail', detail);
+      fastify.post('/play', play);
+      fastify.post('/search', search);
+    },
+  };
+}
