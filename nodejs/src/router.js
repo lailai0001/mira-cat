@@ -52,6 +52,7 @@ import sextb from './spider/video/sextb.js';
 import javsb from './spider/video/javsb.js';
 import porncgw from './spider/video/porncgw.js';
 import xhongyan from './spider/video/xhongyan.js';
+import youzidj from './spider/video/youzidj.js';
 
 const spiders = [
     missav_xptv,
@@ -107,7 +108,8 @@ const spiders = [
     sextb,
     javsb,
     porncgw,
-    xhongyan,];
+    xhongyan,
+    youzidj,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
