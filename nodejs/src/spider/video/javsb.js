@@ -10,6 +10,25 @@
 // 经典两步 token -> save 取 m3u8_file; 全灭才落 parse:1 嗅探 (同前)。
 // sign 时间窗实测 ±3600s 内可用, 播放器随后自取列表无压力。
 //
+// 播放 (2026-10-20 第六轮): 第五轮真机全灭 —— 路 A/B 返回的都是 jav.sb
+// 本域地址, 播放器自取这一跳在设备网络上被 jav.sb 的 CF 拦死 (蜘蛛有
+// 中转能过、播放器没有)。改走全链同出口 Worker (与 JavGG/SexTB/
+// StripChat 真机已验同形态): play 首选 javsb-hls Worker (下方
+// JAVSB_WORKER 常量, 用户部署后生效) —— Worker 内算签取 raw 列表、
+// 分片行改写到 Worker /s, 播放器全程只连 workers.dev。蜘蛛先对
+// Worker /v 做一次校验取数 (含 #EXTM3U 才算通), 不过再依次回退
+// 第五轮路 A (算签直取)、路 B (token 两步)、parse:1 嗅探。
+// 取证要点: CF Workers 出口直连 jav.sb 同样吃 403 (借已部署的
+// javgg-vidhide Worker 实测), 故 Worker 内部取列表要绕公开中转;
+// 18av.mov 分片域 (s103/s104) 对 Workers 出口开放 (实测逐字节
+// 一致), 且用户真机浏览器实证从其设备亦可达 —— 故 Worker 有两种
+// 列表形态: seg=direct (分片保持原始直链, 轻量) 与默认全链代理
+// (分片改走 Worker /s)。蜘蛛先探 seg=direct 列表 + 首分片 (探针
+// 在 App 内跑 = 设备出口实测), 通则用直链形态; 不通改探全链形态;
+// 都不过才回退路 A/B/嗅探。
+// play 总预算放宽到 55s: Worker 首播要等中转取列表 (实测可达 10~35s),
+// 成品在 Worker 侧缓存 600s, 二次点播直接命中。
+//
 // 抓取通道 (2026-10-20 第六版): 真机双状态 (VPN 开/关) 直连全灭、第三轮的
 // jina 单中转也全灭。复核结论: 第三轮实现无 URL/编码类低级错误, 但有三个结构
 // 问题 —— (1) jina 只走了原生 fetch 一条传输, 而本仓已真机通过的 SexTB 是走
@@ -44,6 +63,10 @@ const REFERER = HOST + '/';
 const JINA = 'https://r.jina.ai/';
 const MDNEW = 'https://markdown.new/';
 const ALLORIGINS = 'https://api.allorigins.win/raw?url=';
+// 全链代理 Worker (第六轮, 用户手动部署 javsb-hls 后生效; 留空则跳过此路)
+const JAVSB_WORKER = 'https://javsb-hls.li768435813.workers.dev';
+// 分片探针用的播放器 UA (近似 iOS 原生播放器, 与蜘蛛抓取 UA 区分)
+const PLAYER_UA = 'AppleCoreMedia/1.0.0.20L563 (iPhone; U; CPU OS 17_5 like Mac OS X; zh_cn)';
 
 // 分类: type_id 为 javtype 的 Type slug; new/rank_* 为 label 页 (见 catUrl)
 const CATS = [
@@ -601,6 +624,59 @@ async function tryOfficialStream(hash, playerUrl, deadline) {
   return '';
 }
 
+// ---------- Worker 取流 (第六轮首选) ----------
+// 探针就跑在 App 里, 等于设备出口实测:
+//   形态一 (分片直链, 轻量): 取 Worker 的 seg=direct 列表 (分片保持
+//     18av.mov 原始直链), 再探首分片 (Range 取首字节, 查 0x47 同步字)
+//     —— 列表与分片都通才用它;
+//   形态二 (全链代理): 分片改走 Worker /s, 播放器只连 workers.dev。
+// 任一形态校验通过即返回其地址; 都不过返回 '' (play 回退路 A/B/嗅探)。
+// wDeadline 是 Worker 阶段的截止点 (play 给回退路预留了时间)。
+async function probeSegment(segUrl, timeoutMs) {
+  if (!segUrl || timeoutMs < 800) return false;
+  try {
+    const txt = await viaFetch(segUrl, { 'User-Agent': PLAYER_UA, 'Range': 'bytes=0-1023', 'Accept': '*/*' }, timeoutMs);
+    return !!txt && txt.charCodeAt(0) === 0x47;
+  } catch (e) { return false; }
+}
+
+async function tryWorkerStream(hash, wDeadline) {
+  if (!JAVSB_WORKER || Date.now() >= wDeadline) return '';
+  const isPl = (s) => typeof s === 'string' && s.includes('#EXTM3U');
+  const cap = (want) => Math.max(800, Math.min(want, wDeadline - Date.now()));
+  const getPl = async (u) => {
+    try {
+      const txt = await viaFetch(u, { 'User-Agent': UA, 'Accept': '*/*' }, cap(44000));
+      if (txt && isPl(txt)) return txt;
+    } catch (e) { /* 换 req 传输再试 */ }
+    if (Date.now() >= wDeadline) return '';
+    try {
+      const txt = await viaReq(u, { 'User-Agent': UA, 'Accept': '*/*' }, cap(12000));
+      if (txt && isPl(txt)) return txt;
+    } catch (e) { /* 落空 */ }
+    return '';
+  };
+  // 形态一: 分片直链
+  const directUrl = `${JAVSB_WORKER}/v?hash=${encodeURIComponent(hash)}&seg=direct`;
+  const proxyUrl = `${JAVSB_WORKER}/v?hash=${encodeURIComponent(hash)}`;
+  const pl = await getPl(directUrl);
+  if (pl) {
+    const seg = pl.split('\n').map(x => x.trim()).find(x => x && !x.startsWith('#'));
+    if (seg && (await probeSegment(seg, cap(5000)))) return directUrl;
+    // 直链分片探不过 → 全链形态。Worker 刚为兄弟形态取过 raw 正文并
+    // 缓存 (按 hash), 这次取数应当很快; 时间实在不够时直接返回全链
+    // 地址 (其取数机制与刚成功的直链形态完全同源, 只差改写方式)。
+    if (wDeadline - Date.now() < 3000) return proxyUrl;
+    const pl2 = await getPl(proxyUrl);
+    return pl2 ? proxyUrl : '';
+  }
+  // 直链形态列表都没拿到 → 全链形态再试一次 (Worker 内部竞速是随机的,
+  // 第二轮未必同灭), 仍不过才落回退路。
+  if (Date.now() >= wDeadline) return '';
+  const pl2 = await getPl(proxyUrl);
+  return pl2 ? proxyUrl : '';
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -610,11 +686,16 @@ async function play(reqIn) {
     return { parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': REFERER } };
   }
   const durl = /^https?:\/\//.test(id) ? id : absUrl(id);
-  const deadline = Date.now() + 7500; // play 总耗时 <8s 有界
+  const deadline = Date.now() + 55000; // 第六轮: Worker 首播含中转取列表 (实测可达 10~35s), 放宽总预算; 命中缓存时秒回
   const remain = () => Math.max(400, deadline - Date.now());
   const html = await getDetailPage(durl, remain());
   const { playerUrl, hash } = html ? extractPlayer(html) : { playerUrl: '', hash: '' };
   if (hash && playerUrl) {
+    // 首选 Worker (部署即生效): 校验通过即 parse:0 直返 Worker 地址
+    const w = await tryWorkerStream(hash, deadline - 8000);
+    if (w) {
+      return { parse: 0, url: w, header: { 'User-Agent': UA, 'Referer': REFERER } };
+    }
     const direct = await tryOfficialStream(hash, playerUrl, deadline);
     if (direct) {
       return { parse: 0, url: direct, header: { 'User-Agent': UA, 'Referer': REFERER } };
