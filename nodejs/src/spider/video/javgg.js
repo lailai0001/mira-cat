@@ -6,13 +6,18 @@ import req from '../../util/req.js';
 // 列表: /new-post/[/page/N/]、/trending/[/page/N/]、/genre/{slug}/[/page/N/]
 //       搜索型分类: /?s={kw}[&paged=N]（英字幕/中字幕，用搜索代替坏掉的 tag 页）
 // 详情: /jav/{番号slug}/  解析 data-post 得到 post_id
-// 播放: dooplayer API server1~3，收集后按手机友好度排序解码：
+// 播放: dooplayer API server1~3 并行收集，并行解码后按优先级取第一个成功：
 //   playmate系(playmate.to /embed/): POST {host}/api/s → sx(master.txt)，m3u8/分片无任何 header 要求，
-//              1080p，全链路无头可访问 → 优先级最高
+//              1080p，全链路无头可访问（实测分片无头 200）→ 优先级最高
+//   vidara系(shadowbyte.site /e/ 等): POST {host}/api/stream {filecode,...} → streaming_url(m3u8)，
+//              播放列表/分片无特殊 header 要求（实测 200/200）→ 次优先级（英字幕分类部分视频靠它）
+//   vidhide系(earnvidjavgg.xyz / streamhgjav.xyz): 解 Dean Edwards packer → links.hls2(m3u8)，
+//              无特殊 header 要求 → 再次优先级（CDN 按请求方网络签发 token；热门分类只有这系线路）
 //   f4s系(f4jav.xyz /e/): embed 页 data-video-id → GET {host}/api/play/{vid}?ab=0 → src(m3u8)，
-//              m3u8 强制要求 Origin 头（无头 403），token 带请求方指纹+5分钟时效 → 次优先级
-//   vidhide系(earnvidjavgg.xyz /embed/): 解 Dean Edwards packer → var links.hls2(m3u8) → 最低优先级
+//              m3u8 与分片都强制要求 Origin 头（实测无 Origin 全部 403），播放器内核不转发 → 最低优先级
 //   全部解不出 → 返回最高优先级 embed 页走 parse:1 嗅探
+// 提速(2026-10-20): 旧版串行收集 3 个 server + 串行解码，每步 25s 超时且 fetch 通道无超时，
+//   任一请求挂起整条链拖到分钟级，App 侧等不到结果直接报播放失败；最新分类也因此加载慢。
 
 const KEY = 'py_javgg';
 const NAME = 'JavGG';
@@ -66,6 +71,52 @@ function switchDomain(url, from, to) {
   return url.replace(from, to);
 }
 
+// 硬超时上限: 防止单个请求挂起拖死整条播放链（旧版 fetch 通道无超时是主要慢因）
+function withTimeout(p, ms) {
+  return Promise.race([
+    p,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms)),
+  ]);
+}
+
+// 等一组 promise 全部 settle 或超时(ms)即返回已拿到的结果（慢请求不阻塞整条链）
+function settleWithin(promises, ms) {
+  return new Promise((resolve) => {
+    const out = new Array(promises.length).fill(null);
+    if (!promises.length) { resolve(out); return; }
+    let done = 0;
+    const timer = setTimeout(() => resolve(out), ms);
+    promises.forEach((p, i) => {
+      Promise.resolve(p)
+        .then(v => { out[i] = v; }, () => {})
+        .finally(() => {
+          done++;
+          if (done === promises.length) { clearTimeout(timer); resolve(out); }
+        });
+    });
+  });
+}
+
+// tasks 已按优先级排序: 高优先级先成功就立刻返回，不等低优先级跑完
+function firstByPriority(tasks) {
+  return new Promise((resolve) => {
+    if (!tasks.length) { resolve(null); return; }
+    const results = new Array(tasks.length).fill(undefined);
+    const check = () => {
+      for (let i = 0; i < tasks.length; i++) {
+        if (results[i] === undefined) return; // 更高优先级还没出结果，继续等
+        if (results[i]) { resolve(results[i]); return; }
+      }
+      resolve(null);
+    };
+    tasks.forEach((task, i) => {
+      Promise.resolve()
+        .then(task)
+        .then(r => { results[i] = r || null; check(); }, () => { results[i] = null; check(); });
+    });
+  });
+}
+
 // 双通道: 先框架 req，失败再原生 fetch
 async function getTextInner(url, headers, minLen) {
   const h = {
@@ -77,14 +128,14 @@ async function getTextInner(url, headers, minLen) {
   };
   const need = minLen || 500;
   try {
-    const { data, status } = await req.get(url, { headers: h, timeout: 25000, responseType: 'text' });
+    const { data, status } = await req.get(url, { headers: h, timeout: 12000, responseType: 'text' });
     if (status === 200 && data) {
       const txt = typeof data === 'string' ? data : String(data);
       if (txt.length >= need) return txt;
     }
   } catch (e) { /* 换通道2 */ }
   try {
-    const r = await fetch(url, { headers: h });
+    const r = await withTimeout(fetch(url, { headers: h }), 12000);
     if (r.ok) {
       const txt = await r.text();
       if (txt.length >= need) return txt;
@@ -115,13 +166,13 @@ async function postJson(url, body, headers) {
   };
   const payload = JSON.stringify(body);
   try {
-    const { data, status } = await req.post(url, payload, { headers: h, timeout: 25000 });
+    const { data, status } = await req.post(url, payload, { headers: h, timeout: 12000 });
     if (status === 200 && data) {
       return typeof data === 'string' ? JSON.parse(data) : data;
     }
   } catch (e) { /* 换通道2 */ }
   try {
-    const r = await fetch(url, { method: 'POST', headers: h, body: payload });
+    const r = await withTimeout(fetch(url, { method: 'POST', headers: h, body: payload }), 12000);
     if (r.ok) return await r.json();
   } catch (e) { /* ignore */ }
   return null;
@@ -223,6 +274,10 @@ async function detail(reqIn) {
   const descM = html.match(/<meta property="og:description" content="([^"]+)"/);
   if (descM) content = clean(descM[1]);
 
+  // 把 postId 拼进 play id，play() 可直接调 dooplayer API，省掉再抓一次详情页
+  const postM = html.match(/data-post=['"](\d+)['"]/);
+  const postId = postM ? postM[1] : '';
+
   return {
     list: [{
       vod_id: durl,
@@ -230,7 +285,7 @@ async function detail(reqIn) {
       vod_pic: pic,
       vod_content: content,
       vod_play_from: 'JavGG',
-      vod_play_url: `正片$${durl}`,
+      vod_play_url: `正片$${postId ? postId + '$' + durl : durl}`,
     }],
   };
 }
@@ -303,6 +358,29 @@ async function tryVidhide(embedUrl, durl) {
   }
 }
 
+// vidara 系 (shadowbyte.site / dstyladsg.com / vidara*): embed 页 jwplayer 脚本
+// POST {origin}/api/stream {filecode, device:'ios', codecs:['h265']}（须带 Origin 头）
+// → JSON streaming_url(m3u8)，播放列表/分片无特殊头要求（2026-10-20 实测 200/200, 1080p）
+async function tryVidara(embedUrl, durl) {
+  try {
+    const u = new URL(embedUrl);
+    const code = u.pathname.split('/').filter(Boolean).pop() || '';
+    if (!code) return null;
+    const resp = await postJson(u.origin + '/api/stream',
+      { filecode: code, device: 'ios', codecs: ['h265'] },
+      { 'Referer': embedUrl, 'Origin': u.origin });
+    const src = resp && t(resp.streaming_url || resp.src || resp.url);
+    if (!src || !/^https?:\/\//.test(src)) return null;
+    return {
+      parse: 0,
+      url: src,
+      header: { 'User-Agent': UA, 'Referer': embedUrl },
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
 // playmate 系 (playmate.to /embed/): POST /api/s {c:filecode,d:'web'} → sx(master.txt)
 async function tryPlaymate(embedUrl, durl) {
   try {
@@ -322,12 +400,16 @@ async function tryPlaymate(embedUrl, durl) {
   }
 }
 
-// 播放: 收集 dooplayer server 1~3 的 embed，按解码优先级排序尝试
-// 优先级（按手机端友好程度实测排序）：
-//   playmate(最高优先: m3u8/分片无任何 header 要求, 1080p, 全链路无头可访问)
-//   f4s(次之: m3u8 强制要求 Origin 头、无头 403, token 带请求方指纹+5分钟时效, 播放器不转发 Origin 则必挂)
-//   vidhide(最低: 解包逻辑正确, 但其 CDN(acek-cdn.com) 无法从沙箱验证拉取, token 带 asn 参数)
-// 任一解码成功即 parse:0 直链；全部失败返回 embed 页走 parse:1 嗅探
+// 播放: 并行收集 dooplayer server 1~3 的 embed，并行解码，按优先级取第一个成功
+// 优先级（2026-10-20 实测）：
+//   playmate(最高: m3u8/分片无任何 header 要求, 1080p, 分片无头实测 200, 解码 2.7-4.0s)
+//   vidara(次之: shadowbyte 等, POST /api/stream 得 streaming_url, 播放列表/分片无头实测 200, 解码 ~1s;
+//          英字幕等分类的部分视频只有这条非 vidhide 线)
+//   vidhide(再次: 解包已实测正确, 无特殊头要求; CDN 按请求方网络签发 token,
+//          热门/英字幕/中字幕的大量视频只有 vidhide 系两条线(earnvidjavgg+streamhg))
+//   f4s(最低: m3u8 和分片都强制 Origin 头, 实测无 Origin 全 403, 播放器内核不转发 Origin → 手机端必挂)
+// 任一解码成功即 parse:0 直链；全部失败返回最高优先级 embed 页走 parse:1 嗅探
+// 旧版串行收集+串行解码, 每步 25s 超时叠加可达分钟级 → 最新能播但慢, 其他分类常被 App 播放超时误杀
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -345,7 +427,7 @@ async function play(reqIn) {
   } else if (/^https?:\/\//.test(id)) {
     durl = id;
     const html0 = await getText(durl);
-    const m0 = html0 ? html0.match(/data-post='(\d+)'/) : null;
+    const m0 = html0 ? html0.match(/data-post=['"](\d+)['"]/) : null;
     postId = m0 ? m0[1] : '';
   } else {
     postId = id.replace(/\D/g, '');
@@ -353,39 +435,48 @@ async function play(reqIn) {
   if (!postId) return { parse: 0, url: '' };
   if (!durl) durl = REFERER;
 
-  // 收集 3 个 server 的 embed
-  const embeds = [];
-  for (let srv = 1; srv <= 3; srv++) {
-    let apiText = '';
+  // 并行收集 3 个 server 的 embed（旧版串行：任一请求挂起都拖慢整条链）
+  const fetchEmbed = async (srv) => {
     try {
-      apiText = await getText(`${SITE}/wp-json/dooplayer/v2/${postId}/movie/${srv}`, { 'Accept': 'application/json' }, 10);
-    } catch (e) { continue; }
-    if (!apiText) continue;
-    let embedUrl = '';
-    try { embedUrl = t(JSON.parse(apiText).embed_url); } catch (e) { continue; }
-    if (!embedUrl || !/^https?:\/\//.test(embedUrl)) continue;
-    let host = '';
-    try { host = new URL(embedUrl).hostname; } catch (e) { continue; }
-    let prio = 99; // 其他(lulu等)最低
-    let decoder = null;
-    if (host.includes('playmate')) {
-      prio = 1; decoder = tryPlaymate;
-    } else if (host.includes('f4jav.xyz') || /\/e\/[A-Za-z0-9]+/.test(embedUrl)) {
-      prio = 2; decoder = tryF4s;
-    } else if (host.includes('earnvidjavgg') || host.includes('vidhide') || host.includes('streamhg')) {
-      prio = 3; decoder = tryVidhide;
-    }
-    embeds.push({ embedUrl, prio, decoder });
-  }
-
-  // 按优先级排序：playmate 优先，其次 f4s，再 vidhide
+      const apiText = await getText(`${SITE}/wp-json/dooplayer/v2/${postId}/movie/${srv}`, { 'Accept': 'application/json' }, 10);
+      if (!apiText) return null;
+      const embedUrl = t(JSON.parse(apiText).embed_url);
+      if (!embedUrl || !/^https?:\/\//.test(embedUrl)) return null;
+      const host = new URL(embedUrl).hostname;
+      let prio = 99; // 其他(lulu等)最低
+      let decoder = null;
+      if (host.includes('playmate')) {
+        prio = 1; decoder = tryPlaymate;
+      } else if (host.includes('shadowbyte') || host.includes('dstyladsg') || host.includes('vidara')) {
+        prio = 2; decoder = tryVidara;
+      } else if (host.includes('earnvidjavgg') || host.includes('vidhide') || host.includes('streamhg')) {
+        prio = 3; decoder = tryVidhide;
+      } else if (host.includes('f4jav') || host.includes('f4scdn') || /\/e\/[A-Za-z0-9]+/.test(embedUrl)) {
+        prio = 4; decoder = tryF4s;
+      }
+      return { embedUrl, prio, decoder };
+    } catch (e) { return null; }
+  };
+  // 收集限时 12s: 慢的 server 不阻塞已拿到的线路
+  const embeds = (await settleWithin([1, 2, 3].map(fetchEmbed), 12000)).filter(Boolean);
   embeds.sort((a, b) => a.prio - b.prio);
-  for (const e of embeds) {
-    if (!e.decoder) continue;
-    const direct = await e.decoder(e.embedUrl, durl);
-    if (direct) return direct;
+
+  // 并行解码，高优先级线路一成功立刻返回（不再逐个等超时，也不用等全部跑完）
+  // 整轮解码设 25s 总上限: 个别线路挂起时宁可走嗅探兜底, 也不让 App 等到播放超时
+  const decodable = embeds.filter(e => e.decoder);
+  if (decodable.length) {
+    const best = await withTimeout(
+      firstByPriority(decodable.map(e => () => e.decoder(e.embedUrl, durl))), 25000
+    ).catch(() => null);
+    if (best) return best;
+    // playmate 偶发响应慢/超时：并行一轮全失败时单独再给它一次机会（它是最稳的线）
+    const pm = decodable.find(e => e.prio === 1);
+    if (pm) {
+      const retry = await withTimeout(tryPlaymate(pm.embedUrl, durl), 12000).catch(() => null);
+      if (retry) return retry;
+    }
   }
-  // 没有直链：把第一个 embed 页交给播放器嗅探
+  // 没有直链：把最高优先级的 embed 页交给播放器嗅探
   if (embeds.length) {
     return { parse: 1, url: embeds[0].embedUrl, header: { 'User-Agent': UA, 'Referer': durl } };
   }
