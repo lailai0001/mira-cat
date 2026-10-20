@@ -1,7 +1,11 @@
 import req from '../../util/req.js';
 
 // SexTB (py_sextb)
-// 站点: https://sextb.net/ (JAV 在线站，Cloudflare WAF 拦机房 IP，用户手机网络可访问)
+// 站点: https://sextb.cc / https://sextb.net (JAV 在线站)
+// 重要: .net 在部分国家被封锁，站点官方指定备用域名 sextb.cc（首页横幅原话
+//       "Some countries have blocked our website, please use a backup domain name: SEXTB.CC")。
+//       spider 做双域名 failover: .cc 优先、.net 回退，再失败走 jina reader 兜底。
+//       两站结构完全一致。另有 Cloudflare WAF 拦机房 IP（25 字节 "Your request was blocked"）。
 // 列表: / (最新) / /genre/{slug}/[/pg-N/]  tray-item 卡片
 // 卡片: div.tray-item > a[href="/{code}"] > img.tray-item-thumbnail (封面取 data-src，src 是 default-cover 占位图)
 // 详情: GET /{code}  filmId + 服务器列表 (button.btn-player.episode[data-source][data-id]，如 F4/SW/PM/DD/FL/US)
@@ -9,15 +13,15 @@ import req from '../../util/req.js';
 //       2) f4 系 embed 页 data-api -> GET {host}/api/play/{vid}?ab=0 (带 Origin 头) -> src m3u8 直链；
 //       3) 其他服务器 POST /ajax/player {episode: episode_id, filmId} -> JSON.player HTML -> embed；
 //       4) 解不出的 embed 走 parse:1 嗅探。play 实时在用户手机上解析，token 按用户 IP 签发。
-// 注意: Cloudflare 拦截机房 IP，本机只能用 Wayback 存档 + jina 逆向，播放实测需用户真机验证。
 
 const KEY = 'py_sextb';
 const NAME = 'SexTB';
-const SITE = 'https://sextb.net';
+const HOSTS = ['https://sextb.cc', 'https://sextb.net'];
+const SITE = HOSTS[0];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const REFERER = SITE + '/';
 
-// 核心分类 + 精选题材 (2026-10-20 从 /genres 页实测 200，全部真实存在)
+// 核心分类 + 精选题材 (2026-10-20 从 /genres 页实测存在，两域名通用)
 const CATS = [
   { type_id: 'latest', type_name: '最新' },
   { type_id: 'censored', type_name: '有码', slug: 'censored' },
@@ -74,61 +78,169 @@ function fixUrl(u) {
   return SITE + '/' + u;
 }
 
-// 双通道: 先框架 req，失败再原生 fetch
-async function getHtml(url, extraHeaders) {
-  const headers = {
-    'User-Agent': UA,
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
-    'Referer': REFERER,
-    ...(extraHeaders || {}),
-  };
+// 判断返回内容是否为拦截/验证页 (Cloudflare WAF 拦截、托管挑战等)
+// 注意: 正常页面 head 里也含 challenges.cloudflare.com 的 CF 注入脚本，不能用它判定，
+// 只认拦截页特有的文案与标题
+function isBlockedPage(html) {
+  if (!html || typeof html !== 'string') return true;
+  if (html.length < 500) return true;
+  const head = html.slice(0, 3000);
+  if (/Your request was blocked/i.test(head)) return true;
+  if (/<title>[^<]*(Just a moment|Attention Required)/i.test(head)) return true;
+  if (/Performing security verification/i.test(head)) return true;
+  if (/Sorry, you have been blocked/i.test(head)) return true;
+  return false;
+}
+
+// 把任意本站 URL 拆成 path，候选域名按 [原域名, .cc, .net] 排序
+function hostOrder(url) {
+  const order = [];
+  const m = t(url).match(/^https?:\/\/([^/]+)/i);
+  if (m) {
+    const h = 'https://' + m[1].toLowerCase();
+    if (HOSTS.includes(h)) order.push(h);
+  }
+  for (const h of HOSTS) if (!order.includes(h)) order.push(h);
+  return order;
+}
+
+function pathOf(url) {
+  const u = t(url);
+  const m = u.match(/^https?:\/\/[^/]+(\/.*)$/i);
+  if (m) return m[1];
+  return u.startsWith('/') ? u : '/' + u;
+}
+
+// 带超时的原生 fetch 取文本
+async function timedFetchText(url, headers, timeoutMs) {
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), timeoutMs || 25000);
+  try {
+    const r = await fetch(url, { headers, signal: ctl.signal });
+    if (!r.ok) return '';
+    return await r.text();
+  } catch (e) {
+    return '';
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+// 单次取页面 (req 通道 + fetch 通道)，命中拦截页视为失败
+async function rawGet(url, headers, timeoutMs) {
+  const to = timeoutMs || 25000;
   // 通道1: 框架 req
   try {
-    const { data, status } = await req.get(url, { headers, timeout: 25000 });
-    if (status === 200 && typeof data === 'string' && data.length > 1000) return data;
-    if (status === 200 && data) return typeof data === 'string' ? data : '';
+    const { data, status } = await req.get(url, { headers, timeout: to });
+    if (status === 200 && typeof data === 'string' && !isBlockedPage(data)) return data;
   } catch (e) { /* 换通道2 */ }
   // 通道2: 原生 fetch
+  const txt = await timedFetchText(url, headers, to);
+  if (txt && !isBlockedPage(txt)) return txt;
+  return '';
+}
+
+function pageHeaders(referer, extraHeaders) {
+  return {
+    'User-Agent': UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Dest': 'document',
+    'Referer': referer || REFERER,
+    ...(extraHeaders || {}),
+  };
+}
+
+// 兜底通道: jina reader 取原始 HTML (直连全失败时使用)
+async function fetchViaJina(host, path) {
+  const jinaUrl = 'https://r.jina.ai/' + host + path;
+  const headers = {
+    'User-Agent': UA,
+    'x-respond-with': 'html',
+  };
   try {
-    const r = await fetch(url, { headers });
-    if (r.ok) {
-      const txt = await r.text();
-      if (txt.length > 1000) return txt;
+    const { data, status } = await req.get(jinaUrl, { headers, timeout: 40000 });
+    if (status === 200 && typeof data === 'string' && !isBlockedPage(data)) {
+      if (data.includes('tray-item') || data.length > 5000) return data;
     }
-  } catch (e) { /* ignore */ }
+  } catch (e) { /* 换 fetch */ }
+  const txt = await timedFetchText(jinaUrl, headers, 40000);
+  if (txt && !isBlockedPage(txt) && txt.length > 5000) return txt;
+  return '';
+}
+
+// 多域名 failover 取页面: 逐个域名直连，全失败再逐个域名走 jina 兜底
+// 注意: 非本站 URL (如 f4scdn embed 页) 不做域名替换，直接原 URL 请求
+async function getHtml(url, extraHeaders) {
+  const m = t(url).match(/^https?:\/\/([^/]+)/i);
+  const host = m ? m[1].toLowerCase() : '';
+  if (!/sextb\.(net|cc)$/.test(host)) {
+    return rawGet(url, pageHeaders(m ? 'https://' + host + '/' : REFERER, extraHeaders));
+  }
+  const path = pathOf(url);
+  const hosts = hostOrder(url);
+  for (const h of hosts) {
+    const html = await rawGet(h + path, pageHeaders(h + '/', extraHeaders));
+    if (html) return html;
+  }
+  for (const h of hosts) {
+    const html = await fetchViaJina(h, path);
+    if (html) return html;
+  }
   return '';
 }
 
 async function postJson(url, body, extraHeaders) {
-  const headers = {
-    'User-Agent': UA,
-    'Referer': REFERER,
-    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-    'Accept': 'application/json, text/javascript, */*; q=0.01',
-    ...(extraHeaders || {}),
-  };
+  const path = pathOf(url);
+  const hosts = hostOrder(url);
   const data = new URLSearchParams(body).toString();
-  // 通道1: 框架 req
-  try {
-    const { data: res, status } = await req.post(url, data, { headers, timeout: 25000 });
-    if (status === 200 && res != null) return typeof res === 'string' ? res : JSON.stringify(res);
-  } catch (e) { /* 换通道2 */ }
-  // 通道2: 原生 fetch
-  try {
-    const r = await fetch(url, { method: 'POST', headers, body: data });
-    if (r.ok) return await r.text();
-  } catch (e) { /* ignore */ }
+  for (const host of hosts) {
+    const headers = {
+      'User-Agent': UA,
+      'Referer': host + '/',
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      'X-Requested-With': 'XMLHttpRequest',
+      ...(extraHeaders || {}),
+    };
+    // 若调用方给了 Referer (详情页)，换成当前域名同路径
+    if (headers.Referer && /sextb\.(net|cc)/i.test(headers.Referer) && !headers.Referer.startsWith(host)) {
+      headers.Referer = host + pathOf(headers.Referer);
+    }
+    const full = host + path;
+    // 通道1: 框架 req
+    try {
+      const { data: res, status } = await req.post(full, data, { headers, timeout: 25000 });
+      if (status === 200 && res != null) {
+        const s = typeof res === 'string' ? res : JSON.stringify(res);
+        if (s && !isBlockedPage(s)) return s;
+      }
+    } catch (e) { /* 换通道2 */ }
+    // 通道2: 原生 fetch (带超时)
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort(), 25000);
+    try {
+      const r = await fetch(full, { method: 'POST', headers, body: data, signal: ctl.signal });
+      if (r.ok) {
+        const txt = await r.text();
+        if (txt && !isBlockedPage(txt)) return txt;
+      }
+    } catch (e) { /* ignore */ } finally { clearTimeout(to); }
+  }
   return '';
 }
 
 // 解析视频卡片: div.tray-item > a[href="/{code}"] > img.tray-item-thumbnail
-// 注意: 站点懒加载，真实封面在 data-src，src 是 default-cover.jpg 占位图
-// 排除预告片块 (div.tray-item-trailer，data-link 指向 /genre/xxx)
+// 注意: 1) 站点懒加载，真实封面在 data-src，src 是 default-cover.jpg 占位图；
+//       2) 卡片 class 带修饰时 (如 "tray-item tray-item-uncensored") 也要匹配，
+//          但 tray-item-trailer 预告片块与 tray-item-* 子元素要排除；
+//       3) href 域名兼容 .net/.cc。
 function parseCards(html) {
   const out = [];
   const seen = new Set();
-  const re = /<div class="tray-item">\s*<a\s[^>]*href="(?:https?:\/\/sextb\.net)?(\/[a-z0-9][a-z0-9\-]{3,40})"[^>]*>/gi;
+  const re = /<div class="tray-item(?:\s[^"]*)?">\s*<a\s[^>]*href="(?:https?:\/\/sextb\.(?:net|cc))?(\/[a-z0-9][a-z0-9\-]{3,40})"[^>]*>/gi;
   let m;
   while ((m = re.exec(html)) !== null) {
     const path = m[1];
@@ -285,7 +397,7 @@ async function detail(reqIn) {
   const tm = html.match(/<title>([^<]*)<\/title>/);
   if (tm) name = clean(tm[1]).replace(/\s*-\s*SEXTB.*$/i, '').replace(/Free JAV.*$/i, '').trim();
   // 封面: 优先页面内的 webp poster (cdn001.imggle.net 公开 CDN，直读 200)，
-  // 其次 video 标签 poster，再 og:image (cdna.sextb.net，经 Cloudflare)
+  // 其次 video 标签 poster，再 og:image
   let pic = '';
   const wm = html.match(/data-src="(https?:\/\/cdn001\.imggle\.net\/webp\/poster[^"]+)"/);
   if (wm) pic = wm[1];

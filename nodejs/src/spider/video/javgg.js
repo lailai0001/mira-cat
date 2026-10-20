@@ -6,11 +6,13 @@ import req from '../../util/req.js';
 // 列表: /new-post/[/page/N/]、/trending/[/page/N/]、/genre/{slug}/[/page/N/]
 //       搜索型分类: /?s={kw}[&paged=N]（英字幕/中字幕，用搜索代替坏掉的 tag 页）
 // 详情: /jav/{番号slug}/  解析 data-post 得到 post_id
-// 播放: dooplayer API server1~3，逐个解码：
-//   f4s系(f4jav.xyz /e/): embed 页 data-video-id → GET {host}/api/play/{vid}?ab=0 → src(m3u8)，需 Origin header
-//   vidhide系(earnvidjavgg.xyz /embed/): 解 Dean Edwards packer → var links.hls2(m3u8)
-//   playmate系(playmate.to /embed/): POST {host}/api/s {c:code,d:'web'} → sx(master.txt)
-//   全部解不出 → 返回 embed 页走 parse:1 嗅探
+// 播放: dooplayer API server1~3，收集后按手机友好度排序解码：
+//   playmate系(playmate.to /embed/): POST {host}/api/s → sx(master.txt)，m3u8/分片无任何 header 要求，
+//              1080p，全链路无头可访问 → 优先级最高
+//   f4s系(f4jav.xyz /e/): embed 页 data-video-id → GET {host}/api/play/{vid}?ab=0 → src(m3u8)，
+//              m3u8 强制要求 Origin 头（无头 403），token 带请求方指纹+5分钟时效 → 次优先级
+//   vidhide系(earnvidjavgg.xyz /embed/): 解 Dean Edwards packer → var links.hls2(m3u8) → 最低优先级
+//   全部解不出 → 返回最高优先级 embed 页走 parse:1 嗅探
 
 const KEY = 'py_javgg';
 const NAME = 'JavGG';
@@ -320,8 +322,12 @@ async function tryPlaymate(embedUrl, durl) {
   }
 }
 
-// 播放: 依次试 dooplayer server 1~3，每个 embed 按域名选择解码器
-// f4s → api/play 直链；vidhide → 解包直链；playmate → api/s 直链；其他(lulu等) → 嗅探
+// 播放: 收集 dooplayer server 1~3 的 embed，按解码优先级排序尝试
+// 优先级（按手机端友好程度实测排序）：
+//   playmate(最高优先: m3u8/分片无任何 header 要求, 1080p, 全链路无头可访问)
+//   f4s(次之: m3u8 强制要求 Origin 头、无头 403, token 带请求方指纹+5分钟时效, 播放器不转发 Origin 则必挂)
+//   vidhide(最低: 解包逻辑正确, 但其 CDN(acek-cdn.com) 无法从沙箱验证拉取, token 带 asn 参数)
+// 任一解码成功即 parse:0 直链；全部失败返回 embed 页走 parse:1 嗅探
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -347,7 +353,8 @@ async function play(reqIn) {
   if (!postId) return { parse: 0, url: '' };
   if (!durl) durl = REFERER;
 
-  let firstEmbed = '';
+  // 收集 3 个 server 的 embed
+  const embeds = [];
   for (let srv = 1; srv <= 3; srv++) {
     let apiText = '';
     try {
@@ -357,24 +364,30 @@ async function play(reqIn) {
     let embedUrl = '';
     try { embedUrl = t(JSON.parse(apiText).embed_url); } catch (e) { continue; }
     if (!embedUrl || !/^https?:\/\//.test(embedUrl)) continue;
-    if (!firstEmbed) firstEmbed = embedUrl;
-
     let host = '';
     try { host = new URL(embedUrl).hostname; } catch (e) { continue; }
-
-    let direct = null;
-    if (host.includes('f4jav.xyz') || /\/e\/[A-Za-z0-9]+/.test(embedUrl)) {
-      direct = await tryF4s(embedUrl, durl);
+    let prio = 99; // 其他(lulu等)最低
+    let decoder = null;
+    if (host.includes('playmate')) {
+      prio = 1; decoder = tryPlaymate;
+    } else if (host.includes('f4jav.xyz') || /\/e\/[A-Za-z0-9]+/.test(embedUrl)) {
+      prio = 2; decoder = tryF4s;
     } else if (host.includes('earnvidjavgg') || host.includes('vidhide') || host.includes('streamhg')) {
-      direct = await tryVidhide(embedUrl, durl);
-    } else if (host.includes('playmate')) {
-      direct = await tryPlaymate(embedUrl, durl);
+      prio = 3; decoder = tryVidhide;
     }
+    embeds.push({ embedUrl, prio, decoder });
+  }
+
+  // 按优先级排序：playmate 优先，其次 f4s，再 vidhide
+  embeds.sort((a, b) => a.prio - b.prio);
+  for (const e of embeds) {
+    if (!e.decoder) continue;
+    const direct = await e.decoder(e.embedUrl, durl);
     if (direct) return direct;
   }
-  // 没有直链：把 embed 页交给播放器嗅探
-  if (firstEmbed) {
-    return { parse: 1, url: firstEmbed, header: { 'User-Agent': UA, 'Referer': durl } };
+  // 没有直链：把第一个 embed 页交给播放器嗅探
+  if (embeds.length) {
+    return { parse: 1, url: embeds[0].embedUrl, header: { 'User-Agent': UA, 'Referer': durl } };
   }
   return { parse: 0, url: '' };
 }

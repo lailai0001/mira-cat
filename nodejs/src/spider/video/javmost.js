@@ -5,9 +5,12 @@ import req from '../../util/req.js';
 // 列表: / (最新, 25条/页, 翻页 /category/all/page/N/)
 // 注意: / (最新) 与 /category/all/ (全部) 是站点本身设计的同一页面，内容完全一致，非 spider bug
 // 分类: /category/{all|censor|uncensor}/[/page/N/] (25条/页)
+// 题材: /category/{Genre Slug}/[/page/N/] (巨乳/中出/人妻等，站点 /allcategory 实测)
 // 热门: /topview|/topdaily|/topweek|/topmonth (25条/页, 翻页 /{slug}/all/page/N/)
 // 系列: /code/{CODE}/[/page/N/] (25条/页)
 // 标签: /tag/{TAG}/ (仅第1页可用，翻页 410，站点限制)
+// 无码流出: /tag/REDUCING/ 翻页 410 不可用; 改走 /search/REDUCING/[/page/N/]
+//           (实测与 tag 页第1页内容完全一致，搜索支持翻页)
 // 搜索: /search/{kw}/[/page/N/]
 // 详情: /{CODE}/ 标题+封面从 JSON-LD 取
 // 播放: 三步走。1) 服务端 POST /ri3123o235r/ (必须带 X-Requested-With: XMLHttpRequest 头，
@@ -24,19 +27,30 @@ const SITE = 'https://www.javmost.ws';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const REFERER = SITE + '/';
 
-// 17 个真实分类 (2026-10-20 从站点导航与番号索引实测)
+// 33 个真实分类 (2026-10-20 从站点导航、/allcategory、/allcode 实测)
 // 注意: latest(最新) 与 all(全部) 是站点本身的同一页面，内容一致
-// tag:REDUCING 为"减少马赛克/无码流出"标签页 (与 tag:MOSAIC 内容完全相同，只收录其一)
+// 无码流出: search:REDUCING 走搜索路径 (与 /tag/REDUCING/ 第1页内容一致，支持翻页;
+//   tag 页翻页 410 不可用)。genre 为 /allcategory 的题材分类，code 为 /allcode 的系列
 const CATS = [
   { type_id: 'latest', type_name: '最新' },
   { type_id: 'all', type_name: '全部' },
   { type_id: 'censor', type_name: '有码' },
   { type_id: 'uncensor', type_name: '无码' },
-  { type_id: 'tag:REDUCING', type_name: '无码流出' },
+  { type_id: 'search:REDUCING', type_name: '无码流出' },
   { type_id: 'topview', type_name: '小时热门' },
   { type_id: 'topdaily', type_name: '日热门' },
   { type_id: 'topweek', type_name: '周热门' },
   { type_id: 'topmonth', type_name: '月热门' },
+  { type_id: 'genre:Big Tits', type_name: '巨乳' },
+  { type_id: 'genre:Creampie', type_name: '中出' },
+  { type_id: 'genre:Married Woman', type_name: '人妻' },
+  { type_id: 'genre:School Girls', type_name: '学生' },
+  { type_id: 'genre:Slender', type_name: '苗条' },
+  { type_id: 'genre:Solowork', type_name: '独角戏' },
+  { type_id: 'genre:Squirting', type_name: '潮吹' },
+  { type_id: 'genre:Amateur', type_name: '素人' },
+  { type_id: 'genre:Drama', type_name: '剧情' },
+  { type_id: 'genre:Cowgirl', type_name: '女上位' },
   { type_id: 'code:SNIS', type_name: 'SNIS系列' },
   { type_id: 'code:IPZ', type_name: 'IPZ系列' },
   { type_id: 'code:JUX', type_name: 'JUX系列' },
@@ -45,6 +59,12 @@ const CATS = [
   { type_id: 'code:MIDE', type_name: 'MIDE系列' },
   { type_id: 'code:WANZ', type_name: 'WANZ系列' },
   { type_id: 'code:STAR', type_name: 'STAR系列' },
+  { type_id: 'code:HEYZO', type_name: 'HEYZO系列' },
+  { type_id: 'code:JUC', type_name: 'JUC系列' },
+  { type_id: 'code:JUFD', type_name: 'JUFD系列' },
+  { type_id: 'code:LUXU', type_name: 'LUXU系列' },
+  { type_id: 'code:EBOD', type_name: 'EBOD系列' },
+  { type_id: 'code:RBD', type_name: 'RBD系列' },
 ];
 
 // 非视频的单段路径，解析卡片时跳过
@@ -154,10 +174,22 @@ function buildList(url, page, limit) {
 
 function catUrl(tid, page) {
   page = Math.max(1, page);
-  // 标签分类: tag:REDUCING -> /tag/REDUCING/ (仅第1页，翻页 410)
+  // 标签分类: tag:X -> /tag/X/ (仅第1页，翻页 410)
   if (tid.startsWith('tag:')) {
     const tag = tid.slice(4);
     return `${SITE}/tag/${encodeURIComponent(tag)}/`;
+  }
+  // 搜索型分类: search:REDUCING -> /search/REDUCING/[/page/N/] (支持翻页)
+  if (tid.startsWith('search:')) {
+    const kw = tid.slice(7);
+    if (page <= 1) return `${SITE}/search/${encodeURIComponent(kw)}/`;
+    return `${SITE}/search/${encodeURIComponent(kw)}/page/${page}/`;
+  }
+  // 题材分类: genre:Big Tits -> /category/Big%20Tits/[/page/N/]
+  if (tid.startsWith('genre:')) {
+    const slug = tid.slice(6);
+    if (page <= 1) return `${SITE}/category/${encodeURIComponent(slug)}/`;
+    return `${SITE}/category/${encodeURIComponent(slug)}/page/${page}/`;
   }
   // 系列分类: code:SNIS -> /code/SNIS/
   if (tid.startsWith('code:')) {
