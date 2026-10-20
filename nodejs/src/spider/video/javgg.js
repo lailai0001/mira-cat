@@ -22,6 +22,13 @@ import req from '../../util/req.js';
 //   等 2.5s 宽限盼高优先级，最高优先级成功立即返回）；没有这两类线路或竞速失败，立刻
 //   parse:1 嗅探，目标 vidhide 第一（同系保持 server 顺序）> f4 > other > 第一条 embed。
 //   不解 vidhide、不等待。（第二轮的 detail 预解码缓存 + vidhide 直解已被真机证伪，整套删除。）
+// 第四轮(2026-10-20): 第三轮嗅探真机仍全灭。矩阵实验定版根因: vidhide 流媒体层按
+//   请求方网络身份放行（hls2 CDN 连接层切断、earnvid /stream/ 回 403），换任何请求头
+//   都不变，token 按铸造时请求方的网络签发(asn= 明文可见，e=129600 非短时效问题)。
+//   → vidhide 改走全链代理 Worker(javgg-vidhide-worker.js): 抓 embed、解包铸 token、
+//   拉列表、透传分片全在 Worker 同一出口完成，播放器只连 Worker、零自定义头。
+//   Worker 本体已在 VM 用真实样本全链验证（/v 200、719 分片全经 /s 200、Range 206）。
+//   下方 VIDHIDE_WORKER 常量填入部署地址后生效；留空则 vidhide 维持第三轮嗅探行为。
 
 const KEY = 'py_javgg';
 const NAME = 'JavGG';
@@ -29,6 +36,10 @@ const SITE = 'https://javgg.net';
 const BACKUP_SITE = 'https://javgg.co';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const REFERER = SITE + '/';
+// vidhide 全链代理 Worker 基址（用户手动部署 javgg-vidhide-worker.js 后填入，
+// 如 'https://javgg-vidhide.li768435813.workers.dev'）。留空 = 未部署，
+// vidhide 线路维持第三轮的 parse:1 嗅探行为。
+const VIDHIDE_WORKER = 'https://javgg-vidhide.li768435813.workers.dev';
 
 // 10 个真实分类 (2026-10-20 实测，javgg.net/.co 均 200 且有内容)
 // kind: 'path' 普通列表页翻页 /page/N/；'search' 搜索页翻页 &paged=N
@@ -427,7 +438,20 @@ async function play(reqIn) {
     }
   }
 
-  // 2) 嗅探：vidhide 第一（同系多条保持 server 顺序，earnvid 在前）> f4 > other > 第一条。
+  // 2) vidhide 系：已部署全链代理 Worker 时走 Worker —— play 返回 parse:0 的
+  //    Worker /v 地址，铸 token/拉列表/拉分片全在 Worker 同一出口完成，
+  //    播放器不需要任何自定义头（真机已证播放器不透传 play 的 header 到分片）。
+  //    未部署（常量为空）则不进此分支，维持第三轮嗅探。
+  const vh = embeds.find(e => e.kind === 'vidhide');
+  if (VIDHIDE_WORKER && vh) {
+    return {
+      parse: 0,
+      url: VIDHIDE_WORKER + '/v?u=' + encodeURIComponent(vh.embedUrl) + '&r=' + encodeURIComponent(durl),
+      header: { 'User-Agent': UA, 'Referer': durl },
+    };
+  }
+
+  // 3) 嗅探：vidhide 第一（同系多条保持 server 顺序，earnvid 在前）> f4 > other > 第一条。
   //    vidhide 直链的 token 按解码出口的 ASN 签发、真机全灭，只有让播放器在 embed 页的
   //    网页会话里自己取流才绕得开；f4 强制 Origin 同理。立刻返回，不解码、不等待。
   const sniff = embeds.find(e => e.kind === 'vidhide')
