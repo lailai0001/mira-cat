@@ -5,26 +5,23 @@ import req from '../../util/req.js';
 // 注意: javgg.co 的 /tag/* 归档页全部 500（站方镜像配置坏了），字幕分类改走搜索替代
 // 列表: /new-post/[/page/N/]、/trending/[/page/N/]、/genre/{slug}/[/page/N/]
 //       搜索型分类: /?s={kw}[&paged=N]（英字幕/中字幕，用搜索代替坏掉的 tag 页）
-// 详情: /jav/{番号slug}/  解析 data-post 得到 post_id
-// 播放: dooplayer API server1~3 并行收集 embed，按宿主分线解码：
+// 详情: /jav/{番号slug}/  解析 data-post 得到 post_id，透传进 play 的 id
+// 播放: dooplayer API server1~3 并行收集 embed，按宿主分线：
 //   playmate系(playmate.to /embed/): POST {host}/api/s → sx(master.txt)，m3u8/分片无任何 header 要求，
-//              1080p，全链路无头可访问 → 最可靠的直链
+//              1080p，全链路无头可访问 → spider 直解
 //   vidara系(shadowbyte.site /e/ 等): POST {host}/api/stream {filecode,...} → streaming_url(m3u8)，
-//              播放列表/分片无特殊 header 要求 → 次可靠的直链（英字幕分类部分视频靠它）
-//   vidhide系(earnvidjavgg.xyz / streamhgjav.xyz): 解 Dean Edwards packer → links.hls2(m3u8)。
-//              解码只有一步 embed 页 GET，但该宿主响应方差极大（实测 1.3s~16s），且其 CDN
-//              (acek-cdn/dramiyos-cdn/premilkyway) 按请求方网络(ASN)签发 token，
-//              m3u8/分片只能由与解码同一网络的播放端拉取（spider 与播放器同在手机端，天然一致）
-//   f4s系(f4jav.xyz /e/): m3u8 与分片都强制 Origin 头，播放器内核不转发 → spider 直返必挂，
-//              只作嗅探兜底（浏览器发请求自带 Origin）
-// 播放策略(2026-10-20 第二轮): 上一轮把解码全放在 play() 里现解，实测 play 耗时 3.4~16.1s，
-//   超过 App 播放等待 → 只有线路最快的最新/无码/高清无码能播，vidhide 为主的分类全灭。改为：
-//   1) detail() 阶段就后台预解码并缓存（模块级 Map，TTL 10 分钟），play() 命中缓存毫秒级直返；
-//   2) 未命中时 play() 最多等约 8s（预解码在底层继续，完成后写入缓存，下次点击即直达），
-//      超时/失败立刻落 parse:1 嗅探 vidhide/f4 的 embed 页，让播放器在网页环境里自己走
-//      播放器逻辑（令牌与会话天然一致），不再硬等到 App 超时；
-//   3) 解码竞速改为“高优先级优先 + 低优先级先成功只等 2.5s 宽限”，消除上一轮
-//      firstByPriority 被排位靠前的慢线路堵住已成功线路的问题。
+//              播放列表/分片无特殊 header 要求 → spider 直解（英字幕分类部分视频靠它）
+//   vidhide系(earnvidjavgg.xyz / streamhgjav.xyz): 不再 spider 侧解码。其 m3u8 带 asn= 参数，
+//              token 按解码请求方的网络(ASN)签发，真机实测：哪怕 spider 在 detail 阶段预解码好
+//              直链，播放器拉流时仍被 CDN 拒（全灭）。embed 页普通 GET 200、内联 packer 解开后
+//              含完整 hls2 与 jwplayer setup → 改走 parse:1 嗅探 embed 页，让播放器在网页会话内
+//              自己取流，令牌与会话同源，绕开 ASN 绑定。
+//   f4系(f4jav.xyz /e/): m3u8 与分片都强制 Origin 头，播放器内核不转发 → spider 直返必挂，
+//              同样只作 parse:1 嗅探（浏览器发请求自带 Origin）
+// 播放策略(2026-10-20 第三轮): 只对 playmate/vidara 两类竞速直解（预算 13s、低优先级先成功
+//   等 2.5s 宽限盼高优先级，最高优先级成功立即返回）；没有这两类线路或竞速失败，立刻
+//   parse:1 嗅探，目标 vidhide 第一（同系保持 server 顺序）> f4 > other > 第一条 embed。
+//   不解 vidhide、不等待。（第二轮的 detail 预解码缓存 + vidhide 直解已被真机证伪，整套删除。）
 
 const KEY = 'py_javgg';
 const NAME = 'JavGG';
@@ -306,11 +303,6 @@ async function detail(reqIn) {
   const postM = html.match(/data-post=['"](\d+)['"]/);
   const postId = postM ? postM[1] : '';
 
-  // 关键（第二轮）：detail 阶段就启动后台预解码并缓存结果。
-  // 用户看详情页的几秒里把慢线路（尤其 vidhide）解完，点播放时 play() 命中缓存直接返回，
-  // 不再让 App 在播放环节干等十几秒。fire-and-forget，不阻塞 detail 返回。
-  if (postId) prefetch(postId, durl);
-
   return {
     list: [{
       vod_id: durl,
@@ -323,47 +315,7 @@ async function detail(reqIn) {
   };
 }
 
-// ---- 播放解码 ----
-
-// Dean Edwards packer 解包
-function unpackDean(p, a, c, k) {
-  const chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  const tok = (n) => {
-    let s = '';
-    if (n === 0) return '0';
-    while (n > 0) { s = chars[n % a] + s; n = Math.floor(n / a); }
-    return s;
-  };
-  for (let i = c - 1; i >= 0; i--) {
-    if (k[i]) {
-      const re = new RegExp('\\b' + tok(i).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
-      p = p.replace(re, k[i]);
-    }
-  }
-  return p;
-}
-
-// vidhide 系 (earnvidjavgg.xyz / streamhgjav.xyz): 解 packer → var links.hls2(m3u8)
-// 只有一步 embed 页 GET；慢全在该宿主的响应方差上（实测 1.3s~16s）
-async function tryVidhide(embedUrl, durl, timeoutMs) {
-  try {
-    const html = await getText(embedUrl, { 'Referer': durl }, 500, timeoutMs);
-    if (!html || !html.includes('eval(function(p,a,c,k,e,d)')) return null;
-    const m = html.match(/eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)/s);
-    if (!m) return null;
-    const dec = unpackDean(m[1], parseInt(m[2], 10), parseInt(m[3], 10), m[4].split('|'));
-    const lm = dec.match(/["']hls2["']\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/);
-    const src = lm ? lm[1] : (dec.match(/https?:\/\/[^\s"']+\.m3u8[^\s"']*/) || [])[0];
-    if (!src) return null;
-    return {
-      parse: 0,
-      url: src,
-      header: { 'User-Agent': UA, 'Referer': embedUrl },
-    };
-  } catch (e) {
-    return null;
-  }
-}
+// ---- 播放解码（只有 playmate / vidara 两类在 spider 侧直解） ----
 
 // vidara 系 (shadowbyte.site / dstyladsg.com / vidara*):
 // POST {origin}/api/stream {filecode, device:'ios', codecs:['h265']}（须带 Origin 头）
@@ -407,13 +359,13 @@ async function tryPlaymate(embedUrl, durl, timeoutMs) {
   }
 }
 
-// 线路收集 + 分类（play 与预解码共用）
+// 线路收集 + 分类（decoder 只给 playmate/vidara；vidhide/f4/other 一律走嗅探）
 function classifyEmbed(embedUrl) {
   let host = '';
   try { host = new URL(embedUrl).hostname; } catch (e) { return null; }
   if (host.includes('playmate')) return { embedUrl, prio: 1, kind: 'playmate', decoder: tryPlaymate };
   if (host.includes('shadowbyte') || host.includes('dstyladsg') || host.includes('vidara')) return { embedUrl, prio: 2, kind: 'vidara', decoder: tryVidara };
-  if (host.includes('earnvidjavgg') || host.includes('vidhide') || host.includes('streamhg')) return { embedUrl, prio: 3, kind: 'vidhide', decoder: tryVidhide };
+  if (host.includes('earnvidjavgg') || host.includes('vidhide') || host.includes('streamhg')) return { embedUrl, prio: 3, kind: 'vidhide', decoder: null };
   if (host.includes('f4jav') || host.includes('f4scdn') || /\/e\/[A-Za-z0-9]+/.test(embedUrl)) return { embedUrl, prio: 4, kind: 'f4', decoder: null };
   return { embedUrl, prio: 99, kind: 'other', decoder: null };
 }
@@ -434,64 +386,7 @@ async function collectEmbeds(postId) {
   return embeds;
 }
 
-// ---- 解码缓存（detail 预解码的核心）----
-// key = postId；缓存线路列表、最终直链结果和进行中的解码 promise。
-// vidhide 的 m3u8 URL 里 token 时效以天计（e=129600s），缓存 10 分钟足够安全。
-const DECODE_TTL = 10 * 60 * 1000;
-const decodeCache = new Map(); // postId -> { at, embeds, result, promise }
-
-function cacheGet(postId) {
-  const e = decodeCache.get(postId);
-  if (!e) return null;
-  if (Date.now() - e.at > DECODE_TTL) { decodeCache.delete(postId); return null; }
-  return e;
-}
-
-function cacheSet(postId, patch) {
-  let e = decodeCache.get(postId);
-  if (!e) { e = { at: Date.now(), embeds: null, result: null, promise: null }; decodeCache.set(postId, e); }
-  Object.assign(e, patch);
-  e.at = Date.now();
-  if (decodeCache.size > 300) decodeCache.delete(decodeCache.keys().next().value);
-  return e;
-}
-
-// 完整解码管线：收集线路 → 并行解码（playmate/vidara/vidhide；f4 直返必挂不参与）
-// budgetMs 为整轮竞速预算（到点返回已有最好结果）；单请求超时沿用通道默认 12s，
-// 因为竞速层会兜住总时间，预解码在后台跑更需要把慢线路等出结果而不是早早放弃。
-async function resolveDirect(postId, durl, budgetMs) {
-  const entry = cacheGet(postId);
-  let embeds = entry && entry.embeds;
-  if (!embeds) {
-    embeds = await collectEmbeds(postId);
-    cacheSet(postId, { embeds });
-  }
-  const cands = embeds.filter(e => e.decoder);
-  if (!cands.length) return null;
-  const res = await bestWithin(
-    cands.map(e => ({ prio: e.prio, run: () => e.decoder(e.embedUrl, durl) })),
-    budgetMs, 2500
-  );
-  if (res) cacheSet(postId, { result: res });
-  return res;
-}
-
-// 启动/复用一次后台解码（detail 预解码与 play 现解共用同一个 promise，不重复发请求）
-function prefetch(postId, durl) {
-  if (!postId) return null;
-  const entry = cacheGet(postId);
-  if (entry && entry.result) return Promise.resolve(entry.result);
-  if (entry && entry.promise) return entry.promise;
-  const p = resolveDirect(postId, durl, 30000).catch(() => null);
-  cacheSet(postId, { promise: p });
-  p.then(() => {
-    const e = cacheGet(postId);
-    if (e && e.promise === p) cacheSet(postId, { promise: null });
-  });
-  return p;
-}
-
-// 播放: 缓存直达 → 限时等预解码（约 8s）→ parse:1 嗅探兜底，全程有界，绝不拖到 App 超时
+// 播放: playmate/vidara 竞速直解 → 没有或失败立刻 parse:1 嗅探，全程不解 vidhide
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -517,32 +412,32 @@ async function play(reqIn) {
   if (!postId) return { parse: 0, url: '' };
   if (!durl) durl = REFERER;
 
-  // 1) 缓存直达：detail 阶段已预解码完成，毫秒级返回（能播分类的速度也由此改善：
-  //    线路列表已随预解码缓存，play 不再重抓 dooplayer，更不用重解一遍）
-  const entry = cacheGet(postId);
-  if (entry && entry.result) return entry.result;
+  const embeds = await collectEmbeds(postId);
 
-  // 2) 等预解码/现解，总等待约 8s 封顶。底层解码（30s 预算）不会被取消：
-  //    即使这次等超时，它完成后会写缓存，用户再点一次即直达。
-  const p = prefetch(postId, durl);
-  if (p) {
-    const res = await withTimeout(p, 8000).catch(() => null);
-    if (res) return res;
-    const e2 = cacheGet(postId);
-    if (e2 && e2.result) return e2.result;
+  // 1) 只对带解码器的 playmate/vidara 竞速直解：最高优先级成功立即返回，
+  //    低优先级先成功等 2.5s 宽限盼高优先级，整轮预算 13s
+  const cands = embeds.filter(e => e.decoder && (e.kind === 'playmate' || e.kind === 'vidara'));
+  if (cands.length) {
+    const res = await bestWithin(
+      cands.map(e => ({ prio: e.prio, run: () => e.decoder(e.embedUrl, durl) })),
+      13000, 2500
+    );
+    if (res && res.url) {
+      return { parse: 0, url: res.url, header: { 'User-Agent': UA, 'Referer': durl } };
+    }
   }
 
-  // 3) 嗅探兜底：优先 vidhide 的 embed 页，其次 f4，再次任意一条线路。
-  //    交给播放器在网页环境里走它自己的播放器逻辑：浏览器发请求自带 Origin/Referer，
-  //    令牌与会话也和解码同源同网络，比 spider 硬解直返更可能一次成功；
-  //    对 f4-only 的视频这是唯一可行路径（spider 直返 f4 已实测必挂）。
-  const embeds = (cacheGet(postId) || {}).embeds || [];
-  const sniff = embeds.find(e => e.kind === 'vidhide') || embeds.find(e => e.kind === 'f4') || embeds[0];
+  // 2) 嗅探：vidhide 第一（同系多条保持 server 顺序，earnvid 在前）> f4 > other > 第一条。
+  //    vidhide 直链的 token 按解码出口的 ASN 签发、真机全灭，只有让播放器在 embed 页的
+  //    网页会话里自己取流才绕得开；f4 强制 Origin 同理。立刻返回，不解码、不等待。
+  const sniff = embeds.find(e => e.kind === 'vidhide')
+    || embeds.find(e => e.kind === 'f4')
+    || embeds.find(e => e.kind === 'other')
+    || embeds[0];
   if (sniff) {
     return { parse: 1, url: sniff.embedUrl, header: { 'User-Agent': UA, 'Referer': durl } };
   }
-  // 线路列表还没收集到（收集本身也在预解码里进行中）：先把详情页交给嗅探，
-  // 好过返回空让 App 直接报失败
+  // 线路一条都没收集到：把详情页本身交给嗅探，好过返回空让 App 直接报失败
   if (durl && durl !== REFERER) {
     return { parse: 1, url: durl, header: { 'User-Agent': UA, 'Referer': REFERER } };
   }
