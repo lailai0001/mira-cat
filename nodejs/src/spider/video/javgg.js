@@ -29,6 +29,17 @@ import req from '../../util/req.js';
 //   拉列表、透传分片全在 Worker 同一出口完成，播放器只连 Worker、零自定义头。
 //   Worker 本体已在 VM 用真实样本全链验证（/v 200、719 分片全经 /s 200、Range 206）。
 //   下方 VIDHIDE_WORKER 常量填入部署地址后生效；留空则 vidhide 维持第三轮嗅探行为。
+// 第六轮(2026-10-20): 第五轮真机: 中字幕分类播不了、清晰度低、提速未显。
+//   逐项实测结论: (1) 蜘蛛对中字幕样本的 play 输出与第四轮逐项一致 —— 该分类
+//   死线占比高(抽样 12 条中 5 条: 无 hls4 的 vidhide 单线[hls2 被 ASN 锁、
+//   hls3 源站 502/404]、javside/javb1[页面三方出口全被拦, 只能嗅探]、voe 嗅探),
+//   属站方线路问题、非第五轮回归; 真正的快速通道毒点是"合法 JSON+坏地址"
+//   型负载(见 play 内注释), 已加信任门槛回退。(2) 清晰度低在 vidhide 线:
+//   master 变体是 480→720→1080 升序、播放器默认吃首档 —— Worker v3 把变体
+//   降序并且 /v 直接返回最高档媒体列表; playmate/vidara 的 master 都是单档
+//   (实测 playmate 720p 封顶/vidara 1080p, 由源决定, 蜘蛛返回完整 master)。
+//   (3) 提速: Worker v2 缓存逻辑经 workerd 复现证明正确, 沙箱出口 POP 轮转
+//   测不出命中; v3 改 /v 直达媒体列表省一整跳串行往返, 不再只依赖预热。
 // 提速(2026-10-20 第五轮): 第四轮真机全通但播放加载慢。实测瓶颈在串行往返:
 //   play() 先 collectEmbeds(3 个 dooplayer API)才返回 Worker /v, 播放器再串行
 //   /v→/p→首分片, 每跳 Worker 都实时回源(/v 1.2~2.6s、/p 1.1~1.8s)。
@@ -448,7 +459,12 @@ async function play(reqIn) {
       const payload = JSON.parse(b64urlDecode(fm[1]) || '{}');
       const urls = Array.isArray(payload.e) ? payload.e : [];
       const list = urls.map(u => classifyEmbed(t(u))).filter(Boolean);
-      if (list.length) fastEmbeds = list;
+      // 只信任"像真线路"的负载: 至少一条能归入已知类型(playmate/vidara/
+      // vidhide/f4)才用。整包都是 other 时多半是回传环节把地址弄坏了
+      // (第六轮 harness 实测: 合法 JSON+坏地址的负载会毒死快速通道、跳过
+      // 本该成功的现场收集, play 只剩嗅探坏地址) —— 此时不用负载,
+      // 落到下面 collectEmbeds 全流程, 与第四轮行为完全一致。
+      if (list.length && list.some(e => e.kind !== 'other')) fastEmbeds = list;
     } catch (e) { /* 负载坏了就当没有 */ }
     id = id.slice(0, fm.index);
   }
