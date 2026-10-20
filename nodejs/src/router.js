@@ -60,6 +60,7 @@ import brazz from './spider/video/brazz.js';
 import sakuralive from './spider/video/sakuralive.js';
 import bigbuttshub from './spider/video/bigbuttshub.js';
 import mmtv from './spider/video/7mmtv.js';
+import javideo from './spider/video/javideo.js';
 
 const spiders = [
     missav_xptv,
@@ -119,7 +120,7 @@ const spiders = [
     youzidj,
     stripchat,
     hohoj,
-    rip17, brazz, sakuralive, bigbuttshub, mmtv,];
+    rip17, brazz, sakuralive, bigbuttshub, mmtv, javideo,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
