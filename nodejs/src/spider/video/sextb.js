@@ -1,0 +1,405 @@
+import req from '../../util/req.js';
+
+// SexTB (py_sextb)
+// 站点: https://sextb.net/ (JAV 在线站，Cloudflare WAF 拦机房 IP，用户手机网络可访问)
+// 列表: / (最新) / /genre/{slug}/[/pg-N/]  tray-item 卡片
+// 卡片: div.tray-item > a[href="/{code}"] > img.tray-item-thumbnail (封面取 data-src，src 是 default-cover 占位图)
+// 详情: GET /{code}  filmId + 服务器列表 (button.btn-player.episode[data-source][data-id]，如 F4/SW/PM/DD/FL/US)
+// 播放: 1) 详情页默认 iframe 即 F4 服务器 (f4scdn.com/e/{id})；
+//       2) f4 系 embed 页 data-api -> GET {host}/api/play/{vid}?ab=0 (带 Origin 头) -> src m3u8 直链；
+//       3) 其他服务器 POST /ajax/player {episode: episode_id, filmId} -> JSON.player HTML -> embed；
+//       4) 解不出的 embed 走 parse:1 嗅探。play 实时在用户手机上解析，token 按用户 IP 签发。
+// 注意: Cloudflare 拦截机房 IP，本机只能用 Wayback 存档 + jina 逆向，播放实测需用户真机验证。
+
+const KEY = 'py_sextb';
+const NAME = 'SexTB';
+const SITE = 'https://sextb.net';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+const REFERER = SITE + '/';
+
+// 核心分类 + 精选题材 (2026-10-20 从 /genres 页实测 200，全部真实存在)
+const CATS = [
+  { type_id: 'latest', type_name: '最新' },
+  { type_id: 'censored', type_name: '有码', slug: 'censored' },
+  { type_id: 'uncensored', type_name: '无码', slug: 'uncensored-dc02d84q' },
+  { type_id: 'amateur', type_name: '素人', slug: 'amateur-9yvovjqr' },
+  { type_id: 'subtitle', type_name: '中文字幕', slug: 'subtitle' },
+  { type_id: 'uncensored-leaked', type_name: '无码流出', slug: 'uncensored-leaked-8iodxgmu' },
+  { type_id: 'reducing-mosaic', type_name: '减码', slug: 'reducing-mosaic-o16ol1qy' },
+  { type_id: 'english-subtitle', type_name: '英字幕', slug: 'english-subtitle-8rpwhwew' },
+  { type_id: 'digital-mosaic', type_name: '数码有码', slug: 'digital-mosaic-merf7vyh' },
+  { type_id: 'minimal-mosaic', type_name: '低马赛克', slug: 'minimal-mosaic-csskw5dg' },
+  { type_id: 'big-tits', type_name: '巨乳', slug: 'big-tits-hipx7w77' },
+  { type_id: 'creampie', type_name: '中出', slug: 'creampie-dkel1ugw' },
+  { type_id: 'blowjob', type_name: '口交', slug: 'blowjob-6w43evzo' },
+  { type_id: 'school-girl', type_name: '学生', slug: 'school-girl-aze0q30d' },
+  { type_id: 'milf', type_name: '熟女', slug: 'milf-k01m582n' },
+  { type_id: 'mature-woman', type_name: '成熟女性', slug: 'mature-woman-pj7rh291' },
+  { type_id: 'lesbian', type_name: '蕾丝', slug: 'lesbian-9akyznh5' },
+  { type_id: 'nurse', type_name: '护士', slug: 'nurse-kor7sr6n' },
+  { type_id: 'office-lady', type_name: 'OL', slug: 'office-lady-pjv31x9c' },
+  { type_id: 'threesome', type_name: '3P4P', slug: 'threesome--foursome-3r7836if' },
+  { type_id: 'cosplay', type_name: 'Cosplay', slug: 'cosplay-d5rzeneh' },
+  { type_id: 'voyeur', type_name: '偷拍', slug: 'voyeur-9thq5fr5' },
+  { type_id: 'massage', type_name: '按摩', slug: 'massage-0ypm730h' },
+  { type_id: 'bondage', type_name: '捆绑', slug: 'bondage-wywuaggb' },
+  { type_id: 'squirting', type_name: '潮吹', slug: 'squirting-1t5r5wb9' },
+  { type_id: 'maid', type_name: '女仆', slug: 'maid-vkrzm0oo' },
+  { type_id: 'teen', type_name: '少女', slug: 'teen-gk3kz0pk' },
+  { type_id: 'fc2', type_name: 'FC2', slug: 'fc2' },
+];
+
+function t(v) {
+  return String(v == null ? '' : v).trim();
+}
+
+function clean(s) {
+  return t(s)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\s+/g, ' ');
+}
+
+function fixUrl(u) {
+  u = t(u);
+  if (!u) return '';
+  if (u.startsWith('//')) return 'https:' + u;
+  if (u.startsWith('/')) return SITE + u;
+  if (/^https?:\/\//.test(u)) return u;
+  return SITE + '/' + u;
+}
+
+// 双通道: 先框架 req，失败再原生 fetch
+async function getHtml(url, extraHeaders) {
+  const headers = {
+    'User-Agent': UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+    'Referer': REFERER,
+    ...(extraHeaders || {}),
+  };
+  // 通道1: 框架 req
+  try {
+    const { data, status } = await req.get(url, { headers, timeout: 25000 });
+    if (status === 200 && typeof data === 'string' && data.length > 1000) return data;
+    if (status === 200 && data) return typeof data === 'string' ? data : '';
+  } catch (e) { /* 换通道2 */ }
+  // 通道2: 原生 fetch
+  try {
+    const r = await fetch(url, { headers });
+    if (r.ok) {
+      const txt = await r.text();
+      if (txt.length > 1000) return txt;
+    }
+  } catch (e) { /* ignore */ }
+  return '';
+}
+
+async function postJson(url, body, extraHeaders) {
+  const headers = {
+    'User-Agent': UA,
+    'Referer': REFERER,
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    ...(extraHeaders || {}),
+  };
+  const data = new URLSearchParams(body).toString();
+  // 通道1: 框架 req
+  try {
+    const { data: res, status } = await req.post(url, data, { headers, timeout: 25000 });
+    if (status === 200 && res != null) return typeof res === 'string' ? res : JSON.stringify(res);
+  } catch (e) { /* 换通道2 */ }
+  // 通道2: 原生 fetch
+  try {
+    const r = await fetch(url, { method: 'POST', headers, body: data });
+    if (r.ok) return await r.text();
+  } catch (e) { /* ignore */ }
+  return '';
+}
+
+// 解析视频卡片: div.tray-item > a[href="/{code}"] > img.tray-item-thumbnail
+// 注意: 站点懒加载，真实封面在 data-src，src 是 default-cover.jpg 占位图
+// 排除预告片块 (div.tray-item-trailer，data-link 指向 /genre/xxx)
+function parseCards(html) {
+  const out = [];
+  const seen = new Set();
+  const re = /<div class="tray-item">\s*<a\s[^>]*href="(?:https?:\/\/sextb\.net)?(\/[a-z0-9][a-z0-9\-]{3,40})"[^>]*>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const path = m[1];
+    if (seen.has(path)) continue;
+    seen.add(path);
+    const win = html.slice(m.index, m.index + 2500);
+    // 标题: img alt 属性
+    let title = '';
+    const altM = win.match(/<img[^>]+alt="([^"]+)"/);
+    if (altM) title = clean(altM[1]);
+    // 封面: 优先 data-src (懒加载真实地址)
+    let pic = '';
+    const dsM = win.match(/data-src="(https?:\/\/[^"]+)"/) || win.match(/data-src="(\/\/[^"]+)"/);
+    if (dsM && !dsM[1].includes('default-cover')) pic = fixUrl(dsM[1]);
+    if (!pic) {
+      const srcM = win.match(/<img[^>]+src="(https?:\/\/[^"]+)"/) || win.match(/<img[^>]+src="(\/\/[^"]+)"/);
+      if (srcM && !srcM[1].includes('default-cover')) pic = fixUrl(srcM[1]);
+    }
+    // 番号: div.tray-item-code
+    let code = '';
+    const cdM = win.match(/tray-item-code">([^<]+)</);
+    if (cdM) code = clean(cdM[1]);
+    out.push({
+      vod_id: fixUrl(path),
+      vod_name: title || code || path.replace(/^\//, ''),
+      vod_pic: pic,
+      vod_remarks: code,
+    });
+  }
+  return out;
+}
+
+function parsePagecount(html) {
+  const nums = [...html.matchAll(/\/pg-(\d+)/g)].map(x => parseInt(x[1], 10)).filter(n => n > 0 && n < 100000);
+  return nums.length ? Math.max(...nums) : 1;
+}
+
+function catOf(tid) {
+  return CATS.find(c => c.type_id === tid) || CATS[0];
+}
+
+function catUrl(cat, page) {
+  if (cat.type_id === 'latest') {
+    return page > 1 ? `${SITE}/pg-${page}` : SITE + '/';
+  }
+  const slug = cat.slug || cat.type_id;
+  if (/^https?:\/\//.test(slug)) return slug;
+  const base = slug.includes('/') ? `${SITE}/${slug}` : `${SITE}/genre/${slug}`;
+  return page > 1 ? `${base}/pg-${page}` : base;
+}
+
+function buildList(url, page, limit) {
+  limit = limit || 30;
+  return getHtml(url).then(html => {
+    if (!html) return { page, pagecount: page, limit, total: 0, list: [] };
+    const list = parseCards(html);
+    const pc = parsePagecount(html);
+    return { page, pagecount: Math.max(pc, page), limit, total: list.length, list };
+  });
+}
+
+async function init(reqIn) {
+  return {};
+}
+
+async function home(reqIn) {
+  const cls = CATS.map(c => ({ type_id: c.type_id, type_name: c.type_name }));
+  const html = await getHtml(SITE + '/');
+  const list = html ? parseCards(html).slice(0, 30) : [];
+  return { class: cls, list };
+}
+
+async function category(reqIn) {
+  const body = reqIn?.body || {};
+  const tid = t(body.tid || body.id) || 'latest';
+  const page = Math.max(1, parseInt(body.page, 10) || 1);
+  const cat = catOf(tid);
+  return buildList(catUrl(cat, page), page, 30);
+}
+
+// 从详情页提取 filmId 和服务器 (episode) 列表
+function extractPlayerInfo(html) {
+  let filmId = '';
+  const fm = html.match(/filmId\s*=\s*["']?(\d+)/);
+  if (fm) filmId = fm[1];
+  const episodes = [];
+  const re = /<button[^>]*class="[^"]*btn-player episode[^"]*"[^>]*data-source="(\d+)"[^>]*data-id="(\d+)"[^>]*>(?:<i[^>]*><\/i>)?\s*([A-Z0-9]+)</g;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    episodes.push({ filmId: m[1], episode: m[2], name: m[3] });
+  }
+  return { filmId, episodes };
+}
+
+// 从详情页提取默认 player iframe
+function extractDefaultEmbed(html) {
+  const m = html.match(/id="sextb-player"[\s\S]{0,500}?<iframe[^>]+src="(https?:\/\/[^"]+)"/) ||
+            html.match(/id="sextb-player"[\s\S]{0,500}?<iframe[^>]+src="(\/\/[^"]+)"/);
+  return m ? fixUrl(m[1]) : '';
+}
+
+// 解析 f4 系 embed: embed 页 data-video-id -> {host}/api/play/{vid}?ab=0 -> src (m3u8)
+async function resolveF4(embedUrl, durl) {
+  const html = await getHtml(embedUrl, { 'Referer': durl });
+  if (!html) return '';
+  const vm = html.match(/data-video-id="([^"]+)"/);
+  const am = html.match(/data-api="([^"]+)"/);
+  if (!vm || !am) return '';
+  const hostM = embedUrl.match(/^(https?:\/\/[^/]+)/);
+  if (!hostM) return '';
+  const apiUrl = hostM[1] + am[1] + (am[1].includes('?') ? '&' : '?') + 'ab=0';
+  const host = hostM[1];
+  let src = '';
+  const headers = {
+    'User-Agent': UA,
+    'Referer': embedUrl,
+    'Origin': host,
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+  };
+  // 通道1: 框架 req
+  try {
+    const { data, status } = await req.get(apiUrl, { headers, timeout: 25000 });
+    if (status === 200 && data) {
+      const json = typeof data === 'string' ? JSON.parse(data) : data;
+      if (json && json.src) src = t(json.src);
+    }
+  } catch (e) { /* 换通道2 */ }
+  // 通道2: 原生 fetch
+  if (!src) {
+    try {
+      const r = await fetch(apiUrl, { headers });
+      if (r.ok) {
+        const json = await r.json();
+        if (json && json.src) src = t(json.src);
+      }
+    } catch (e) { /* ignore */ }
+  }
+  if (!src) return '';
+  if (!/^https?:\/\//.test(src)) src = host + (src.startsWith('/') ? src : '/' + src);
+  return { url: src, origin: host };
+}
+
+async function detail(reqIn) {
+  const body = reqIn?.body || {};
+  let id = t(body.id);
+  if (!id) return { list: [] };
+  const durl = /^https?:\/\//.test(id) ? id : fixUrl(id);
+
+  const html = await getHtml(durl);
+  if (!html) return { list: [] };
+
+  // 标题
+  let name = '';
+  const tm = html.match(/<title>([^<]*)<\/title>/);
+  if (tm) name = clean(tm[1]).replace(/\s*-\s*SEXTB.*$/i, '').replace(/Free JAV.*$/i, '').trim();
+  // 封面: 优先页面内的 webp poster (cdn001.imggle.net 公开 CDN，直读 200)，
+  // 其次 video 标签 poster，再 og:image (cdna.sextb.net，经 Cloudflare)
+  let pic = '';
+  const wm = html.match(/data-src="(https?:\/\/cdn001\.imggle\.net\/webp\/poster[^"]+)"/);
+  if (wm) pic = wm[1];
+  if (!pic) {
+    const vm = html.match(/<video[^>]+poster="(https?:\/\/[^"]+)"/);
+    if (vm) pic = vm[1];
+  }
+  if (!pic) {
+    const ogm = html.match(/<meta property="og:image" content="([^"]+)"/);
+    if (ogm) pic = ogm[1];
+  }
+
+  return {
+    list: [{
+      vod_id: durl,
+      vod_name: name || durl,
+      vod_pic: fixUrl(pic),
+      vod_remarks: '',
+      vod_content: name,
+      vod_play_from: 'SexTB',
+      vod_play_url: `正片$${durl}`,
+    }],
+  };
+}
+
+async function play(reqIn) {
+  const body = reqIn?.body || {};
+  let id = t(body.id);
+  if (!id) return { parse: 0, url: '' };
+  // id 可能是 "正片$https://..." 形式，取 $ 后面的完整 URL
+  if (id.includes('$')) id = id.split('$').pop().trim();
+  if (/\.m3u8(\?|$)/i.test(id)) {
+    return { parse: 0, url: id, header: { 'User-Agent': UA, 'Origin': 'https://f4scdn.com' } };
+  }
+  const durl = /^https?:\/\//.test(id) ? id : fixUrl(id);
+
+  // 第1步: 抓详情页，拿默认 embed iframe（通常是 F4/f4scdn）
+  const html = await getHtml(durl);
+  if (!html) return { parse: 0, url: '' };
+  const embedUrl = extractDefaultEmbed(html);
+
+  if (embedUrl) {
+    // f4 系 (f4scdn.com / f4jav.xyz): 解析 api/play 拿 m3u8 直链
+    if (/f4scdn\.com|f4jav\.xyz/i.test(embedUrl)) {
+      const res = await resolveF4(embedUrl, durl);
+      if (res && /\.m3u8|\.txt/i.test(res.url)) {
+        return {
+          parse: 0,
+          url: res.url,
+          header: { 'User-Agent': UA, 'Referer': embedUrl, 'Origin': res.origin },
+        };
+      }
+    }
+  }
+
+  // 第2步: 逐个服务器 POST /ajax/player 拿 player HTML，找可解的 embed
+  const { filmId, episodes } = extractPlayerInfo(html);
+  if (filmId && episodes.length) {
+    for (const ep of episodes) {
+      const resp = await postJson(SITE + '/ajax/player', { episode: ep.episode, filmId }, { 'Referer': durl });
+      if (!resp) continue;
+      let playerHtml = '';
+      try {
+        const json = JSON.parse(resp);
+        playerHtml = t(json.player);
+      } catch (e) { continue; }
+      const em = playerHtml.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/) ||
+                 playerHtml.match(/<iframe[^>]+src="(\/\/[^"]+)"/);
+      if (!em) continue;
+      const eu = fixUrl(em[1]);
+      if (/f4scdn\.com|f4jav\.xyz/i.test(eu)) {
+        const res = await resolveF4(eu, durl);
+        if (res && /\.m3u8|\.txt/i.test(res.url)) {
+          return {
+            parse: 0,
+            url: res.url,
+            header: { 'User-Agent': UA, 'Referer': eu, 'Origin': res.origin },
+          };
+        }
+      }
+      // 其他 embed (SW/PM/DD/FL/US 等): 交给嗅探
+      if (/^https?:\/\//.test(eu)) {
+        return { parse: 1, jx: 0, url: eu, header: { 'User-Agent': UA, 'Referer': durl } };
+      }
+    }
+  }
+
+  // 第3步: 兜底，嗅探默认 embed 页
+  if (embedUrl && /^https?:\/\//.test(embedUrl)) {
+    return { parse: 1, jx: 0, url: embedUrl, header: { 'User-Agent': UA, 'Referer': durl } };
+  }
+  return { parse: 0, url: '' };
+}
+
+async function search(reqIn) {
+  const body = reqIn?.body || {};
+  const wd = t(body.wd);
+  const page = Math.max(1, parseInt(body.page, 10) || 1);
+  if (!wd) return { page, pagecount: page, limit: 30, total: 0, list: [] };
+  let url = SITE + '/search/' + encodeURIComponent(wd);
+  if (page > 1) url += '/pg-' + page;
+  return buildList(url, page, 30);
+}
+
+export default function createSpider() {
+  return {
+    meta: { key: KEY, name: NAME, type: 3 },
+    api: async (fastify) => {
+      fastify.post('/init', init);
+      fastify.post('/home', home);
+      fastify.post('/category', category);
+      fastify.post('/detail', detail);
+      fastify.post('/play', play);
+      fastify.post('/search', search);
+    },
+  };
+}
