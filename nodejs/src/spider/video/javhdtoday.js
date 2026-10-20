@@ -17,8 +17,8 @@ const CN = SITE + '/cn';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const REFERER = CN + '/';
 
-// 8 个真实排序分类 (2026-10-20 实测，均为 200 且有 28 条/页)
-const CATS = [
+// 8 个真实排序分类 (SSR，2026-10-20 实测，均为 200 且有 28 条/页)
+const SORT_CATS = [
   { type_id: 'recent', type_name: '最新上传' },
   { type_id: 'popular', type_name: '最受欢迎' },
   { type_id: 'releaseday', type_name: '发布日' },
@@ -28,6 +28,19 @@ const CATS = [
   { type_id: 'longest', type_name: '最长' },
   { type_id: 'watched', type_name: '观看最多' },
 ];
+
+// 6 个标签分类 (站点分类页为 JS 骨架屏，走 ?ajax=1 接口取列表，28 条/页，2026-10-21 实测均有内容)
+const TAG_CATS = [
+  { type_id: 'tag:uncensored-jav', type_name: '无码流出', slug: 'uncensored-jav' },
+  { type_id: 'tag:chinese-subtitle', type_name: '中文字幕', slug: 'chinese-subtitle' },
+  { type_id: 'tag:jav-sub', type_name: '英文字幕', slug: 'jav-sub' },
+  { type_id: 'tag:big-tits', type_name: '巨乳', slug: 'big-tits' },
+  { type_id: 'tag:creampie', type_name: '中出', slug: 'creampie' },
+  { type_id: 'tag:amateur', type_name: '素人', slug: 'amateur' },
+];
+
+const CATS = [...SORT_CATS, ...TAG_CATS];
+const LIMIT = 28;
 
 function t(v) {
   return String(v == null ? '' : v).trim();
@@ -147,10 +160,36 @@ function parsePagecount(html) {
 }
 
 function catUrl(tid, page) {
-  const sort = CATS.some(c => c.type_id === tid) ? tid : 'recent';
+  if (tid.startsWith('tag:')) {
+    const cat = TAG_CATS.find(c => c.type_id === tid) || TAG_CATS[0];
+    return `${CN}/${cat.slug}/?ajax=1&page=${page}`;
+  }
+  const sort = SORT_CATS.some(c => c.type_id === tid) ? tid : 'recent';
   let url = `${CN}/${sort}/`;
   if (page > 1) url += `${page}/`;
   return url;
+}
+
+function isTagCat(tid) {
+  return String(tid).startsWith('tag:');
+}
+
+// 分类页取列表：排序分类为 SSR 直抓；标签分类走 ?ajax=1 JSON 接口
+async function buildList(url, page, limit, isTag) {
+  limit = limit || LIMIT;
+  if (isTag) {
+    const j = await getJson(url, REFERER);
+    if (!j || !j.html) return { page, pagecount: page, limit, total: 0, list: [] };
+    const list = parseCards(j.html);
+    const total = parseInt(j.total, 10) || 0;
+    const pc = total > 0 ? Math.ceil(total / limit) : Math.max(page, 1);
+    return { page, pagecount: pc, limit, total, list };
+  }
+  const html = await getHtml(url);
+  if (!html) return { page, pagecount: page, limit, total: 0, list: [] };
+  const list = parseCards(html);
+  const pc = parsePagecount(html);
+  return { page, pagecount: Math.max(pc, page), limit, total: list.length, list };
 }
 
 async function init(reqIn) {
@@ -169,11 +208,7 @@ async function category(reqIn) {
   const tid = t(body.tid || body.id) || 'recent';
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const url = catUrl(tid, page);
-  const html = await getHtml(url);
-  if (!html) return { page, pagecount: page, limit: 28, total: 0, list: [] };
-  const list = parseCards(html);
-  const pc = parsePagecount(html);
-  return { page, pagecount: Math.max(pc, page), limit: 28, total: list.length, list };
+  return buildList(url, page, LIMIT, isTagCat(tid));
 }
 
 // 从详情页提取 embed 页地址
@@ -263,6 +298,26 @@ async function detail(reqIn) {
   };
 }
 
+// 自有播放器 (stream*.javhdz.today/embed.php) -> embed.php?json=1 -> proxied m3u8
+// 分片经站方服务器代理，无 Origin/IP 绑定，手机端友好
+async function resolveSelfPlayer(playerUrl, referer) {
+  const pM = String(playerUrl).match(/[?&]p=([^&]+)/);
+  if (!pM) return '';
+  let host = '';
+  try { host = new URL(playerUrl).origin; } catch (e) { return ''; }
+  const token = pM[1];
+  // 依次试 next=0..2（每页一个源）
+  for (let n = 0; n <= 2; n++) {
+    const apiUrl = `${host}/embed.php?json=1&next=${n}&p=${encodeURIComponent(token)}`;
+    const j = await getJson(apiUrl, referer);
+    if (j && j.success && j.src && typeof j.src === 'string') {
+      const src = j.src.startsWith('http') ? j.src : host + j.src;
+      return { url: src, playerUrl, host };
+    }
+  }
+  return '';
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -283,7 +338,20 @@ async function play(reqIn) {
   const players = extractPlayers(embedHtml);
   if (!players.length) return { parse: 0, url: '' };
 
-  // 优先 f4 系（可解出 m3u8 直链）
+  // 1. 优先站方自有播放器 (javhdz.today) -> proxied m3u8，无 Origin/IP 绑定
+  const selfPlayers = players.filter(p => /javhdz\.today\/embed\.php/i.test(p.url));
+  for (const sp of selfPlayers) {
+    const r = await resolveSelfPlayer(sp.url, embedUrl);
+    if (r && r.url) {
+      return {
+        parse: 0,
+        url: r.url,
+        header: { 'User-Agent': UA, 'Referer': r.playerUrl },
+      };
+    }
+  }
+
+  // 2. f4 系 (m3u8 token 疑似绑定请求 IP，仅作降级)
   const f4 = players.find(p => /f4\w*\.com|f4scdn/i.test(p.url));
   if (f4) {
     const r = await resolveF4(f4.url, durl);
@@ -295,7 +363,7 @@ async function play(reqIn) {
       };
     }
   }
-  // 其他 embed 走嗅探
+  // 3. 其他 embed 走嗅探
   const first = players[0];
   return { parse: 1, url: first.url, header: { 'User-Agent': UA, 'Referer': durl } };
 }

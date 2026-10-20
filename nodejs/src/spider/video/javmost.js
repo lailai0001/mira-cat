@@ -10,10 +10,13 @@ import req from '../../util/req.js';
 // 标签: /tag/{TAG}/ (仅第1页可用，翻页 410，站点限制)
 // 搜索: /search/{kw}/[/page/N/]
 // 详情: /{CODE}/ 标题+封面从 JSON-LD 取
-// 播放: 两步走。1) 服务端 POST /ri3123o235r/ (必须带 X-Requested-With: XMLHttpRequest 头，
+// 播放: 三步走。1) 服务端 POST /ri3123o235r/ (必须带 X-Requested-With: XMLHttpRequest 头，
 //       否则被 tar-pit) 拿 embed 播放器地址 (dooplayer.com/mostplayer.com 等)；
-//       2) 把纯播放器 embed 页交给 MiraPlayer parse:1 嗅探 (比嗅探详情页更直接)。
-//       拿不到 embed 时降级嗅探详情页。
+//       2) embed 页带 Sec-Fetch-Dest: iframe 头访问 (否则 204)，解析 meta 的
+//          x-embed-token/et/sig/api，POST {api}{token} 拿到直链 (mp4/m3u8)，parse:0；
+//       3) 解不出直链时降级把 embed 页交给 MiraPlayer parse:1 嗅探，再降级嗅探详情页。
+//       注意: 部分 CDN (wowstream2.cloud 等) 对机房 IP 有 CF 拦截，服务端验证 403，
+//       但用户手机家庭网络一般可直连。
 
 const KEY = 'py_javmost';
 const NAME = 'JavMost';
@@ -246,6 +249,70 @@ async function fetchEmbedUrl(durl, html) {
   return '';
 }
 
+// 从 embed 页 (dooplayer.com/mostplayer.com 系) 解析直链
+// embed 页必须带 Sec-Fetch-Dest: iframe 头，否则返回 204
+// 页内 meta: x-embed-token / x-embed-api / x-embed-et / x-embed-sig
+// 调 API: POST {api}stream/{token}，头 X-Embed-Auth:1 + X-Embed-ET + X-Embed-SIG，body {"ref": "..."}
+async function resolveEmbedDirect(embedUrl, referer) {
+  if (!/dooplayer\.com|mostplayer\.com/i.test(embedUrl)) return '';
+  const headers = {
+    'User-Agent': UA,
+    'Referer': referer || REFERER,
+    'Sec-Fetch-Dest': 'iframe',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'cross-site',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+  let html = '';
+  try {
+    const { data, status } = await req.get(embedUrl, { headers, timeout: 25000 });
+    if (status === 200 && data) html = typeof data === 'string' ? data : String(data);
+  } catch (e) { /* ignore */ }
+  if (!html) {
+    try {
+      const r = await fetch(embedUrl, { headers });
+      if (r.ok) html = await r.text();
+    } catch (e) { /* ignore */ }
+  }
+  if (!html || html.length < 200) return '';
+  const meta = (n) => {
+    const m = html.match(new RegExp(`<meta[^>]+name=["']?${n}["']?[^>]*content=["']?([^"'>\\s]+)`, 'i'))
+      || html.match(new RegExp(`<meta[^>]+content=["']?([^"'>\\s]+)["']?[^>]*name=["']?${n}["']?`, 'i'));
+    return m ? m[1] : '';
+  };
+  const token = meta('x-embed-token');
+  const api = meta('x-embed-api');
+  const et = meta('x-embed-et');
+  const sig = meta('x-embed-sig');
+  if (!token || !api || !et || !sig) return '';
+  const apiUrl = api.replace(/\/?$/, '') + '/' + token;
+  const apiHeaders = {
+    'User-Agent': UA,
+    'Referer': embedUrl,
+    'Content-Type': 'application/json',
+    'X-Embed-Auth': '1',
+    'X-Embed-ET': et,
+    'X-Embed-SIG': sig,
+  };
+  const apiBody = JSON.stringify({ ref: new URL(embedUrl).origin });
+  let json = null;
+  try {
+    const { data, status } = await req.post(apiUrl, apiBody, { headers: apiHeaders, timeout: 25000 });
+    if (status === 200 && data) json = typeof data === 'string' ? JSON.parse(data) : data;
+  } catch (e) { /* ignore */ }
+  if (!json) {
+    try {
+      const r = await fetch(apiUrl, { method: 'POST', headers: apiHeaders, body: apiBody });
+      if (r.ok) json = await r.json();
+    } catch (e) { /* ignore */ }
+  }
+  if (json && json.ok && json.url && /^https?:\/\//.test(json.url)) {
+    return json.url;
+  }
+  return '';
+}
+
 async function home(reqIn) {
   const cls = CATS.map(c => ({ type_id: c.type_id, type_name: c.type_name }));
   return { class: cls, list: [] };
@@ -324,7 +391,21 @@ async function play(reqIn) {
     embedUrl = await fetchEmbedUrl(durl, html);
   }
   if (embedUrl && /^https?:\/\//.test(embedUrl)) {
-    // 第2步: 把纯播放器 embed 页交给 MiraPlayer 嗅探 (比嗅探详情页更直接，无需等 ajax)
+    // 第2步: dooplayer/mostplayer 系 embed 页直接解析出直链 (parse:0)
+    const direct = await resolveEmbedDirect(embedUrl, durl);
+    if (direct) {
+      const embedOrigin = new URL(embedUrl).origin;
+      return {
+        parse: 0,
+        url: direct,
+        header: {
+          'User-Agent': UA,
+          'Referer': embedUrl,
+          'Origin': embedOrigin,
+        },
+      };
+    }
+    // 第3步: 其他 embed 页交给 MiraPlayer 嗅探
     return {
       parse: 1,
       jx: 0,

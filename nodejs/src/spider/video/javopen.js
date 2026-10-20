@@ -162,38 +162,58 @@ async function category(reqIn) {
   return buildList(url, page, 20);
 }
 
-function extractPlayer(html) {
-  // 方式1: <textarea id="raw-payload"> Base64 编码的 iframe（2026-10-20 实测，tape=1~4 各不同）
+// 解析详情页的播放器: 提取 raw-payload 里的 iframe src (返回完整 embed 信息)
+// 注意: 同一视频有 tape=1~4 四个服务器，默认是 tape=1
+function decodePayload(html) {
   const rawM = html.match(/<textarea[^>]*id="raw-payload"[^>]*>([^<]+)<\/textarea>/);
-  if (rawM) {
+  if (!rawM) return '';
+  try {
+    let b64 = rawM[1].trim();
+    let dec = '';
+    if (typeof Buffer !== 'undefined') {
+      dec = Buffer.from(b64, 'base64').toString('utf-8');
+    } else {
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      dec = new TextDecoder().decode(bytes);
+    }
+    const srcM = dec.match(/src="([^"]+)"/i);
+    if (srcM) return srcM[1];
+  } catch (e) { /* ignore */ }
+  return '';
+}
+
+function classifyEmbed(embedUrl) {
+  if (!embedUrl) return null;
+  const vm = embedUrl.match(/https?:\/\/([^"/]+)\/e\/([A-Za-z0-9\-_]+)/);
+  if (vm) return { host: 'https://' + vm[1], filecode: vm[2], embedUrl, isVidaraa: /vidaraa/i.test(vm[1]) };
+  return { host: '', filecode: '', embedUrl, isVidaraa: false };
+}
+
+function extractPlayer(html) {
+  const src = decodePayload(html);
+  if (src) return classifyEmbed(src);
+  // 降级: 直接的 iframe 标签
+  const m = html.match(/<iframe[^>]+src="(https?:\/\/[^"/]+)\/e\/([A-Za-z0-9\-_]+)"/);
+  if (m) return { host: m[1], filecode: m[2], embedUrl: m[0], isVidaraa: /vidaraa/i.test(m[1]) };
+  return null;
+}
+
+// 依次在 tape=1~4 中找 vidaraa（实测大部分默认 tape 是 streamdesi，少数视频的其他 tape 有 vidaraa）
+async function findVidaraaTape(durl) {
+  for (let tape = 1; tape <= 4; tape++) {
+    let html = '';
     try {
-      let b64 = rawM[1].trim();
-      // Node 和浏览器兼容的 base64 解码
-      let dec = '';
-      if (typeof Buffer !== 'undefined') {
-        dec = Buffer.from(b64, 'base64').toString('utf-8');
-      } else {
-        const bin = atob(b64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        dec = new TextDecoder().decode(bytes);
-      }
-      const srcM = dec.match(/src="([^"]+)"/i);
-      if (srcM) {
-        const url = srcM[1];
-        // vidaraa.cc/e/{filecode} 或 bysewihe.com/e/{filecode} 走 api/stream
-        const vm = url.match(/https?:\/\/([^"/]+)\/e\/([A-Za-z0-9]+)/);
-        if (vm) return { host: 'https://' + vm[1], filecode: vm[2], embedUrl: url };
-        // 其他 embed 直接返回，由 MiraPlayer 嗅探
-        return { host: '', filecode: '', embedUrl: url };
-      }
-    } catch (e) { /* 继续方式2 */ }
+      const url = tape === 1 ? durl : (durl.replace(/\?.*$/, '') + `?tape=${tape}`);
+      html = await getHtml(url);
+    } catch (e) { /* ignore */ }
+    if (!html) continue;
+    const player = extractPlayer(html);
+    if (player && player.isVidaraa && player.filecode) {
+      return player;
+    }
   }
-  // 方式2: 直接的 iframe 标签
-  const m = html.match(/<iframe[^>]+src="(https?:\/\/[^"/]+)\/e\/([A-Za-z0-9]+)"/);
-  if (m) return { host: m[1], filecode: m[2], embedUrl: m[0] };
-  const m2 = html.match(/(https?:\/\/[^"/\s]+)\/e\/([A-Za-z0-9]{6,})/);
-  if (m2) return { host: m2[1], filecode: m2[2], embedUrl: '' };
   return null;
 }
 
@@ -244,24 +264,40 @@ async function play(reqIn) {
     return { parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': REFERER } };
   }
   const durl = /^https?:\/\//.test(id) ? id : (SITE + '/video/' + id.replace(/^\/+/, ''));
-  const html = await getHtml(durl);
-  if (!html) return { parse: 0, url: '' };
-  const player = extractPlayer(html);
-  if (!player) return { parse: 0, url: '' };
-  // vidaraa/bysewihe 系：调 api/stream 拿 m3u8 直链
-  if (player.host && player.filecode) {
-    const streamUrl = await fetchStreamUrl(player.host, player.filecode, durl);
+  const baseUrl = durl.replace(/\?.*$/, '');
+
+  // 1. 先找 vidaraa（最可靠，实测100%拿直链）
+  //    先看默认 tape，找不到就依次试 tape=2/3/4
+  let vidPlayer = null;
+  const html = await getHtml(baseUrl);
+  if (html) {
+    const p = extractPlayer(html);
+    if (p && p.isVidaraa && p.filecode) vidPlayer = p;
+  }
+  if (!vidPlayer) {
+    vidPlayer = await findVidaraaTape(baseUrl);
+  }
+  if (vidPlayer && vidPlayer.filecode) {
+    const streamUrl = await fetchStreamUrl(vidPlayer.host, vidPlayer.filecode, baseUrl);
     if (streamUrl) {
       return {
         parse: 0,
         url: streamUrl,
-        header: { 'User-Agent': UA, 'Referer': player.host + '/' },
+        header: { 'User-Agent': UA, 'Referer': vidPlayer.host + '/' },
       };
     }
   }
-  // 其他 embed（如 morencius/loadvid）：走嗅探
-  if (player.embedUrl) {
-    return { parse: 1, url: player.embedUrl, header: { 'User-Agent': UA, 'Referer': REFERER } };
+
+  // 2. 没 vidaraa：默认 tape 的 embed 走嗅探（带 javopen Referer，部分 embed 需要它做验证）
+  if (html) {
+    const p = extractPlayer(html);
+    if (p && p.embedUrl) {
+      return {
+        parse: 1,
+        url: p.embedUrl,
+        header: { 'User-Agent': UA, 'Referer': REFERER },
+      };
+    }
   }
   return { parse: 0, url: '' };
 }

@@ -1,30 +1,37 @@
 import req from '../../util/req.js';
 
 // JavGG (py_javgg)
-// 站点: https://javgg.net/ (WordPress + DooPlay 主题，无反爬)
-// 列表: /new-post/[/page/N/]、/trending/、/tag/{slug}/[/page/N/]、/genre/{slug}/[/page/N/]
+// 站点: https://javgg.net/ (WordPress + DooPlay 主题，无反爬；备用域名 javgg.co)
+// 注意: javgg.co 的 /tag/* 归档页全部 500（站方镜像配置坏了），字幕分类改走搜索替代
+// 列表: /new-post/[/page/N/]、/trending/[/page/N/]、/genre/{slug}/[/page/N/]
+//       搜索型分类: /?s={kw}[&paged=N]（英字幕/中字幕，用搜索代替坏掉的 tag 页）
 // 详情: /jav/{番号slug}/  解析 data-post 得到 post_id
-// 播放: GET /wp-json/dooplayer/v2/{post_id}/movie/1 → embed_url(f4jav.xyz)
-//       → embed 页 data-video-id → GET {host}/api/play/{vid}?ab=0&r={durl} → src(m3u8)
-//       播放必须带 Origin: {embed_host} header，否则 403
+// 播放: dooplayer API server1~3，逐个解码：
+//   f4s系(f4jav.xyz /e/): embed 页 data-video-id → GET {host}/api/play/{vid}?ab=0 → src(m3u8)，需 Origin header
+//   vidhide系(earnvidjavgg.xyz /embed/): 解 Dean Edwards packer → var links.hls2(m3u8)
+//   playmate系(playmate.to /embed/): POST {host}/api/s {c:code,d:'web'} → sx(master.txt)
+//   全部解不出 → 返回 embed 页走 parse:1 嗅探
 
 const KEY = 'py_javgg';
 const NAME = 'JavGG';
 const SITE = 'https://javgg.net';
+const BACKUP_SITE = 'https://javgg.co';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const REFERER = SITE + '/';
 
-// 9 个真实分类 (2026-10-20 实测，均为 200 且有内容)
+// 10 个真实分类 (2026-10-20 实测，javgg.net/.co 均 200 且有内容)
+// kind: 'path' 普通列表页翻页 /page/N/；'search' 搜索页翻页 &paged=N
 const CATS = [
-  { type_id: 'latest', type_name: '最新', url: '/new-post/' },
-  { type_id: 'trending', type_name: '热门', url: '/trending/' },
-  { type_id: 'english-subtitle', type_name: '英字幕', url: '/tag/english-subtitle/' },
-  { type_id: 'chinese-subtitle', type_name: '中字幕', url: '/tag/chinese-subtitle/' },
-  { type_id: 'uncensored-leak', type_name: '无码流出', url: '/tag/uncensored-leak/' },
-  { type_id: 'censored', type_name: '有码', url: '/tag/censored/' },
-  { type_id: 'reduce-mosaic', type_name: '减码破解', url: '/tag/reduce-mosaic/' },
-  { type_id: 'genre-4k', type_name: '4K', url: '/genre/4k/' },
-  { type_id: 'genre-3p', type_name: '3P', url: '/genre/3p/' },
+  { type_id: 'latest', type_name: '最新', kind: 'path', url: '/new-post/' },
+  { type_id: 'trending', type_name: '热门', kind: 'path', url: '/trending/' },
+  { type_id: 'english-subtitle', type_name: '英字幕', kind: 'search', kw: 'english subtitle' },
+  { type_id: 'chinese-subtitle', type_name: '中字幕', kind: 'search', kw: 'chinese subtitle' },
+  { type_id: 'uncensored', type_name: '无码', kind: 'path', url: '/genre/uncensored/' },
+  { type_id: 'hd-uncensored', type_name: '高清无码', kind: 'path', url: '/genre/hd-uncensored/' },
+  { type_id: 'minimal-mosaic', type_name: '减码', kind: 'path', url: '/genre/minimal-mosaic/' },
+  { type_id: 'digital-mosaic', type_name: '有码', kind: 'path', url: '/genre/digital-mosaic/' },
+  { type_id: 'genre-4k', type_name: '4K', kind: 'path', url: '/genre/4k/' },
+  { type_id: 'genre-3p', type_name: '3P', kind: 'path', url: '/genre/3p/' },
 ];
 
 function t(v) {
@@ -53,10 +60,11 @@ function fixUrl(u) {
   return u;
 }
 
+function switchDomain(url, from, to) {
+  return url.replace(from, to);
+}
+
 // 双通道: 先框架 req，失败再原生 fetch
-// minLen: 最小有效长度 (HTML 页用 500，JSON API 用 10)
-// 备用域名: javgg.net 被墙时自动切 javgg.co (2026-10-20 实测同站同结构)
-const BACKUP_SITE = 'https://javgg.co';
 async function getTextInner(url, headers, minLen) {
   const h = {
     'User-Agent': UA,
@@ -66,7 +74,6 @@ async function getTextInner(url, headers, minLen) {
     ...(headers || {}),
   };
   const need = minLen || 500;
-  // 通道1: 框架 req
   try {
     const { data, status } = await req.get(url, { headers: h, timeout: 25000, responseType: 'text' });
     if (status === 200 && data) {
@@ -74,7 +81,6 @@ async function getTextInner(url, headers, minLen) {
       if (txt.length >= need) return txt;
     }
   } catch (e) { /* 换通道2 */ }
-  // 通道2: 原生 fetch
   try {
     const r = await fetch(url, { headers: h });
     if (r.ok) {
@@ -85,16 +91,38 @@ async function getTextInner(url, headers, minLen) {
   return '';
 }
 
-// 域名 failover: 主站抓不到时切备用域名再试
+// 域名 failover: 主站抓不到时切备用域名再试（注意：javgg.co 的 /tag/* 坏了，分类已避开 tag）
 async function getText(url, headers, minLen) {
   let txt = await getTextInner(url, headers, minLen);
   if (txt) return txt;
   if (url.includes('javgg.net')) {
-    const backupUrl = url.replace('javgg.net', 'javgg.co');
-    txt = await getTextInner(backupUrl, headers, minLen);
+    txt = await getTextInner(switchDomain(url, 'javgg.net', 'javgg.co'), headers, minLen);
     if (txt) return txt;
   }
   return '';
+}
+
+// POST JSON 双通道
+async function postJson(url, body, headers) {
+  const h = {
+    'User-Agent': UA,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'Referer': REFERER,
+    ...(headers || {}),
+  };
+  const payload = JSON.stringify(body);
+  try {
+    const { data, status } = await req.post(url, payload, { headers: h, timeout: 25000 });
+    if (status === 200 && data) {
+      return typeof data === 'string' ? JSON.parse(data) : data;
+    }
+  } catch (e) { /* 换通道2 */ }
+  try {
+    const r = await fetch(url, { method: 'POST', headers: h, body: payload });
+    if (r.ok) return await r.json();
+  } catch (e) { /* ignore */ }
+  return null;
 }
 
 // 解析列表卡片
@@ -109,7 +137,6 @@ function parseCards(html) {
     out.push({ vod_id: durl, vod_name: name || durl, vod_pic: pic || '', vod_remarks: '' });
   };
   let m;
-  // 结构1: 列表页
   const re1 = /<article[^>]*class="[^"]*item movies[^"]*"[^>]*>([\s\S]*?)<\/article>/g;
   while ((m = re1.exec(html)) !== null) {
     const card = m[1];
@@ -120,7 +147,6 @@ function parseCards(html) {
     const codeM = card.match(/<h3><a[^>]*>([^<]+)<\/a><\/h3>/);
     push(linkM[1], imgM ? fixUrl(imgM[1]) : '', titleM ? clean(titleM[1]) : (codeM ? clean(codeM[1]) : ''));
   }
-  // 结构2: 搜索页
   const re2 = /<div class="result-item">([\s\S]*?)<\/article>/g;
   while ((m = re2.exec(html)) !== null) {
     const card = m[1];
@@ -135,6 +161,11 @@ function parseCards(html) {
 
 function catUrl(tid, page) {
   const cat = CATS.find(c => c.type_id === tid) || CATS[0];
+  if (cat.kind === 'search') {
+    let base = SITE + '/?s=' + encodeURIComponent(cat.kw);
+    if (page > 1) base += '&paged=' + page;
+    return base;
+  }
   let base = SITE + cat.url;
   if (page > 1) base += 'page/' + page + '/';
   return base;
@@ -150,7 +181,6 @@ async function home(reqIn) {
 }
 
 function parsePagecount(html, page) {
-  // WordPress 分页: /page/N/
   const nums = [...html.matchAll(/\/page\/(\d+)\//g)].map(x => parseInt(x[1], 10)).filter(n => n > 0 && n < 100000);
   const max = nums.length ? Math.max(...nums) : 0;
   return Math.max(max, page, 1);
@@ -191,17 +221,11 @@ async function detail(reqIn) {
   const descM = html.match(/<meta property="og:description" content="([^"]+)"/);
   if (descM) content = clean(descM[1]);
 
-  // post_id 用于播放 API（play 时实时从详情页取，不拼进 vod_play_url，
-  // 避免 URL 里多一个 $ 破坏播放器的 名称$地址 切分）
-  const postM = html.match(/data-post='(\d+)'/);
-  const postId = postM ? postM[1] : '';
-
   return {
     list: [{
       vod_id: durl,
       vod_name: name || durl,
       vod_pic: pic,
-      vod_remarks: '',
       vod_content: content,
       vod_play_from: 'JavGG',
       vod_play_url: `正片$${durl}`,
@@ -209,15 +233,16 @@ async function detail(reqIn) {
   };
 }
 
-// f4s 系 embed 链路: embed 页 data-video-id -> {host}/api/play/{vid} -> m3u8
-// 成功返回 {parse:0,...}，失败返回 null（换下一个 server 或走嗅探）
-async function tryF4sChain(embedUrl, durl) {
+// ---- 播放解码 ----
+
+// f4s 系: embed 页 data-video-id → {host}/api/play/{vid}?ab=0 → src(m3u8)
+async function tryF4s(embedUrl, durl) {
   try {
     const embedHost = new URL(embedUrl).origin;
     const embedHtml = await getText(embedUrl, { 'Referer': durl });
     if (!embedHtml) return null;
     const vidM = embedHtml.match(/data-video-id="([a-f0-9-]+)"/);
-    if (!vidM) return null; // 非 f4s 系（vidhide/streamhg/playmate 等混淆播放器）
+    if (!vidM) return null;
     const vid = vidM[1];
     const apiM = embedHtml.match(/data-api="([^"]+)"/);
     const playApi = apiM ? (apiM[1].startsWith('/') ? embedHost + apiM[1] : apiM[1]) : `${embedHost}/api/play/${vid}`;
@@ -227,7 +252,6 @@ async function tryF4sChain(embedUrl, durl) {
     const srcJson = JSON.parse(srcText);
     const src = t(srcJson.src || srcJson.url);
     if (!src || !/^https?:\/\//.test(src)) return null;
-    // m3u8 必须带 Origin 才能访问 (f4s 锁定)
     return {
       parse: 0,
       url: src,
@@ -238,8 +262,66 @@ async function tryF4sChain(embedUrl, durl) {
   }
 }
 
-// 播放: 依次试 dooplayer server 1~3
-// f4s 系 -> api/play 拿 m3u8 直链(parse:0)；其他混淆播放器 -> 返回 embed 页走嗅探(parse:1)
+// Dean Edwards packer 解包
+function unpackDean(p, a, c, k) {
+  const chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const tok = (n) => {
+    let s = '';
+    if (n === 0) return '0';
+    while (n > 0) { s = chars[n % a] + s; n = Math.floor(n / a); }
+    return s;
+  };
+  for (let i = c - 1; i >= 0; i--) {
+    if (k[i]) {
+      const re = new RegExp('\\b' + tok(i).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
+      p = p.replace(re, k[i]);
+    }
+  }
+  return p;
+}
+
+// vidhide 系 (earnvidjavgg.xyz /embed/): 解 packer → var links.hls2(m3u8)
+async function tryVidhide(embedUrl, durl) {
+  try {
+    const html = await getText(embedUrl, { 'Referer': durl });
+    if (!html || !html.includes('eval(function(p,a,c,k,e,d)')) return null;
+    const m = html.match(/eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)/s);
+    if (!m) return null;
+    const dec = unpackDean(m[1], parseInt(m[2], 10), parseInt(m[3], 10), m[4].split('|'));
+    const lm = dec.match(/["']hls2["']\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/);
+    const src = lm ? lm[1] : (dec.match(/https?:\/\/[^\s"']+\.m3u8[^\s"']*/) || [])[0];
+    if (!src) return null;
+    return {
+      parse: 0,
+      url: src,
+      header: { 'User-Agent': UA, 'Referer': embedUrl },
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// playmate 系 (playmate.to /embed/): POST /api/s {c:filecode,d:'web'} → sx(master.txt)
+async function tryPlaymate(embedUrl, durl) {
+  try {
+    const u = new URL(embedUrl);
+    const code = u.pathname.split('/').filter(Boolean).pop() || '';
+    if (!code) return null;
+    const resp = await postJson(u.origin + '/api/s', { c: code, d: 'web' }, { 'Referer': embedUrl });
+    const src = resp && t(resp.sx || resp.src || resp.url);
+    if (!src || !/^https?:\/\//.test(src)) return null;
+    return {
+      parse: 0,
+      url: src,
+      header: { 'User-Agent': UA, 'Referer': embedUrl },
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// 播放: 依次试 dooplayer server 1~3，每个 embed 按域名选择解码器
+// f4s → api/play 直链；vidhide → 解包直链；playmate → api/s 直链；其他(lulu等) → 嗅探
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -248,7 +330,6 @@ async function play(reqIn) {
   if (/\.m3u8(\?|$)/i.test(id)) {
     return { parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': REFERER } };
   }
-  // id 可能是 "postId$durl" / 完整 durl / 纯 postId
   let postId = '';
   let durl = '';
   const pm = id.match(/^(\d+)\$(https?:\/\/.+)$/);
@@ -277,16 +358,21 @@ async function play(reqIn) {
     try { embedUrl = t(JSON.parse(apiText).embed_url); } catch (e) { continue; }
     if (!embedUrl || !/^https?:\/\//.test(embedUrl)) continue;
     if (!firstEmbed) firstEmbed = embedUrl;
-    // f4s 系 embed 路径形如 /e/{code}；vidhide/playmate 的 /embed/ 直接跳过抓取
+
+    let host = '';
+    try { host = new URL(embedUrl).hostname; } catch (e) { continue; }
+
     let direct = null;
-    try {
-      if (new URL(embedUrl).pathname.startsWith('/e/')) {
-        direct = await tryF4sChain(embedUrl, durl);
-      }
-    } catch (e) { /* ignore */ }
+    if (host.includes('f4jav.xyz') || /\/e\/[A-Za-z0-9]+/.test(embedUrl)) {
+      direct = await tryF4s(embedUrl, durl);
+    } else if (host.includes('earnvidjavgg') || host.includes('vidhide') || host.includes('streamhg')) {
+      direct = await tryVidhide(embedUrl, durl);
+    } else if (host.includes('playmate')) {
+      direct = await tryPlaymate(embedUrl, durl);
+    }
     if (direct) return direct;
   }
-  // 没有 f4s 直链：把 embed 页交给播放器嗅探（手机端执行播放器 JS 后捕获真实流）
+  // 没有直链：把 embed 页交给播放器嗅探
   if (firstEmbed) {
     return { parse: 1, url: firstEmbed, header: { 'User-Agent': UA, 'Referer': durl } };
   }
