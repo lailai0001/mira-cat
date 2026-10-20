@@ -4,21 +4,27 @@
 // 该函数不在任何可抓到的客户端资源里, 明文 sign 实测被源站回 "erro time";
 // 故 play 先按官方链实试 (硬超时, 总耗时 <8s), 失败立即 parse:1 嗅探官方播放器页。
 //
-// 抓取通道 (2026-10-20 第五版): 真机上 App 内两种栈 (框架 req 桌面头 / 原生 fetch
-// iOS 头) 抓本站页面全灭, 同机抓其他 CF 站正常、VM 内同代码全通 —— 拦截在
-// "真机请求特征 x 本站 CF 区域规则"层, 且两栈在 App 内共用同一底层网络栈,
-// 换头换栈都绕不过去。自有 Worker 中转也已实测判死 (本站 CF 专拦 Workers 出口,
-// 回 Attention Required 页)。本版改为三层递进 + 粘性记忆 + 页面缓存:
-//   L1 框架 req + 桌面头直连 (原通道; 在能直连的网络下是不限量的首选)
-//   L2 r.jina.ai 公开抓取中转 (带 x-return-format: html 时返回原始 DOM,
-//      与直连页面同构, 现有解析器可直接吃; 2026-10-20 实测分类/详情/搜索/
-//      榜单/token 接口全部 200 且内容新鲜)
-//   L3 原生 fetch + iOS Safari 头 (最后兜底)
-// 粘性记忆: 记住上一层成功的是哪层, 下次先试它 (真机上首个页面付一次
-// 全链试探成本, 之后直达 jina, 不再每页先撞 L1)。
-// 页面缓存: 列表/搜索 120s、详情 300s —— jina 免费层约 20 次/分钟/IP,
-// 缓存 + 粘性把正常浏览的 jina 调用压到很低, 也顺带加速翻页返回。
-// 校验口径不变: 列表页必须含卡片标记, 拦截页/空壳 (解析 0 卡) 也算失败。
+// 抓取通道 (2026-10-20 第六版): 真机双状态 (VPN 开/关) 直连全灭、第三轮的
+// jina 单中转也全灭。复核结论: 第三轮实现无 URL/编码类低级错误, 但有三个结构
+// 问题 —— (1) jina 只走了原生 fetch 一条传输, 而本仓已真机通过的 SexTB 是走
+// 框架 req (axios) 打 jina 的; (2) 层序直连先行且每层超时叠加 (6+12+6=24s),
+// 全灭时用户每页要等满三层才返回空; (3) r.jina.ai 域名大陆直连通常不可达,
+// VPN 下也未通, 单中转没有第二条可达路径。本版改为:
+//   中转先行 + 多中转并行竞速 (冷启动时 jina/markdown.new/allorigins 三路
+//   同时发, 首个通过内容校验的胜出并记为粘性层, 后续请求直达该层);
+//   单次页面抓取全局预算 20s 封顶, 每层另有自己的超时上限;
+//   markdown.new: Cloudflare 托管的公开转读服务 (大陆直连通常可达), 输出与
+//   jina 同格式的 markdown —— 列表解析器同时吃 HTML 与两种 markdown 方言
+//   (jina 原生 / markdown.new), markdown 模式无封面 (站方懒加载图在转读时
+//   已丢), 有标题+时长, 属降级可用;
+//   allorigins: CF 前置的公开代理, 其实测冷抓取慢且偶发 52x, 只作机会层
+//   (其缓存热时很快; token 接口因其缓存可能串话, 不走它);
+//   jina 本身保留两条传输 (框架 req + 原生 fetch) 与 markdown 降级层
+//   (App 若把自设格式头丢了, jina 返回 markdown 也能出列表);
+//   直连 (req 桌面头 / fetch iOS 头) 降为最后兜底, 不再先行试探。
+// 页面缓存保留: 列表/搜索 120s、详情 300s (降中转调用量, jina 免费层约
+// 20 次/分钟/IP; 竞速只在无粘性层时发生, 稳态每页只打一层)。
+// 校验口径不变: 解析出 0 卡片 (或详情无 og/播放器) 视为该层失败。
 // 另带会话级 Cookie 罐: 任一层响应给了 Set-Cookie 就存下并回放 (仅直连层)。
 import req from '../../util/req.js';
 
@@ -28,8 +34,10 @@ const HOST = 'https://jav.sb';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const UA_IOS = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 const REFERER = HOST + '/';
-// L2 抓取中转: 公开服务 r.jina.ai, 目标 URL 直接拼在其后
+// 公开抓取中转 (目标 URL 直接拼在其后 / 或作参数)
 const JINA = 'https://r.jina.ai/';
+const MDNEW = 'https://markdown.new/';
+const ALLORIGINS = 'https://api.allorigins.win/raw?url=';
 
 // 分类: type_id 为 javtype 的 Type slug; new/rank_* 为 label 页 (见 catUrl)
 const CATS = [
@@ -55,6 +63,7 @@ function clean(s) {
   return t(s)
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
     .replace(/\s+/g, ' ');
 }
 
@@ -64,6 +73,12 @@ function absUrl(u) {
   if (/^https?:\/\//i.test(u)) return u;
   if (u.startsWith('//')) return 'https:' + u;
   return HOST + (u.startsWith('/') ? u : '/' + u);
+}
+
+// ---------- 调试钩子 (仅 harness 设置 globalThis.__JAVSB_LOG__ 时生效) ----------
+function noteLayer(name, ms, ok, url) {
+  const g = globalThis.__JAVSB_LOG__;
+  if (Array.isArray(g)) g.push({ layer: name, ms, ok: !!ok, url });
 }
 
 // ---------- 会话 Cookie 罐 (仅直连 jav.sb 时回放) ----------
@@ -106,7 +121,13 @@ function safariHeaders(referer) {
   };
 }
 
-// ---------- 单次抓取 (三层) ----------
+// jina 取 HTML 的格式头: 两个文档头同时发 (VM 实测同发无冲突),
+// 任一被中间层丢弃时另一个仍可能生效; 都被丢时返回 markdown, 列表层可降级吃。
+function jinaHtmlHeaders() {
+  return { 'User-Agent': UA, 'Accept': '*/*', 'x-return-format': 'html', 'x-respond-with': 'html' };
+}
+
+// ---------- 基础传输 ----------
 async function viaReq(url, headers, timeoutMs) {
   const host = new URL(url).host;
   const h = { ...headers };
@@ -141,25 +162,31 @@ async function viaFetch(url, headers, timeoutMs) {
   }
 }
 
-// L2: r.jina.ai 中转。x-return-format: html 返回目标页原始 DOM (text/plain 承载),
-// 与直连 HTML 同构; JSON 接口会被包进 <pre> 里, 由 parseJsonLoose 剥出。
-async function viaJina(url, timeoutMs) {
-  const ctl = new AbortController();
-  const to = setTimeout(() => ctl.abort(), timeoutMs);
-  try {
-    const r = await fetch(JINA + url, {
-      headers: { 'User-Agent': UA, 'Accept': '*/*', 'x-return-format': 'html' },
-      signal: ctl.signal,
-      redirect: 'follow',
-    });
-    if (!r.ok) return ''; // 含 429 限流: 本层失败, 由外层落其他层/空结果
-    return await r.text();
-  } catch (e) {
-    return '';
-  } finally {
-    clearTimeout(to);
-  }
-}
+// ---------- 抓取层 (name -> {cap, run}) ----------
+// run(targetUrl, timeoutMs) 返回页面文本 (失败为 '')。
+const LAYERS = {
+  // 中转 1: jina 经框架 req (与已真机通过的 SexTB 同传输同头家族)
+  jinaHtmlReq: { cap: 8000, run: (u, ms) => viaReq(JINA + u, jinaHtmlHeaders(), ms) },
+  // 中转 1b: jina 经原生 fetch (传输多样性兜底)
+  jinaHtmlFetch: { cap: 8000, run: (u, ms) => viaFetch(JINA + u, jinaHtmlHeaders(), ms) },
+  // 中转 2: markdown.new (CF 托管, 大陆直连可达性好; 输出 markdown)
+  mdNew: { cap: 8000, run: (u, ms) => viaReq(MDNEW + u, { 'User-Agent': UA, 'Accept': '*/*' }, ms) },
+  // 中转 3: allorigins (CF 前置; 冷抓取慢/偶发 52x, 机会层)
+  allOrigins: { cap: 10000, run: (u, ms) => viaReq(ALLORIGINS + encodeURIComponent(u), { 'User-Agent': UA, 'Accept': '*/*' }, ms) },
+  // 中转 1c: jina markdown (格式头全丢时的降级, 仅列表/搜索有意义)
+  jinaMd: { cap: 8000, run: (u, ms) => viaReq(JINA + u, { 'User-Agent': UA, 'Accept': '*/*' }, ms) },
+  // 直连兜底 (真机已证两出口全灭, 仅保留给网络环境变化的情况)
+  directReq: { cap: 6000, run: (u, ms) => viaReq(u, desktopHeaders(), ms) },
+  directFetch: { cap: 5000, run: (u, ms) => viaFetch(u, safariHeaders(), ms) },
+};
+// 列表/搜索: 全层 (含 markdown 降级)
+const LIST_LAYERS = ['jinaHtmlReq', 'mdNew', 'allOrigins', 'jinaHtmlFetch', 'jinaMd', 'directReq', 'directFetch'];
+// 详情: 必须 HTML (og/播放器), 无 markdown 层
+const DETAIL_LAYERS = ['jinaHtmlReq', 'allOrigins', 'jinaHtmlFetch', 'directReq', 'directFetch'];
+// token 接口: 小预算短链, 不用 allorigins (缓存可能串话) 与 markdown 层
+const TOKEN_LAYERS = ['jinaHtmlReq', 'directReq', 'jinaHtmlFetch'];
+// 冷启动竞速组 (中转三路)
+const RACE_LAYERS = ['jinaHtmlReq', 'mdNew', 'allOrigins'];
 
 // ---------- 页面缓存 ----------
 const pageCache = new Map(); // url -> { t, s }
@@ -177,52 +204,133 @@ function cacheSet(url, s) {
   if (pageCache.size > 80) pageCache.delete(pageCache.keys().next().value);
 }
 
-// ---------- 三层递进抓取 (粘性层记忆) ----------
-// validate(txt) 通过才算拿到真内容; 全部层失败返回 ''。
-// slices: 每层超时上限 (ms), 依次 [L1 req 直连, L2 jina 中转, L3 fetch]
-// ttl: >0 时先查页面缓存、成功后写入缓存。
-let goodLayer = -1;
+// ---------- 多层抓取编排 ----------
+// 粘性层: 按用途分开记 (页面组/ token 组互不污染), 上次胜出的层下次先试。
+const goodLayers = { page: '', token: '' };
 
-async function getText(url, validate, slices, ttl) {
+async function tryLayer(name, url, validate, sliceMs) {
+  const L = LAYERS[name];
+  if (!L || sliceMs < 800) return '';
+  const t0 = Date.now();
+  try {
+    const txt = await L.run(url, sliceMs);
+    const ok = !!txt && validate(txt);
+    noteLayer(name, Date.now() - t0, ok, url);
+    return ok ? txt : '';
+  } catch (e) {
+    noteLayer(name, Date.now() - t0, false, url);
+    return '';
+  }
+}
+
+// opts: { layers, budgetMs, caps(覆盖每层上限), cacheTtl }
+// 全局预算封顶: 任何一页抓取总时长不超过 budgetMs (默认 20s)。
+async function fetchVia(url, validate, opts) {
+  const o = opts || {};
+  const layerNames = (o.layers || LIST_LAYERS).filter(n => LAYERS[n]);
+  const budget = o.budgetMs || 20000;
+  const deadline = Date.now() + budget;
+  const capOf = (n) => (o.caps && o.caps[n]) || LAYERS[n].cap;
+  const remain = () => deadline - Date.now();
   const ok = typeof validate === 'function' ? validate : (s) => !!s;
-  if (ttl) {
-    const cached = cacheGet(url, ttl);
+
+  if (o.cacheTtl) {
+    const cached = cacheGet(url, o.cacheTtl);
     if (cached && ok(cached)) return cached;
   }
-  const [s1, s2, s3] = slices || [6000, 12000, 6000];
-  const layers = [
-    () => viaReq(url, desktopHeaders(), s1),
-    () => viaJina(url, s2),
-    () => viaFetch(url, safariHeaders(), s3),
-  ];
-  const order = goodLayer >= 0
-    ? [goodLayer, ...[0, 1, 2].filter(i => i !== goodLayer)]
-    : [0, 1, 2];
-  for (const i of order) {
-    try {
-      const txt = await layers[i]();
-      if (txt && ok(txt)) {
-        goodLayer = i;
-        if (ttl) cacheSet(url, txt);
-        return txt;
+  const tried = new Set();
+  const stickyKey = o.stickyKey || 'page';
+  const succeed = (name, txt) => {
+    goodLayers[stickyKey] = name;
+    if (o.cacheTtl) cacheSet(url, txt);
+    return txt;
+  };
+
+  // 1) 粘性层先行
+  const sticky = goodLayers[stickyKey];
+  if (sticky && layerNames.includes(sticky) && remain() > 800) {
+    tried.add(sticky);
+    const txt = await tryLayer(sticky, url, ok, Math.min(capOf(sticky), remain()));
+    if (txt) return succeed(sticky, txt);
+  }
+
+  // 2) 冷启动竞速: 中转组同时发, 首个通过校验的胜出。
+  // 形态偏好: markdown 结果 (无封面) 先攒住, 给 HTML 结果 2.5s 宽限期,
+  // 宽限内有 HTML 胜出则用 HTML (列表有封面), 否则用先到的 markdown。
+  const racers = RACE_LAYERS.filter(n => layerNames.includes(n) && !tried.has(n));
+  const mdCapable = layerNames.includes('jinaMd'); // 详情/token 组无 markdown 降级, 不走宽限
+  if (racers.length > 1 && remain() > 1500) {
+    racers.forEach(n => tried.add(n));
+    const raced = await new Promise((resolve) => {
+      let settled = 0;
+      let done = false;
+      let mdCand = null;
+      let graceTimer = null;
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        if (graceTimer) clearTimeout(graceTimer);
+        resolve(v);
+      };
+      const timer = setTimeout(() => finish(mdCand), remain());
+      for (const n of racers) {
+        tryLayer(n, url, ok, Math.min(capOf(n), remain())).then((txt) => {
+          if (done) return;
+          if (txt) {
+            const cand = { name: n, txt };
+            if (!mdCapable || txt.includes('<div class="thumbnail group">')) { finish(cand); return; }
+            if (!mdCand) {
+              mdCand = cand;
+              graceTimer = setTimeout(() => finish(mdCand), 2500);
+            }
+            settled++;
+          } else {
+            settled++;
+          }
+          if (settled >= racers.length) finish(mdCand);
+        });
       }
-    } catch (e) { /* 下一层 */ }
+    });
+    if (raced) return succeed(raced.name, raced.txt);
+  }
+
+  // 3) 其余层按序递进
+  for (const n of layerNames) {
+    if (tried.has(n) || remain() <= 800) continue;
+    tried.add(n);
+    const txt = await tryLayer(n, url, ok, Math.min(capOf(n), remain()));
+    if (txt) return succeed(n, txt);
   }
   return '';
 }
 
-// 列表页校验: 必须含真实卡片标记 (拦截页/空壳不含)
-const isListPage = (s) => s.includes('<div class="thumbnail group">');
-// 详情页校验: og 标题或官方播放器任一出现
-const isDetailPage = (s) => s.includes('og:title') || s.includes('/static/player/');
-// 搜索页校验: 有卡片最好; 无结果页也是真页面 (足够长且含站内标记) 一并接受, 避免空结果白等三层
-const isSearchPage = (s) => isListPage(s) || (s.length > 3000 && s.includes('javtype'));
-
-function getHtml(url, validate, ttl) {
-  return getText(url, validate || isListPage, undefined, ttl == null ? TTL_LIST : ttl);
+function getListPage(url, validate) {
+  return fetchVia(url, validate || isListPage, { layers: LIST_LAYERS, budgetMs: 20000, cacheTtl: TTL_LIST });
 }
 
-// ---------- JSON 宽松解析 (直连是裸 JSON, jina 会包 <pre>) ----------
+function getDetailPage(url, budgetMs) {
+  return fetchVia(url, isDetailPage, { layers: DETAIL_LAYERS, budgetMs: budgetMs || 20000, cacheTtl: TTL_DETAIL });
+}
+
+// ---------- 内容校验 ----------
+// 校验口径: 能解析出卡片才算列表页 (拦截页/空壳/markdown 无卡均不算)
+const isListPage = (s) => countCards(s) > 0;
+// 详情页校验: og 标题或官方播放器任一出现 (仅 HTML 形态)
+const isDetailPage = (s) => typeof s === 'string' && (s.includes('og:title') || s.includes('/static/player/'));
+// 搜索页校验: 有卡片最好; 无结果的 HTML 页也是真页面 (足够长且含站内标记) 一并接受
+const isSearchPage = (s) => countCards(s) > 0 || (typeof s === 'string' && s.length > 3000 && s.includes('javtype'));
+// 转读 markdown 页面校验 (jina / markdown.new 的输出都带 Title: 前缀行)
+const isMdPage = (s) => typeof s === 'string' && s.includes('Title: ') && s.includes('Markdown Content:');
+
+// 从转读 markdown 里提取页面标题 (首行 "Title: xxx", 可能带站名后缀)
+function mdTitle(md) {
+  const m = String(md || '').match(/^Title:\s*(.+)$/m);
+  if (!m) return '';
+  return clean(m[1]).replace(/\s*[-|–—]\s*JAVSB\s*$/i, '').trim();
+}
+
+// ---------- JSON 宽松解析 (直连是裸 JSON, jina HTML 会包 <pre>, markdown 会带前后缀) ----------
 function parseJsonLoose(s) {
   if (!s) return null;
   try { return JSON.parse(s); } catch (e) { /* 继续 */ }
@@ -231,13 +339,23 @@ function parseJsonLoose(s) {
   return null;
 }
 
-// ---------- 列表解析 ----------
+// ---------- 列表解析 (HTML + markdown 双形态) ----------
 
-// 卡片: <div class="thumbnail group"> ... <a href="/jav/{slug}-1-1.html">
+function countCards(html) {
+  return parseCards(html).length;
+}
+
+function parseCards(html) {
+  const s = String(html || '');
+  if (s.includes('<div class="thumbnail group">')) return parseCardsHtml(s);
+  return parseCardsMd(s);
+}
+
+// HTML 卡片: <div class="thumbnail group"> ... <a href="/jav/{slug}-1-1.html">
 //   <img data-src="/upload/vod/*.jpg" alt="片名"> ... <span ...>时长</span>
 // 按卡片起始标签切块解析, 每块窗口给足 4000 字符, 保证最后一张卡不丢。
-// jina HTML 与直连 HTML 同构 (实测卡片字段逐一对齐), 同一解析器通用。
-function parseCards(html) {
+// jina HTML / allorigins 与直连 HTML 同构, 同一解析器通用。
+function parseCardsHtml(html) {
   const out = [];
   const seen = new Set();
   const parts = String(html || '').split('<div class="thumbnail group">');
@@ -266,7 +384,39 @@ function parseCards(html) {
   return out;
 }
 
-// 从分页链接提取总页数
+// markdown 卡片 (jina 原生 markdown 与 markdown.new 两种方言通用):
+//   jina:      [![Image N: 片名](loading.png)](详情URL)[时长](详情URL) + [片名](详情URL)
+//   md.new:    [](详情URL) [时长](详情URL) + [片名](详情URL)
+// 共同点: 都有独立的 [片名](详情URL) 文本链接, 且详情 URL 均为 /jav/*.html
+// (导航/分类链接是 /javtype/*, 不会误入)。封面在转读时已丢 (懒加载占位图),
+// vod_pic 留空 —— 降级可用: 有标题、时长, 点进去走详情层取真图与播放。
+function parseCardsMd(text) {
+  const s = String(text || '');
+  const dur = new Map();
+  for (const m of s.matchAll(/\[(\d+:\d{2}:\d{2})\]\((https:\/\/jav\.sb\/jav\/[^)\s]+\.html)\)/g)) {
+    if (!dur.has(m[2])) dur.set(m[2], m[1]);
+  }
+  const out = [];
+  const seen = new Set();
+  const push = (url, title) => {
+    const name = clean(title || '');
+    if (!url || seen.has(url)) return;
+    if (!name || /^\d+:\d{2}:\d{2}$/.test(name)) return;
+    seen.add(url);
+    out.push({ vod_id: url, vod_name: name, vod_pic: '', vod_remarks: dur.get(url) || '' });
+  };
+  // jina 方言的图片链接行 (alt 即片名)
+  for (const m of s.matchAll(/!\[Image \d+: ([^\]]+)\]\([^)]*\)\]\((https:\/\/jav\.sb\/jav\/[^)\s]+\.html)\)/g)) {
+    push(m[2], m[1]);
+  }
+  // 两方言共有的独立片名链接行
+  for (const m of s.matchAll(/\[([^\]]+)\]\((https:\/\/jav\.sb\/jav\/[^)\s]+\.html)\)/g)) {
+    push(m[2], m[1]);
+  }
+  return out;
+}
+
+// 从分页链接提取总页数 (HTML 与 markdown 里都是同样的 URL 字面, 通用)
 function pagecountOf(html, re) {
   const nums = [...String(html || '').matchAll(re)].map(x => parseInt(x[1], 10)).filter(n => n > 0 && n < 1000000);
   return nums.length ? Math.max(...nums) : 1;
@@ -299,7 +449,7 @@ async function init(reqIn) {
 
 async function home(reqIn) {
   const cls = CATS.map(c => ({ type_id: c.type_id, type_name: c.type_name }));
-  const html = await getHtml(HOST + '/');
+  const html = await getListPage(HOST + '/');
   const list = html ? parseCards(html).slice(0, 30) : [];
   return { class: cls, list };
 }
@@ -309,7 +459,7 @@ async function category(reqIn) {
   const tid = t(body.tid || body.id) || 'new';
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const cat = CATS.find(c => c.type_id === tid) || CATS[0];
-  const html = await getHtml(catUrl(cat, page));
+  const html = await getListPage(catUrl(cat, page));
   if (!html) return { page, pagecount: page, limit: 12, total: 0, list: [] };
   const list = parseCards(html);
   const pc = catPagecount(html, cat);
@@ -336,8 +486,28 @@ async function detail(reqIn) {
   const id = t(body.id);
   if (!id) return { list: [] };
   const durl = /^https?:\/\//.test(id) ? id : absUrl(id);
-  const html = await getHtml(durl, isDetailPage, TTL_DETAIL);
-  if (!html) return { list: [] };
+  const html = await getDetailPage(durl);
+  if (!html) {
+    // HTML 全层失败时的降级: 用转读 markdown 合成详情条目 (只有标题,
+    // 无封面/播放器信息) —— 至少能打开条目, play 会落 parse:1 嗅探详情页,
+    // WebView 与蜘蛛抓取通道相互独立, 仍有播出机会, 强于返回空详情。
+    const md = await fetchVia(durl, isMdPage, {
+      layers: ['jinaHtmlFetch', 'jinaMd', 'mdNew'], budgetMs: 8000,
+    });
+    const name = md ? mdTitle(md) : '';
+    if (!name) return { list: [] };
+    return {
+      list: [{
+        vod_id: durl,
+        vod_name: name,
+        vod_pic: '',
+        vod_remarks: '',
+        vod_content: '',
+        vod_play_from: 'JAVSB',
+        vod_play_url: `正片$${durl}`,
+      }],
+    };
+  }
   const name = og(html, 'title');
   const pic = og(html, 'image');
   const desc = og(html, 'description');
@@ -361,11 +531,13 @@ async function tryOfficialStream(hash, playerUrl, deadline) {
   if (Date.now() >= deadline) return '';
   const hasToken = (s) => { const j = parseJsonLoose(s); return !!(j && j.token); };
   const hasFile = (s) => { const j = parseJsonLoose(s); return !!(j && j.m3u8_file); };
-  // 第1步: 换 token (三层通道, 总预算内; slices 依次 [req, jina, fetch])
+  // 第1步: 换 token (中转短链, 整个 play 的剩余预算内)
   let token = '', ts = '';
   try {
-    const txt = await getText(`${HOST}/token.php?file=${encodeURIComponent(hash)}`, hasToken,
-      [budget(2000), budget(3500), budget(1500)]);
+    const txt = await fetchVia(`${HOST}/token.php?file=${encodeURIComponent(hash)}`, hasToken, {
+      layers: TOKEN_LAYERS, budgetMs: Math.max(600, deadline - Date.now()), stickyKey: 'token',
+      caps: { jinaHtmlReq: budget(2500), directReq: budget(2000), jinaHtmlFetch: budget(1500) },
+    });
     const j = parseJsonLoose(txt);
     token = t(j && j.token); ts = t(j && j.ts);
   } catch (e) { /* 落嗅探 */ }
@@ -375,7 +547,10 @@ async function tryOfficialStream(hash, playerUrl, deadline) {
   const key = `${hash}@${Math.floor(Date.now() / 1000)}`;
   try {
     const url = `${HOST}/save_m3u8_cache.php?file=${encodeURIComponent(hash)}&token=${encodeURIComponent(token)}&ts=${encodeURIComponent(ts)}&sign=${encodeURIComponent(key)}`;
-    const txt = await getText(url, hasFile, [budget(2000), budget(3000), budget(1500)]);
+    const txt = await fetchVia(url, hasFile, {
+      layers: TOKEN_LAYERS, budgetMs: Math.max(600, deadline - Date.now()), stickyKey: 'token',
+      caps: { jinaHtmlReq: budget(2000), directReq: budget(1500), jinaHtmlFetch: budget(1200) },
+    });
     const j = parseJsonLoose(txt);
     const f = t(j && j.m3u8_file);
     if (f && /m3u8/i.test(f)) return f + (f.includes('sign=') ? '' : `&sign=${key}`);
@@ -393,9 +568,8 @@ async function play(reqIn) {
   }
   const durl = /^https?:\/\//.test(id) ? id : absUrl(id);
   const deadline = Date.now() + 7500; // play 总耗时 <8s 有界
-  const remain = () => Math.max(300, deadline - Date.now());
-  const html = await getText(durl, isDetailPage,
-    [Math.min(2500, remain()), Math.min(6000, remain()), Math.min(2000, remain())], TTL_DETAIL);
+  const remain = () => Math.max(400, deadline - Date.now());
+  const html = await getDetailPage(durl, remain());
   const { playerUrl, hash } = html ? extractPlayer(html) : { playerUrl: '', hash: '' };
   if (hash && playerUrl) {
     const direct = await tryOfficialStream(hash, playerUrl, deadline);
@@ -419,7 +593,7 @@ async function search(reqIn) {
   if (!wd) return { page, pagecount: page, limit: 12, total: 0, list: [] };
   const kw = encodeURIComponent(wd);
   const url = page > 1 ? `${HOST}/vod/search/page/${page}/wd/${kw}.html` : `${HOST}/vod/search.html?wd=${kw}`;
-  const html = await getHtml(url, isSearchPage);
+  const html = await getListPage(url, isSearchPage);
   if (!html) return { page, pagecount: page, limit: 12, total: 0, list: [] };
   const list = parseCards(html);
   const pc = pagecountOf(html, /\/vod\/search\/page\/(\d+)\//g);
