@@ -70,7 +70,29 @@ function clean(s) {
     .replace(/&#\d+;/g, ''));
 }
 
-// ---------------- 抓取 (框架 req 优先, fetch 兜底; 均跟随重定向) ----------------
+// ---------------- 抓取 (多层兜底 + 内容校验 + 胜出层记忆) ----------------
+// 2026-10-21 第三轮修复 (与 bestjavporn 同病同方):
+// 真机故障根因 (VM 实测坐实): 本站 (与 bestjavporn 同运营网络) 的
+// Cloudflare 按 User-Agent 拉黑 HTTP 库特征 UA —— okhttp / Java /
+// axios / node-fetch / python-requests 等一律 403, 只回 17B~5.5KB
+// 空壳页; 浏览器 UA (含空 UA) 则 200 满页。App 运行时发出的请求
+// 带的正是这类被拉黑的 UA (蜘蛛设置的 Chrome UA 未能生效到站方),
+// 于是真机上 home/category/search/detail 全部只拿到 403 空壳 ->
+// 解析 0 卡 -> "有分类、无内容、点不开"。其他源 (Brazz/javideo/
+// 7mmtv) 的 CF 区没有这条规则, 故独这两站全灭。
+// 对策: 抓取改为多层竞速兜底, 每层结果先过内容校验 (真页面:
+// 长度 >12KB 且含 pornfhd.com 标记且无 CF 空壳特征) 才采纳:
+//   直连 req -> 直连 fetch -> jina 读页 (x-respond-with:html 取
+//   原始 HTML, 实测 1~2s 满页保真) -> allorigins -> codetabs。
+// 记住胜出层 (sticky), 后续请求先试它, 避免每次全程试错。
+// 总预算 70s; 真机典型路径: 直连两层快速吃 403 (~2s) -> jina ~2s。
+function isRealPage(html) {
+  if (!html || html.length < 12000) return false;
+  if (!html.includes('pornfhd.com')) return false;
+  if (/Attention Required|Just a moment|cf-challenge|Checking your browser/i.test(html)) return false;
+  return true;
+}
+
 async function viaReq(url, timeoutMs) {
   try {
     const r = await req.get(url, {
@@ -84,15 +106,11 @@ async function viaReq(url, timeoutMs) {
   }
 }
 
-async function viaFetch(url, timeoutMs) {
+async function fetchText(url, headers, timeoutMs) {
   try {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs || 15000);
-    const r = await fetch(url, {
-      headers: { 'User-Agent': UA, Referer: REFERER },
-      redirect: 'follow',
-      signal: ctl.signal,
-    });
+    const r = await fetch(url, { headers, redirect: 'follow', signal: ctl.signal });
     clearTimeout(timer);
     if (!r.ok) return '';
     return await r.text();
@@ -101,13 +119,61 @@ async function viaFetch(url, timeoutMs) {
   }
 }
 
-async function getPage(url, timeoutMs) {
-  let html = await viaReq(url, timeoutMs);
-  if (!html || html.length < 2000) {
-    const f = await viaFetch(url, timeoutMs);
-    if (f && f.length > (html ? html.length : 0)) html = f;
+async function viaFetch(url, timeoutMs) {
+  return fetchText(url, { 'User-Agent': UA, Referer: REFERER }, timeoutMs);
+}
+
+async function viaJina(url) {
+  // jina 匿名读页偶发 401 (出口 IP 信誉), 立即重试一次常能过
+  for (let i = 0; i < 2; i++) {
+    const html = await fetchText('https://r.jina.ai/' + url, {
+      'User-Agent': UA,
+      'x-respond-with': 'html',
+    }, 22000);
+    if (isRealPage(html)) return html;
+    if (i === 0) await new Promise((res) => setTimeout(res, 1200));
   }
-  return html || '';
+  return '';
+}
+
+async function viaAllorigins(url) {
+  return fetchText('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, 30000);
+}
+
+async function viaCodetabs(url) {
+  return fetchText('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, 22000);
+}
+
+const PAGE_LAYERS = [
+  (url, ms) => viaReq(url, ms),
+  (url, ms) => viaFetch(url, ms),
+  (url) => viaJina(url),
+  (url) => viaAllorigins(url),
+  (url) => viaCodetabs(url),
+];
+let goodLayer = -1; // 上次胜出的层下标, -1 = 未知
+
+async function getPage(url, timeoutMs) {
+  const deadline = Date.now() + 70000;
+  const order = [];
+  if (goodLayer >= 0) order.push(goodLayer);
+  for (let i = 0; i < PAGE_LAYERS.length; i++) if (i !== goodLayer) order.push(i);
+  let best = '';
+  for (const idx of order) {
+    if (Date.now() > deadline) break;
+    let html = '';
+    try { html = await PAGE_LAYERS[idx](url, timeoutMs); } catch (e) { html = ''; }
+    if (isRealPage(html)) {
+      goodLayer = idx;
+      return html;
+    }
+    if (html && html.length > best.length) best = html;
+  }
+  return best;
 }
 
 // ---------------- 解析 ----------------
