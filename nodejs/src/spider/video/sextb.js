@@ -9,32 +9,40 @@ import req from '../../util/req.js';
 // 列表: / (最新) / /genre/{slug}/[/pg-N/]  tray-item 卡片
 // 卡片: div.tray-item > a[href="/{code}"] > img.tray-item-thumbnail (封面取 data-src，src 是 default-cover 占位图)
 // 详情: GET /{code}  filmId + 服务器列表 (button.btn-player.episode[data-source][data-id]，如 F4/SW/PM/DD/FL/US)
-// 播放 (v3): 全部走 parse:1 嗅探，不再解析直链、不再本地代理:
-//       1) 详情页默认 iframe 非 F4 -> 直接嗅探该 embed 页；
-//       2) 默认是 F4 (f4scdn.com/f4jav.xyz) -> 按按钮顺序跳过 F4，
-//          最多借 2 条非 F4 线路 (POST /ajax/player 快速版)，嗅探借到的 embed；
-//       3) 借不到 -> 嗅探 F4 自己的 embed 页兜底。
-//       play 只做 1 次详情页 GET + 至多 2 次 ajax POST，秒级返回。
-// 实测根因 (2026-10-20 VM 验证): f4 CDN 的 playlist.txt、子播放列表、每个分片
-//       请求都必须带 Origin: {embed host} 才能 200，否则 403（仅 UA 无头 → 403；
-//       无 UA → 404；Referer 也救不了）。iOS 播放器无法自行补 Origin（被禁止
-//       自定义），所以 play 返回的 m3u8 直链在端内播不了。
-// 修复史: v1 本地代理透传分片、v2 只代理播放列表 + 分片直链靠 play 的
-//       header 补 Origin，两轮用户真机均无法播放——播放器不把 play 返回
-//       的 header (尤其 Origin) 透传到分片请求，f4 直链路在端内无解。
-// 修复 (v3, 2026-10-20): 删掉整个本地代理与 f4 直链解析，play 全面改走
-//       嗅探。依据: (1) 抽样 28 个视频默认 embed 26 个是 F4，非 F4 默认
-//       (hglink/streamhg 系，FC2 分类) 的 parse:1 嗅探真机已验证可播；
-//       (2) F4 embed 页是纯 fetch 驱动 (player.js 用 fetch(api/play) +
-//       fetch(playlist)，无自定义头)，网页上下文里浏览器自动带
-//       Origin: https://f4scdn.com，嗅探链路自洽。
-
+// 播放 (v4): 逐个 embed 宿主在蜘蛛侧解析直链 (parse:0)，嗅探只做最后兜底。
+//       三轮全嗅探真机仍全灭（本站 embed 页在 MiraPlayer 嗅探里起不了播）。
+//       线路按宿主分流（优先级 SW > PM > F4 > FL > DD > US > ST > PP）:
+//         SW (hglink.to, StreamHG 系): 同代码在 trailerhg.xyz 有 XFS 明文页,
+//           纯字符串解包取 links: hls3（无 token 的 master.txt）优先、
+//           hls2（带 asn= 网络绑定 token）其次；填了 SEXTB_WORKER 则整链
+//           走 Worker /v（铸 token 与拉流同出口）。
+//         PM (playmate 系): POST /api/s {c,d:'web'} → sx 直链（无头要求，
+//           JavGG 线已真机验证同协议可播）；vidara 系 POST /api/stream。
+//         F4 (f4scdn/f4jav): 列表与分片强制 Origin: https://f4scdn.com，
+//           播放器不透传 header，端内直链无解 —— 只能走 SEXTB_WORKER 的
+//           /f4 全链代理（Worker 内 api/play 取 src + 注入 Origin 改写）。
+//           未部署 Worker 时 F4 线路跳过（试其他线路，全灭再嗅探兜底）。
+//         FL/DD/其他 XFS 系: 通用解包提取 m3u8/mp4 + 探活通过才返回。
+//       每条线路解析都带探活（列表须 #EXTM3U、mp4 须 200/206），
+//       探活不过当没解出，继续下一条，避免返回死链堵住后面的机会。
+// 实测根因 (2026-10-20 VM 验证): f4 CDN 的 playlist、子列表、每个分片
+//       请求都必须带 Origin: https://f4scdn.com 才能 200（UA-only 403、
+//       Referer 403）。其官方 api/play?ab=0 能拿签名 src，但 src 的列表与
+//       分片同样查 Origin —— 这就是 v1/v2/v3 三轮真机全灭的最后一关。
+// 修复史: v1 本地代理透传分片（App 本地桥传二进制失败）、v2 只代理列表
+//       靠 play header 补 Origin（播放器不透传）、v3 全线嗅探（本站
+//       embed 页嗅探起不了播），三轮真机均无法播放。v4 改逐宿主解析。
 const KEY = 'py_sextb';
 const NAME = 'SexTB';
 const HOSTS = ['https://sextb.cc', 'https://sextb.net'];
 const SITE = HOSTS[0];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const REFERER = SITE + '/';
+
+// SexTB 专用 HLS 代理 Worker 地址（sextb-hls-worker.js，用户手动部署到
+// 自己的 Cloudflare 后填这里，如 https://sextb-hls.xxx.workers.dev）。
+// 留空 = 未部署: F4 线路无法解析（站方 Origin 墙）、SW 走蜘蛛内解析。
+const SEXTB_WORKER = '';
 
 // 核心分类 + 精选题材 (2026-10-20 从 /genres 页实测存在，两域名通用)
 const CATS = [
@@ -251,6 +259,291 @@ async function postJsonFast(durl, body) {
   return '';
 }
 
+
+// ================= v4 播放解析层（逐宿主直解） =================
+
+// 纯字符串 Dean Edwards packer 解包（XFS 系 embed 页通用，禁 vm/eval）
+function jsUnescapeSingle(s) {
+  return s.replace(/\\(.)/g, (m, c) => {
+    if (c === 'n') return '\n';
+    if (c === 'r') return '\r';
+    if (c === 't') return '\t';
+    return c;
+  });
+}
+
+function unpackDeanEdwards(html) {
+  const m = String(html || '').match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\s*\(\s*'((?:[^'\\]|\\.)*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:[^'\\]|\\.)*)'\.split\('\|'\)/);
+  if (!m) return '';
+  let p = jsUnescapeSingle(m[1]);
+  const a = parseInt(m[2], 10);
+  const c = parseInt(m[3], 10);
+  const k = jsUnescapeSingle(m[4]).split('|');
+  const enc = (n) => (n < a ? '' : enc(Math.floor(n / a))) + ((n % a) > 35 ? String.fromCharCode((n % a) + 29) : (n % a).toString(36));
+  let i = c;
+  while (i--) {
+    if (k[i]) {
+      const word = k[i];
+      p = p.replace(new RegExp('\\b' + enc(i) + '\\b', 'g'), () => word);
+    }
+  }
+  return p;
+}
+
+// 从解包文本提取 StreamHG links{hls2,hls3,hls4}
+function extractHgLinks(text) {
+  const links = {};
+  for (const m of String(text || '').matchAll(/"hls(\d+)"\s*:\s*"([^"]+)"/g)) {
+    links['hls' + m[1]] = m[2];
+  }
+  return links;
+}
+
+// 从解包文本/页面提取通用 file: m3u8 或 mp4（filemoon/streamwish/voe 等）
+function extractGenericFile(text) {
+  const s = String(text || '');
+  let m = s.match(/"file"\s*:\s*"(https?:[^"]+?\.m3u8[^"]*)"/) || s.match(/file\s*:\s*"(https?:[^"]+?\.m3u8[^"]*)"/);
+  if (m) return m[1];
+  m = s.match(/(https?:\/\/[^\s"'\\]+\.m3u8(?:\?[^\s"'\\]*)?)/);
+  if (m) return m[1];
+  m = s.match(/"file"\s*:\s*"(https?:[^"]+?\.mp4[^"]*)"/);
+  if (m) return m[1];
+  return '';
+}
+
+// 带超时的二进制 GET 探活（只关心状态码与前几个字节）
+async function timedFetchBytes(url, headers, timeoutMs, range) {
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), timeoutMs || 7000);
+  try {
+    const h = { ...(headers || {}) };
+    if (range) h['Range'] = range;
+    const r = await fetch(url, { headers: h, signal: ctl.signal });
+    const buf = await r.arrayBuffer().catch(() => new ArrayBuffer(0));
+    return { status: r.status, text: new TextDecoder().decode(buf.slice(0, 4096)), size: buf.byteLength };
+  } catch (e) {
+    return { status: 0, text: '', size: 0 };
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+// 探活: 是真播放列表才认（#EXTM3U 开头）
+async function probePlaylist(url, headers) {
+  const r = await timedFetchBytes(url, headers, 7000);
+  return r.status === 200 && r.text.includes('#EXTM3U');
+}
+
+// 通用 GET 文本（embed 页解析用：req 通道 + fetch 通道，不做本站拦截页判定）
+async function fetchEmbedText(url, referer, timeoutMs) {
+  const headers = pageHeaders(referer || REFERER);
+  const to = timeoutMs || 12000;
+  try {
+    const { data, status } = await req.get(url, { headers, timeout: to });
+    if (status === 200 && typeof data === 'string' && data.length > 200) return data;
+  } catch (e) { /* 换通道2 */ }
+  const txt = await timedFetchText(url, headers, to);
+  return txt && txt.length > 200 ? txt : '';
+}
+
+// JSON POST（playmate/vidara 的 api 用）: req 通道 + fetch 通道
+async function postJsonBody(url, obj, headers, timeoutMs) {
+  const to = timeoutMs || 10000;
+  const h = {
+    'User-Agent': UA,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    ...(headers || {}),
+  };
+  const payload = JSON.stringify(obj);
+  try {
+    const { data, status } = await req.post(url, payload, { headers: h, timeout: to });
+    if (status === 200 && data) return typeof data === 'string' ? JSON.parse(data) : data;
+  } catch (e) { /* 换通道2 */ }
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), to);
+  try {
+    const r = await fetch(url, { method: 'POST', headers: h, body: payload, signal: ctl.signal });
+    if (r.ok) return await r.json();
+  } catch (e) { /* ignore */ } finally {
+    clearTimeout(timer);
+  }
+  return null;
+}
+
+function hostOf(u) {
+  try { return new URL(u).hostname.toLowerCase(); } catch (e) { return ''; }
+}
+
+function codeOf(u) {
+  try {
+    const parts = new URL(u).pathname.split('/').filter(Boolean);
+    return parts[parts.length - 1] || '';
+  } catch (e) { return ''; }
+}
+
+// SW / StreamHG 系（hglink.to、streamhg、trailerhg、earnvid、vidhide 等）:
+// 填了 Worker → 整链走 Worker /v；否则蜘蛛内解包: hglink 换 trailerhg 同
+// 代码 XFS 页 → 解包 links → hls3（无 token）优先、hls2（asn 绑定）其次，
+// 探活通过才返回。
+async function resolveStreamHg(embedUrl, durl) {
+  if (SEXTB_WORKER) {
+    const wurl = SEXTB_WORKER + '/v?u=' + encodeURIComponent(embedUrl) + '&r=' + encodeURIComponent(durl);
+    // 先探活 Worker 真能出列表再返回，避免 Worker 故障时堵住其他线路
+    if (await probePlaylist(wurl, { 'User-Agent': UA })) {
+      return { parse: 0, url: wurl, header: { 'User-Agent': UA } };
+    }
+    return null;
+  }
+  const host = hostOf(embedUrl);
+  const code = codeOf(embedUrl);
+  if (!code) return null;
+  let pageUrl = embedUrl;
+  if (/(^|\.)hglink\.to$/.test(host)) pageUrl = 'https://trailerhg.xyz/e/' + code;
+  const html = await fetchEmbedText(pageUrl, durl, 12000);
+  if (!html) return null;
+  const unpacked = unpackDeanEdwards(html) || html;
+  const links = extractHgLinks(unpacked);
+  const heads = { 'User-Agent': UA };
+  if (links.hls3 && await probePlaylist(links.hls3, heads)) {
+    return { parse: 0, url: links.hls3, header: heads };
+  }
+  if (links.hls4 && await probePlaylist(links.hls4, heads)) {
+    return { parse: 0, url: links.hls4, header: heads };
+  }
+  // hls2 的 token 按解码方网络签发（asn=），探活过也只代表当前网络能拉，
+  // 仍返回作次选（同机同网时可播），排在 hls3/hls4 之后
+  if (links.hls2 && await probePlaylist(links.hls2, heads)) {
+    return { parse: 0, url: links.hls2, header: heads };
+  }
+  return null;
+}
+
+// PM / playmate 系（playmate.to /embed/{code}）:
+// POST /api/s {c:code, d:'web'} → sx 直链，列表/分片无特殊头要求
+async function resolvePlaymate(embedUrl) {
+  try {
+    const u = new URL(embedUrl);
+    const code = codeOf(embedUrl);
+    if (!code) return null;
+    const resp = await postJsonBody(u.origin + '/api/s', { c: code, d: 'web' }, { 'Referer': embedUrl }, 10000);
+    const src = resp && t(resp.sx || resp.src || resp.url);
+    if (!src || !/^https?:\/\//.test(src)) return null;
+    return { parse: 0, url: src, header: { 'User-Agent': UA, 'Referer': embedUrl } };
+  } catch (e) {
+    return null;
+  }
+}
+
+// vidara 系（shadowbyte.site / dstyladsg.com / vidara*）:
+// POST /api/stream {filecode, device:'ios', codecs:['h265']} → streaming_url
+async function resolveVidara(embedUrl) {
+  try {
+    const u = new URL(embedUrl);
+    const code = codeOf(embedUrl);
+    if (!code) return null;
+    const resp = await postJsonBody(u.origin + '/api/stream',
+      { filecode: code, device: 'ios', codecs: ['h265'] },
+      { 'Referer': embedUrl, 'Origin': u.origin }, 10000);
+    const src = resp && t(resp.streaming_url || resp.src || resp.url);
+    if (!src || !/^https?:\/\//.test(src)) return null;
+    return { parse: 0, url: src, header: { 'User-Agent': UA, 'Referer': embedUrl } };
+  } catch (e) {
+    return null;
+  }
+}
+
+// dood 系（doodstream 及克隆域名）: embed 页取 /pass_md5/ 路径 → GET 得
+// CDN 前缀 → 拼 token 参数。构造后必须 Range 探活通过才返回（防假成功）。
+async function resolveDood(embedUrl) {
+  try {
+    const u = new URL(embedUrl);
+    const html = await fetchEmbedText(embedUrl, embedUrl, 12000);
+    if (!html) return null;
+    const pm = html.match(/(\/pass_md5\/[A-Za-z0-9_\-\/]+)/);
+    if (!pm) return null;
+    const passUrl = u.origin + pm[1];
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 8000);
+    let prefix = '';
+    try {
+      const r = await fetch(passUrl, { headers: { 'User-Agent': UA, 'Referer': embedUrl }, signal: ctl.signal });
+      if (r.ok) prefix = t(await r.text());
+    } catch (e) { /* ignore */ } finally {
+      clearTimeout(timer);
+    }
+    if (!/^https?:\/\//.test(prefix)) return null;
+    const tokM = html.match(/[?&]token=([A-Za-z0-9_\-]+)/) || html.match(/token\s*[:=]\s*["']([A-Za-z0-9_\-]+)["']/);
+    const expM = html.match(/expiry\s*[:=]\s*["']?(\d{9,})/);
+    let finalUrl = prefix;
+    if (tokM) finalUrl += '?token=' + tokM[1] + (expM ? '&expiry=' + expM[1] : '');
+    const probe = await timedFetchBytes(finalUrl, { 'User-Agent': UA, 'Referer': embedUrl }, 7000, 'bytes=0-0');
+    if (probe.status === 200 || probe.status === 206) {
+      return { parse: 0, url: finalUrl, header: { 'User-Agent': UA, 'Referer': embedUrl } };
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 通用 XFS 系（filemoon / streamwish / voe / filelions 等）:
+// 抓 embed 页 → 解包 → 提取 file: m3u8/mp4 → 探活通过才返回
+async function resolveGeneric(embedUrl, durl) {
+  const html = await fetchEmbedText(embedUrl, durl, 12000);
+  if (!html) return null;
+  const unpacked = unpackDeanEdwards(html);
+  const file = extractGenericFile(unpacked) || extractGenericFile(html);
+  if (!file || !/^https?:\/\//.test(file)) return null;
+  const heads = { 'User-Agent': UA, 'Referer': embedUrl };
+  if (/\.m3u8(\?|$)/i.test(file)) {
+    if (await probePlaylist(file, heads)) return { parse: 0, url: file, header: heads };
+    return null;
+  }
+  const probe = await timedFetchBytes(file, heads, 7000, 'bytes=0-0');
+  if (probe.status === 200 || probe.status === 206) return { parse: 0, url: file, header: heads };
+  return null;
+}
+
+// 按 embed 宿主分流解析；解不出返回 null（交给下一条线路）
+async function resolveEmbed(embedUrl, durl) {
+  const host = hostOf(embedUrl);
+  if (!host) return null;
+  if (/f4scdn\.com|f4jav\.xyz/.test(host)) {
+    // F4: 只有 Worker 能过 Origin 墙；未部署直接放弃这条线。
+    // 部署了也要先探活 Worker 的 /f4 真能出列表再返回。
+    if (SEXTB_WORKER) {
+      const wurl = SEXTB_WORKER + '/f4?u=' + encodeURIComponent(embedUrl) + '&r=' + encodeURIComponent(durl);
+      if (await probePlaylist(wurl, { 'User-Agent': UA })) {
+        return { parse: 0, url: wurl, header: { 'User-Agent': UA } };
+      }
+    }
+    return null;
+  }
+  if (/hglink\.to|streamhg|trailerhg|earnvid|vidhide/.test(host)) {
+    return resolveStreamHg(embedUrl, durl);
+  }
+  if (/playmate/.test(host)) return resolvePlaymate(embedUrl);
+  if (/shadowbyte|dstyladsg|vidara/.test(host)) return resolveVidara(embedUrl);
+  if (/dood|d000d|do7go|playmogo/.test(host)) return resolveDood(embedUrl);
+  // 其余（filemoon/streamwish/voe/未知宿主）走通用解包提取
+  return resolveGeneric(embedUrl, durl);
+}
+
+// POST /ajax/player 取某条线路的 embed URL
+async function ajaxEmbed(durl, ep, filmId) {
+  const resp = await postJsonFast(durl, { episode: ep.episode, filmId });
+  if (!resp) return '';
+  try {
+    const json = JSON.parse(resp);
+    const playerHtml = t(json.player);
+    const em = playerHtml.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/) ||
+               playerHtml.match(/<iframe[^>]+src="(\/\/[^"]+)"/);
+    if (em) return fixUrl(em[1]);
+  } catch (e) { /* ignore */ }
+  return '';
+}
+
 // 解析视频卡片: div.tray-item > a[href="/{code}"] > img.tray-item-thumbnail
 // 注意: 1) 站点懒加载，真实封面在 data-src，src 是 default-cover.jpg 占位图；
 //       2) 卡片 class 带修饰时 (如 "tray-item tray-item-uncensored") 也要匹配，
@@ -408,50 +701,57 @@ async function play(reqIn) {
   // id 可能是 "正片$https://..." 形式，取 $ 后面的完整 URL
   if (id.includes('$')) id = id.split('$').pop().trim();
   if (/\.m3u8(\?|$)/i.test(id)) {
-    return { parse: 0, url: id, header: { 'User-Agent': UA, 'Origin': 'https://f4scdn.com' } };
+    return { parse: 0, url: id, header: { 'User-Agent': UA } };
   }
   const durl = /^https?:\/\//.test(id) ? id : fixUrl(id);
 
   // 只抓 1 次详情页: 拿默认 embed + 服务器列表
   const html = await getHtml(durl);
   if (!html) return { parse: 0, url: '' };
-  const embedUrl = extractDefaultEmbed(html);
-  const isF4 = (u) => /f4scdn\.com|f4jav\.xyz/i.test(u || '');
-
-  // 默认 embed 非 F4: 直接嗅探它 (hglink/streamhg 系真机已验证可播)
-  if (embedUrl && !isF4(embedUrl)) {
-    return { parse: 1, jx: 0, url: embedUrl, header: { 'User-Agent': UA, 'Referer': durl } };
-  }
-
-  // 默认是 F4 (或无默认 embed): 按按钮顺序跳过 F4，最多借 2 条非 F4 线路，
-  // POST /ajax/player 拿到 embed 后嗅探它
+  const defEmbed = extractDefaultEmbed(html);
   const { filmId, episodes } = extractPlayerInfo(html);
-  if (filmId && episodes.length) {
-    let tried = 0;
-    for (const ep of episodes) {
-      if (tried >= 2) break;
-      if (/^F4$/i.test(t(ep.name))) continue;
-      tried++;
-      const resp = await postJsonFast(durl, { episode: ep.episode, filmId });
-      if (!resp) continue;
-      let playerHtml = '';
-      try {
-        const json = JSON.parse(resp);
-        playerHtml = t(json.player);
-      } catch (e) { continue; }
-      const em = playerHtml.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/) ||
-                 playerHtml.match(/<iframe[^>]+src="(\/\/[^"]+)"/);
-      if (!em) continue;
-      const eu = fixUrl(em[1]);
-      if (/^https?:\/\//.test(eu)) {
-        return { parse: 1, jx: 0, url: eu, header: { 'User-Agent': UA, 'Referer': durl } };
-      }
-    }
+
+  // 线路优先级（按名称）: SW > PM > F4 > FL > DD > US > ST > PP，其余按页面顺序
+  const PREF = { SW: 0, PM: 1, F4: 2, FL: 3, DD: 4, US: 5, ST: 6, PP: 7 };
+  const lines = [];
+  const seenName = new Set();
+  const sorted = [...episodes].sort((a, b) => {
+    const pa = PREF[t(a.name).toUpperCase()] ?? 90;
+    const pb = PREF[t(b.name).toUpperCase()] ?? 90;
+    return pa - pb;
+  });
+  for (const ep of sorted) {
+    const nm = t(ep.name).toUpperCase();
+    if (seenName.has(nm)) continue;
+    seenName.add(nm);
+    lines.push(ep);
   }
 
-  // 借不到: 嗅探 F4 自己的 embed 页兜底 (网页上下文自动带 Origin，链路自洽)
-  if (embedUrl && /^https?:\/\//.test(embedUrl)) {
-    return { parse: 1, jx: 0, url: embedUrl, header: { 'User-Agent': UA, 'Referer': durl } };
+  const deadline = Date.now() + 45000;
+  let firstEmbed = defEmbed || '';
+  let tried = 0;
+  for (const ep of lines) {
+    if (tried >= 4 || Date.now() > deadline) break;
+    tried++;
+    // 第一条（页面默认线路）的 embed 已在详情 HTML 里，省一次 ajax
+    let embed = '';
+    if (episodes.length && ep.episode === episodes[0].episode && defEmbed) {
+      embed = defEmbed;
+    } else if (filmId) {
+      embed = await ajaxEmbed(durl, ep, filmId);
+    }
+    if (!embed) continue;
+    if (!firstEmbed) firstEmbed = embed;
+    try {
+      const resolved = await resolveEmbed(embed, durl);
+      if (resolved && resolved.url) return resolved;
+    } catch (e) { /* 换下一条线路 */ }
+  }
+
+  // 全部线路解不出: 回到默认 embed 嗅探兜底（v3 行为）
+  const sniff = defEmbed || firstEmbed;
+  if (sniff && /^https?:\/\//.test(sniff)) {
+    return { parse: 1, jx: 0, url: sniff, header: { 'User-Agent': UA, 'Referer': durl } };
   }
   return { parse: 0, url: '' };
 }
