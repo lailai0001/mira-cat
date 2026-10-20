@@ -10,9 +10,18 @@ import req from '../../util/req.js';
 // 卡片: div.tray-item > a[href="/{code}"] > img.tray-item-thumbnail (封面取 data-src，src 是 default-cover 占位图)
 // 详情: GET /{code}  filmId + 服务器列表 (button.btn-player.episode[data-source][data-id]，如 F4/SW/PM/DD/FL/US)
 // 播放: 1) 详情页默认 iframe 即 F4 服务器 (f4scdn.com/e/{id})；
-//       2) f4 系 embed 页 data-api -> GET {host}/api/play/{vid}?ab=0 (带 Origin 头) -> src m3u8 直链；
+//       2) f4 系 embed 页 data-api -> GET {host}/api/play/{vid}?ab=0 (带 Origin 头) -> src playlist.txt 主播放列表；
 //       3) 其他服务器 POST /ajax/player {episode: episode_id, filmId} -> JSON.player HTML -> embed；
 //       4) 解不出的 embed 走 parse:1 嗅探。play 实时在用户手机上解析，token 按用户 IP 签发。
+// 实测根因 (2026-10-20 VM 验证): f4 CDN 的 playlist.txt、子播放列表、每个分片
+//       请求都必须带 Origin: {embed host} 才能 200，否则 403（仅 UA 无头 → 403；
+//       无 UA → 404；Referer 也救不了）。iOS 播放器无法自行补 Origin（被禁止
+//       自定义），所以 play 返回的 m3u8 直链在端内播不了。
+// 修复: play 返回本地代理地址 /proxy/m3u8，由代理请求源站时补齐
+//       Origin/Referer，把改写后的播放列表返回给播放器；子播放列表继续走
+//       /proxy/m3u8 递归改写，分片/密钥经 /proxy/res 二进制透传。
+//       代理失败时 302 降级到原始地址（与之前直连行为一致）。
+//       先例: avhub.js / javmobile.js 的同名代理路由。
 
 const KEY = 'py_sextb';
 const NAME = 'SexTB';
@@ -302,6 +311,136 @@ function buildList(url, page, limit) {
   });
 }
 
+// ---------- 本地 HLS 代理 (f4 CDN 必须 Origin 才能 200, 播放器端无法补头) ----------
+
+// base64url 编码/解码 (供代理 URL 的 query 参数)
+function b64url(s) {
+  try {
+    return Buffer.from(String(s), 'utf8').toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) { return ''; }
+}
+
+function unb64url(s) {
+  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+}
+
+// 构造本地代理地址 (js2p://_WEB_ 为 App 动态地址 scheme, 同 avhub/javmobile/ffm3u8 先例)
+function proxyUrl(reqIn, path, targetUrl, referer, origin) {
+  try {
+    const server = reqIn?.server;
+    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
+    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
+    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}&o=${b64url(origin || '')}`;
+  } catch (e) { return ''; }
+}
+
+function absUrl(u, base) {
+  try { return new URL(u, base).toString(); } catch (e) { return u; }
+}
+
+// 改写 m3u8: 子播放列表 (.txt/.m3u8) 继续走 /proxy/m3u8 递归改写,
+// 分片与 URI="..." (密钥/初始化段) 走 /proxy/res 二进制透传
+function rewriteM3u8(raw, m3u8Url, reqIn, referer, origin) {
+  const lines = String(raw).split(/\r?\n/);
+  const out = lines.map(line => {
+    const s = line.trim();
+    if (!s) return line;
+    if (s.startsWith('#')) {
+      if (s.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
+          const abs = absUrl(uri.replace(/&amp;/g, '&'), m3u8Url);
+          const p = proxyUrl(reqIn, '/proxy/res', abs, referer, origin);
+          return p ? `URI="${p}"` : all;
+        });
+      }
+      return line;
+    }
+    const abs = absUrl(s.replace(/&amp;/g, '&'), m3u8Url);
+    const isPlaylist = /\.(m3u8|txt)(\?|$)/i.test(abs);
+    const p = proxyUrl(reqIn, isPlaylist ? '/proxy/m3u8' : '/proxy/res', abs, referer, origin);
+    return p || line;
+  });
+  return out.join('\n');
+}
+
+async function fetchText(url, headers) {
+  try {
+    const { data, status } = await req.get(url, { headers, timeout: 20000 });
+    if (status === 200 && data) return typeof data === 'string' ? data : String(data);
+  } catch (e) { /* 换通道2 */ }
+  try {
+    const r = await fetch(url, { headers });
+    if (r.ok) return await r.text();
+  } catch (e) { /* ignore */ }
+  return '';
+}
+
+async function fetchBuffer(url, headers) {
+  try {
+    const { data, status } = await req.get(url, { headers, timeout: 30000, responseType: 'arraybuffer' });
+    if (status === 200 && data) return Buffer.from(data);
+  } catch (e) { /* 换通道2 */ }
+  try {
+    const r = await fetch(url, { headers });
+    if (r.ok) return Buffer.from(await r.arrayBuffer());
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+// GET /proxy/m3u8?u={b64url 播放列表}&r={b64url referer}&o={b64url origin}
+async function m3u8Proxy(request, reply) {
+  const q = request?.query || {};
+  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let target = '', referer = REFERER, origin = '';
+  try {
+    target = unb64url(q.u);
+    if (q.r) referer = unb64url(q.r) || referer;
+    if (q.o) origin = unb64url(q.o);
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  // f4 CDN 全链路必须带 Origin: {embed host}，否则 403
+  const headers = { 'User-Agent': UA, 'Accept': '*/*', 'Referer': referer };
+  if (origin) headers['Origin'] = origin;
+  const raw = await fetchText(target, headers);
+  if (!raw || !raw.includes('#EXTM3U')) {
+    // 降级: 302 重定向到原始地址 (与直连行为一致)
+    reply.redirect(target);
+    return;
+  }
+  reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+  reply.header('Cache-Control', 'no-cache');
+  reply.send(rewriteM3u8(raw, target, request, referer, origin));
+}
+
+// GET /proxy/res?u={b64url 资源}&r={b64url referer}&o={b64url origin} —— 分片/密钥二进制透传
+async function resProxy(request, reply) {
+  const q = request?.query || {};
+  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let target = '', referer = REFERER, origin = '';
+  try {
+    target = unb64url(q.u);
+    if (q.r) referer = unb64url(q.r) || referer;
+    if (q.o) origin = unb64url(q.o);
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  const headers = { 'User-Agent': UA, 'Accept': '*/*', 'Referer': referer };
+  if (origin) headers['Origin'] = origin;
+  const buf = await fetchBuffer(target, headers);
+  if (!buf) {
+    reply.redirect(target);
+    return;
+  }
+  // 按后缀给合理 Content-Type: f4 分片伪装成 .png/.jpg/.jpeg/.webp, 实为 TS 流，
+  // iOS AVPlayer 系按 video/mp2t 更稳 (同 蜜桃 REX 分片强制 mp2t 先例)
+  const ct = /\.(m3u8|txt)(\?|$)/i.test(target) ? 'application/vnd.apple.mpegurl'
+    : /\.(ts|png|jpg|jpeg|webp|bin)(\?|$)/i.test(target) ? 'video/mp2t'
+    : 'application/octet-stream';
+  reply.header('Content-Type', ct);
+  reply.header('Cache-Control', 'no-cache');
+  reply.send(buf);
+}
+
 async function init(reqIn) {
   return {};
 }
@@ -380,7 +519,7 @@ async function resolveF4(embedUrl, durl) {
   }
   if (!src) return '';
   if (!/^https?:\/\//.test(src)) src = host + (src.startsWith('/') ? src : '/' + src);
-  return { url: src, origin: host };
+  return { url: src, origin: host, embed: embedUrl };
 }
 
 async function detail(reqIn) {
@@ -440,13 +579,16 @@ async function play(reqIn) {
   const embedUrl = extractDefaultEmbed(html);
 
   if (embedUrl) {
-    // f4 系 (f4scdn.com / f4jav.xyz): 解析 api/play 拿 m3u8 直链
+    // f4 系 (f4scdn.com / f4jav.xyz): 解析 api/play 拿 playlist 直链。
+    // CDN 全链路要求 Origin (实测无头 403)，播放器端补不了头: 走本地代理，
+    // 代理请求时补齐 Origin/Referer 并改写播放列表 (见 m3u8Proxy/resProxy)。
     if (/f4scdn\.com|f4jav\.xyz/i.test(embedUrl)) {
       const res = await resolveF4(embedUrl, durl);
       if (res && /\.m3u8|\.txt/i.test(res.url)) {
+        const purl = proxyUrl(reqIn, '/proxy/m3u8', res.url, embedUrl, res.origin);
         return {
           parse: 0,
-          url: res.url,
+          url: purl || res.url,
           header: { 'User-Agent': UA, 'Referer': embedUrl, 'Origin': res.origin },
         };
       }
@@ -471,9 +613,10 @@ async function play(reqIn) {
       if (/f4scdn\.com|f4jav\.xyz/i.test(eu)) {
         const res = await resolveF4(eu, durl);
         if (res && /\.m3u8|\.txt/i.test(res.url)) {
+          const purl = proxyUrl(reqIn, '/proxy/m3u8', res.url, eu, res.origin);
           return {
             parse: 0,
-            url: res.url,
+            url: purl || res.url,
             header: { 'User-Agent': UA, 'Referer': eu, 'Origin': res.origin },
           };
         }
@@ -512,6 +655,9 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
+      // HLS 本地代理 (GET): f4 CDN 要求 Origin 播放器端无法设置, 代理补头透传
+      fastify.get('/proxy/m3u8', m3u8Proxy);
+      fastify.get('/proxy/res', resProxy);
     },
   };
 }
