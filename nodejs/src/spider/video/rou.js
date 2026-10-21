@@ -5,11 +5,17 @@ import * as cheerio from 'cheerio';
 // 站点: rou.video (已从 Next.js 迁到 TanStack Start, 2026-10 实测)
 // 分类 5 个; 列表/搜索走 HTML 解析 (卡片 a.group[href^="/v/"])
 // 详情从页面内嵌 TSR 流式脚本取加密 ev 解码得到 videoUrl (decodeEv 算法与 XPTV 一致)
-// 播放: videoUrl 为 /api/hls/<id>, 即 m3u8 播放地址 (播放器以 application/x-mpegURL 加载)
+// 播放: videoUrl 为 /api/hls/<id>; 该地址返回 PNG 包装的 HLS (载荷在 PNG roUd chunk 里),
+// 普通播放器播不了, 故播放地址改指 rou-hls Worker 拆包后的普通 HLS (见 API_MIRROR_HOST/HLS_WORKER)
 
 const KEY = 'py_rou';
 const NAME = '肉视频';
 const HOST = 'https://rou.video';
+// 站方 /api/hls 返回的是 PNG 包装的 HLS (清单与分片的真实载荷藏在 PNG 的 roUd chunk 里),
+// 普通播放器解不开, 必须经 rou-hls Worker 服务端拆包成普通 HLS 才能播。
+// /api 取清单走官方镜像域名: 主站 rou.video 的 /api 拦 Cloudflare Workers 出口, 镜像不拦 (同后端同 id)。
+const API_MIRROR_HOST = 'https://rouvb1.xyz';
+const HLS_WORKER = 'https://rou-hls.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0';
 
 const CLASSES = [
@@ -111,6 +117,22 @@ async function getPlayurl(detailUrl) {
   }
 }
 
+// 把 /api/hls/<id> 原始地址换成 rou-hls Worker 拆包地址 (域名换官方镜像, ref 带详情页给 Worker 做 Referer)
+function toWorkerUrl(rawUrl, ref) {
+  const u = absUrl(rawUrl);
+  if (!u) return '';
+  if (u.startsWith(HLS_WORKER)) return u;
+  let api = u;
+  try {
+    const p = new URL(u);
+    if (p.pathname.startsWith('/api/hls/')) {
+      api = API_MIRROR_HOST + p.pathname + p.search;
+      if (!ref) ref = HOST + '/v/' + p.pathname.split('/').pop();
+    }
+  } catch (e) {}
+  return `${HLS_WORKER}/v?u=${encodeURIComponent(api)}&ref=${encodeURIComponent(ref || HOST + '/')}`;
+}
+
 async function init() {
   return {};
 }
@@ -148,8 +170,9 @@ async function detail(reqIn) {
   const $ = cheerio.load(html);
   const title = $('meta[property="og:title"]').attr('content') || '';
   const pic = $('meta[property="og:image"]').attr('content') || '';
-  const playurl = await getPlayurl(url);
-  if (!playurl) return { list: [] };
+  const rawPlayurl = await getPlayurl(url);
+  if (!rawPlayurl) return { list: [] };
+  const playurl = toWorkerUrl(rawPlayurl, url);
   return { list: [{
     vod_id: id,
     vod_name: title || id,
@@ -166,12 +189,16 @@ async function play(reqIn) {
   // body.id 可能为 "选集名$播放地址" 形式, 取 $ 后半部分
   const i = url.lastIndexOf('$');
   if (i >= 0) url = url.slice(i + 1);
+  if (url.startsWith(HLS_WORKER)) {
+    // detail 已给出 Worker 拆包地址, 原样透传
+    return { parse: 0, url, header: headers() };
+  }
+  // 兜底: 旧缓存/直传的原始 /api/hls 地址同样换成 Worker 拆包地址
   // XPTV getPlayinfo 原逻辑: .jpg 替换为 .m3u8 (旧版 videoUrl 是封面 jpg; 新版已为 /api/hls/<id>, 此处为兼容兜底)
-  url = url.replace('.jpg', '.m3u8');
-  url = absUrl(url);
+  url = absUrl(url.replace('.jpg', '.m3u8'));
   return {
     parse: 0,
-    url,
+    url: toWorkerUrl(url),
     header: headers(),
   };
 }
