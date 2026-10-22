@@ -47,6 +47,23 @@
 // 框架 req (axios), 全局 fetch 仅在 typeof 守卫成立时作 'fetch'
 // 直连通道的附加实现, 缺失时该通道自动退化为 req —— 任何通道
 // 不得再依赖 fetch 存在。
+//
+// 2026-10-22 第八轮 (只修播放; 列表/分类/封面真机已通): 真机报
+// 「能加载不能播」。实测坐实失败层在 embed->文件令牌的 IP 绑定:
+// 同一 MaxStream embed 页, 经 jina / 自有 Worker 出口看页后解出
+// 的 m3u8, 换一出口取必 403; 经同出口直连看页解出的则 200。即
+// lk 家族文件令牌绑 embed 查看者 IP, 而旧版 resolveEmbed 在多
+// 出口通道间竞速、胜出出口随机, 令牌几乎永远绑不到播放器 (手
+// 机) 的 IP —— 本地全链同出口, harness 永远测不出。本轮改法:
+//   ① embed 取页改「直连三栈优先」分波 (fetch/req/https = 设备
+//      自身出口), 代理通道只兜底; 解出线按出口分组排序: 直连线
+//      最前、借线的 hugstream 前置 (master.txt, 实测不绑 IP 只
+//      认 Referer) 次之、借线的绑定型宿主末位; 线名给直连线加
+//      「·直」标记, 详情恒附一条网页嗅探兜底线;
+//   ② play 改走 resolveLines 同一排序选线 (点的线与最优线同组
+//      才尊重选择), 不再逐条盲试;
+//   ③ 铸造 POST 全灭且 own 为 403/网络错时, 隔 1.2s 只重试 own
+//      一发 (CF 对 Workers 出口的间歇拒绝会分钟级自愈)。
 import req from '../../util/req.js';
 import https from 'https';
 import zlib from 'zlib';
@@ -2330,13 +2347,21 @@ async function fetchPage(url, opts = {}) {
     await Promise.race([winP, all, deadline]);
   };
   if (opts.profile === 'embed') {
-    // embed 页小而多: 精简通道组, 避免每条 embed 拉满通道造成连接风暴
+    // embed 页: 出口一致性优先 (第八轮实测坐实, 见文件头): 文件令牌
+    // 与 embed 查看者 IP 绑定, 故第一波只用直连三栈 (设备自身出口,
+    // 与播放器同 IP); 直连全灭才借代理通道 —— 借线解出的令牌绑的
+    // 是代理出口, 对绑定型宿主必然 403, 只能作排序末位兜底。
     await runWave([
-      ['own', chOwn, 10000],
-      ['fetch', chFetch, 10000],
-      ['demo', chDemo, 10000],
-      ['req', chReq, 10000],
+      ['fetch', chFetch, 9000],
+      ['req', chReq, 9000],
+      ['https', chHttps, 9000],
     ]);
+    if (!winner) {
+      await runWave([
+        ['own', chOwn, 10000],
+        ['demo', chDemo, 10000],
+      ]);
+    }
     if (!winner) {
       await runWave([
         ['jina', chJina, 10000],
@@ -2452,6 +2477,18 @@ async function httpPostForm(url, bodyStr, opts = {}) {
   }, 10000, 'POST', bodyStr);
   await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost]]);
   if (!winner) await runWave([['aoRaw', aoPost]]);
+  if (!winner) {
+    // own 的上游 403 是站方 CF 对 Workers 出口的时段/colo 间歇拒绝
+    // (真机与本地都见过同请求分钟级自愈), 全灭时隔 1.2s 只重试 own
+    // 一发, 不扩大竞速面。
+    const ownOc = outcomes.find((o) => o.name === 'own');
+    if (ownOc && (ownOc.status === 403 || ownOc.status === 0)) {
+      await new Promise((r) => setTimeout(r, 1200));
+      let res;
+      try { res = await ownPost(); } catch (e) { res = { status: 0, body: '' }; }
+      judge('own2', res);
+    }
+  }
   if (winner) return { text: winner.text, via: winner.via, outcomes };
   // 全灭归因: 有通道拿到带 status 字段的 JSON (站方明确回 false) ->
   // post-bad; 连 JSON 都没拿到 -> post-none。
@@ -2676,22 +2713,37 @@ function hostRank(name) {
   return 5;
 }
 
-// embed 页 -> 配置里的源数组 (单条硬顶 15s, 防慢 embed 拖死详情)
+// 直连通道名 (设备自身出口; 与播放器同 IP)。其余通道 (own/demo/
+// jina/ao*) 均为代理出口, 解出的绑定型令牌与播放器 IP 不符。
+const DIRECT_CHANNELS = new Set(['fetch', 'req', 'https']);
+
+// embed 页 -> {sources, direct} (单条硬顶 20s, 防慢 embed 拖死详情)。
+// direct=true 表示 embed 由直连栈取回, 文件令牌绑设备 IP, 与播放器
+// 自洽; direct=false 为借代理出口解出, 仅对非绑定宿主可用。
 async function resolveEmbed(embedUrl, referer) {
-  const html = await Promise.race([
-    httpGet(embedUrl, { referer, kind: 'embed' }),
-    new Promise((res) => setTimeout(() => res(''), 15000)),
+  const r = await Promise.race([
+    fetchPage(embedUrl, { kind: 'embed', referer, profile: 'embed', deadlineMs: 20000 }),
+    new Promise((res) => setTimeout(() => res(null), 20000)),
   ]);
-  if (!html) return null;
-  const cfg = (html.match(/data-config="([^"]+)"/) || [])[1];
+  if (!r || !r.html) return null;
+  const cfg = (r.html.match(/data-config="([^"]+)"/) || [])[1];
   if (!cfg) return null;
   let u;
   try { u = new URL(embedUrl); } catch (e) { return null; }
   try {
     const { sources } = decryptConfig(cfg, u.pathname, u.search);
-    if (Array.isArray(sources) && sources.length) return sources;
+    if (Array.isArray(sources) && sources.length) {
+      return { sources, direct: !!(r.win && DIRECT_CHANNELS.has(r.win.name)), viaName: r.win ? r.win.name : '' };
+    }
   } catch (e) { /* 解密失败 */ }
   return null;
+}
+
+// 线路出口分组 (见 resolveLines 排序注释)
+function lineGroup(ln) {
+  if (ln.direct) return 0;
+  if (/master\.txt(\?|$)/i.test(ln.file || '')) return 1;
+  return 2;
 }
 
 function pickSource(sources) {
@@ -2721,13 +2773,16 @@ async function resolveLines(durl) {
   const lines = [];
   await Promise.all(paths.slice(0, 8).map(async (p, idx) => {
     const embedUrl = 'https:' + p.path;
-    const sources = await resolveEmbed(embedUrl, durl);
-    const src = sources && pickSource(sources);
+    const r = await resolveEmbed(embedUrl, durl);
+    const src = r && pickSource(r.sources);
     if (src && src.file) {
-      lines.push({ idx, lo: p.lo, embedUrl, file: src.file, type: t(src.type), host: prettyHost(src.file) });
+      lines.push({ idx, lo: p.lo, embedUrl, file: src.file, type: t(src.type), host: prettyHost(src.file), direct: !!r.direct });
     }
   }));
-  lines.sort((a, b) => (hostRank(a.host) - hostRank(b.host)) || (a.idx - b.idx));
+  // 排序: 直连解出 (令牌绑设备 IP, 与播放器自洽) 最前; 借线解出的
+  // hugstream 前置 (master.txt, 实测不绑 IP、只认 Referer) 次之;
+  // 借线解出的绑定型宿主 (令牌绑代理出口, 设备必 403) 末位。
+  lines.sort((a, b) => (lineGroup(a) - lineGroup(b)) || (hostRank(a.host) - hostRank(b.host)) || (a.idx - b.idx));
   if (!lines.length) return { html, lines: [], stage: 'embed', via };
   return { html, lines, stage: 'ok', via };
 }
@@ -2837,8 +2892,11 @@ async function detail(reqIn) {
   const fromNames = [];
   const playUrls = [];
   lines.forEach((ln) => {
-    // 线路名标注来源家族: 最终文件宿主 + 区域线 lo (如 CloudCDN·nl3)
-    fromNames.push(ln.lo && ln.lo !== 'main' ? `${ln.host}·${ln.lo}` : ln.host);
+    // 线路名标注来源家族: 最终文件宿主 + 区域线 lo (如 CloudCDN·nl3);
+    // 直连栈解出的线尾加「·直」—— 令牌绑设备 IP, 是真机首选。
+    let nm = ln.lo && ln.lo !== 'main' ? `${ln.host}·${ln.lo}` : ln.host;
+    if (ln.direct) nm += '·直';
+    fromNames.push(nm);
     playUrls.push('播放$' + durl + '@@' + ln.idx);
   });
   if (!lines.length) {
@@ -2846,8 +2904,13 @@ async function detail(reqIn) {
     // (真机 WebView 是真实浏览器, 站方 cast 链可在详情页内原生跑通)。
     fromNames.push('网页嗅探·' + (STAGE_TEXT[stage] || '铸造失败'));
     playUrls.push('播放$' + durl + '@@sniff');
-  } else if (via) {
-    contentParts.push('铸造通道: ' + via);
+  } else {
+    if (via) contentParts.push('铸造通道: ' + via);
+    const nDirect = lines.filter((l) => l.direct).length;
+    contentParts.push(`线路出口: 直连${nDirect}/${lines.length} (直连线令牌绑本机IP, 优先点带「·直」的线)`);
+    // 直链全为借线或仍播不了时的最后兜底: WebView 嗅探详情页
+    fromNames.push('网页嗅探·兜底');
+    playUrls.push('播放$' + durl + '@@sniff');
   }
   return {
     list: [{
@@ -2880,28 +2943,17 @@ async function play(reqIn) {
   if (sniffOnly) id = id.slice(0, -'@@sniff'.length);
   const mm = id.match(/^(https?:\/\/\S+?)@@(\d+)$/);
   const durl = mm ? mm[1] : absUrl(id);
-  const wantIdx = mm ? parseInt(mm[2], 10) : 0;
-  const html = await getDetailHtml(durl);
-  if (!html) return sniffResult(durl);
-  const { postId, mpu } = extractPlaySeed(html);
-  if (!postId || !mpu) return sniffResult(durl);
-  const { paths } = await fetchEmbedPaths(postId, mpu, durl);
-  if (!paths.length) return sniffResult(durl);
-  const order = paths.map((p, idx) => idx);
-  // 与 detail 相同的排序口径: 先按 detail 时的 idx 顺序尝试想要的那条,
-  // 拿不到再按顺序逐条兜底 (区域铸造偶发失败时换线还能播)。
-  const tries = [wantIdx, ...order.filter(i => i !== wantIdx)];
-  for (const i of tries) {
-    const p = paths[i];
-    if (!p) continue;
-    const embedUrl = 'https:' + p.path;
-    const sources = await resolveEmbed(embedUrl, durl);
-    const src = sources && pickSource(sources);
-    if (src && src.file) {
-      return { parse: 0, url: src.file, header: { 'User-Agent': UA, 'Referer': embedUrl } };
-    }
-  }
-  return sniffResult(durl);
+  const wantIdx = mm ? parseInt(mm[2], 10) : -1;
+  // 现场重铸整链 (令牌时效 + IP 绑定的双重要求), 线路已按出口一致
+  // 性排序 (见 resolveLines): 用户点的线若与最优线同组则尊重其选
+  // 择, 否则回最优线 —— 借线解出的绑定型令牌在设备上必 403, 点了
+  // 也播不了, 不如直接给能播的那条。
+  const { lines } = await resolveLines(durl);
+  if (!lines.length) return sniffResult(durl);
+  const tapped = lines.find((l) => l.idx === wantIdx);
+  const best = lines[0];
+  const pick = (tapped && lineGroup(tapped) <= lineGroup(best)) ? tapped : best;
+  return { parse: 0, url: pick.file, header: { 'User-Agent': UA, 'Referer': pick.embedUrl } };
 }
 
 async function search(reqIn) {
