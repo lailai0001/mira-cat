@@ -73,6 +73,17 @@
 // req 余量, 不再单次传输吃满 44s)。Worker 与官方链均未动, 不
 // 新增任何中转。
 //
+// 播放 (2026-10-22 第十一轮, 诊断探针版, 备推未推): 第十轮 (Worker
+// v4 KV) 上线后真机仍全灭, 而既有证据全在 VM/Worker 侧 —— "设备出口
+// 用蜘蛛自身的 req/fetch 栈直取官方 raw 清单" 这一跳从未被单独测过
+// (第五轮测的是播放器栈)。本版在 play 的 Worker 路里并行加一发直取
+// 探针 (算签与官方链路 A 同法, 8s 封顶, 只记状态、不改出参地址),
+// 结果编进 play 返回的线路名后缀: 探针200/<片数> / 探针<状态码> /
+// 探针超时 / 探针未回。Worker 路出参由字符串 url 改为 [线路名, url]
+// 一对 (播放器多源命名形态), url 本体与第八轮逐字一致, parse/
+// header 不变; 非 Worker 路 (旧链路/嗅探) 逐字不动。判定口径与后续
+// /put 回存评估见报告 catfix_javsb_r11.md。
+//
 // 抓取通道 (2026-10-20 第六版): 真机双状态 (VPN 开/关) 直连全灭、第三轮的
 // jina 单中转也全灭。复核结论: 第三轮实现无 URL/编码类低级错误, 但有三个结构
 // 问题 —— (1) jina 只走了原生 fetch 一条传输, 而本仓已真机通过的 SexTB 是走
@@ -843,6 +854,117 @@ async function verifiedWorkerUrl(hash, form, budgetMs) {
   return workerUrlFor(hash, 'proxy');
 }
 
+// ---------- 第十一轮: 设备直取探针 (仅诊断, 不参与出参地址决策) ----------
+// 与主线并行: play 在 Worker 路一拿到 hash 就点火, 用蜘蛛自身两条
+// 直连栈 (框架 req 桌面头 / 原生 fetch iOS 头, 与 LAYERS 的 directReq/
+// directFetch 同传输同头家族) 直取官方 raw 清单。刻意不走 viaReq/
+// viaFetch —— 那两个助手把非 200 吞成 '', 探针要的恰是状态码本身。
+// 判定: 任一栈回 200 且正文含 #EXTM3U -> 探针200/<EXTINF 数>; 两栈
+// 皆有应答但无一成功 -> 第一份确定状态码 (探针403 等); 8s 内无任何
+// 确定应答 -> 探针超时。首份非 200 应答后只再给另一栈 1.5s 宽限
+// (等它可能的 200), 不把 403 的快败拖成 8s。结论按 hash 缓存 120s:
+// 用户连点另一条线时直接念得出上一发的结论, 同时后台刷新一发。
+const PROBE_CAP_MS = 8000;
+const PROBE_GRACE_MS = 1500;
+const probeCache = new Map(); // hash -> { t, suffix }
+
+function probeRawUrl(hash) {
+  const key = javsbSign(`${hash}@${Math.floor(Date.now() / 1000)}`);
+  return `${HOST}/save_m3u8_cache.php?file=${encodeURIComponent(hash)}&raw=1&sign=${key}`;
+}
+
+async function probeAttemptFetch(url, ms) {
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { headers: safariHeaders(), signal: ctl.signal, redirect: 'follow' });
+    const txt = await r.text().catch(() => '');
+    return { status: r.status, text: typeof txt === 'string' ? txt : '' };
+  } catch (e) { return null; } finally { clearTimeout(to); }
+}
+
+async function probeAttemptReq(url, ms) {
+  try {
+    const res = await req.get(url, { headers: desktopHeaders(), timeout: ms });
+    if (res && typeof res.status === 'number') {
+      const data = typeof res.data === 'string' ? res.data : (res.data == null ? '' : JSON.stringify(res.data));
+      return { status: res.status, text: data };
+    }
+    return null;
+  } catch (e) {
+    const st = e && (typeof e.status === 'number' ? e.status : (e.response && typeof e.response.status === 'number' ? e.response.status : 0));
+    return st ? { status: st, text: '' } : null;
+  }
+}
+
+// 返回 Promise<string> (永不 reject): 线路名后缀。
+function probeDirectRaw(hash) {
+  const hit = probeCache.get(hash);
+  if (hit && Date.now() - hit.t < 120000) {
+    // 有新鲜结论: 立即回该结论, 同时后台再打一发刷新缓存 (不阻塞)
+    probeDirectRawFresh(hash).catch(() => {});
+    return Promise.resolve(hit.suffix);
+  }
+  return probeDirectRawFresh(hash);
+}
+
+function probeDirectRawFresh(hash) {
+  const url = probeRawUrl(hash);
+  const t0 = Date.now();
+  const p = new Promise((resolve) => {
+    let done = false;
+    let answered = 0;
+    let firstStatus = 0;
+    let graceTimer = null;
+    const finish = (suffix) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
+      probeCache.set(hash, { t: Date.now(), suffix });
+      if (probeCache.size > 40) probeCache.delete(probeCache.keys().next().value);
+      noteLayer('probe-direct', Date.now() - t0, suffix.startsWith('探针200'), url);
+      resolve(suffix);
+    };
+    const timer = setTimeout(() => finish(firstStatus ? `探针${firstStatus}` : '探针超时'), PROBE_CAP_MS);
+    const onRes = (r) => {
+      if (done) return;
+      if (r && r.status) {
+        if (r.status === 200 && r.text.includes('#EXTM3U')) {
+          finish(`探针200/${(r.text.match(/#EXTINF/g) || []).length}`);
+          return;
+        }
+        if (!firstStatus) {
+          firstStatus = r.status;
+          graceTimer = setTimeout(() => finish(`探针${firstStatus}`), PROBE_GRACE_MS);
+        }
+      }
+      if (++answered >= 2) finish(firstStatus ? `探针${firstStatus}` : '探针超时');
+    };
+    probeAttemptFetch(url, PROBE_CAP_MS).then(onRes, () => onRes(null));
+    probeAttemptReq(url, PROBE_CAP_MS).then(onRes, () => onRes(null));
+  });
+  return p;
+}
+
+// 主线出参包装: 字符串 url -> [线路名·探针后缀, url]。主线先算完时
+// 最多再短等 2s (且不越过 play 的 18s 硬顶) 等探针落点; 等不到记
+// 探针未回, 绝不因探针拖过主线预算。url 本体/parse/header 不动。
+async function withProbeName(res, probeP, deadline) {
+  if (!res || typeof res.url !== 'string' || !res.url) return res;
+  const base = res.url.includes('seg=direct') ? '直链' : '全链';
+  let suffix = '探针未回';
+  if (probeP) {
+    const grace = Math.max(0, Math.min(2000, deadline - Date.now()));
+    const got = await Promise.race([
+      probeP.then((s) => ({ s })),
+      new Promise((r) => setTimeout(() => r(null), grace)),
+    ]).catch(() => null);
+    if (got && got.s) suffix = got.s;
+  }
+  return { ...res, url: [`${base}·${suffix}`, res.url] };
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -879,6 +1001,8 @@ async function play(reqIn) {
     // 第八轮 Worker 路径: 已知结果秒回 -> 预热短等 (<=6s) -> 单次
     // 有界尝试 (<=10s) -> 未校验兜底; 全程 <=18s。
     const wHead = { 'User-Agent': UA, 'Referer': REFERER };
+    // 第十一轮探针: 拿到 hash 即与主线并行点火 (结论只进线路名)
+    const probeP = probeDirectRaw(hash).catch(() => '探针超时');
     let e = workerState.get(hash);
     // 无状态/已判失败: 顺手 (重新) 点火后台预热, 惠及下一次点播
     if (!e || (e.st !== 'ok' && e.st !== 'pending')) {
@@ -900,14 +1024,14 @@ async function play(reqIn) {
       return { parse: 0, url: u, header: wHead };
     };
     let okS = freshOk();
-    if (okS && (!formWanted || formWanted === 'proxy' || formWanted === okS.form)) return fromOk(okS);
+    if (okS && (!formWanted || formWanted === 'proxy' || formWanted === okS.form)) return await withProbeName(await fromOk(okS), probeP, deadline);
     // 预热进行中: 短等 <=6s (第七轮等 20s 是 53s 的主因之一)
     e = workerState.get(hash);
     if (e && e.st === 'pending' && e.promise && remain() > 4000) {
       const waitMs = Math.min(6000, remain() - 2500);
       if (waitMs > 0) await Promise.race([e.promise, new Promise(r => setTimeout(r, waitMs))]);
       okS = freshOk();
-      if (okS && (!formWanted || formWanted === 'proxy' || formWanted === okS.form)) return fromOk(okS);
+      if (okS && (!formWanted || formWanted === 'proxy' || formWanted === okS.form)) return await withProbeName(await fromOk(okS), probeP, deadline);
     }
     // 单次有界尝试 (<=10s): 只掷一轮, 不再多轮串行叠加
     if (remain() > 2500) {
@@ -917,14 +1041,14 @@ async function play(reqIn) {
         en.st = 'ok'; en.form = got; en.t = Date.now();
         workerState.set(hash, en);
         noteLayer('worker-play-once', 0, true, workerUrlFor(hash, got));
-        return { parse: 0, url: workerUrlFor(hash, got), header: wHead };
+        return await withProbeName({ parse: 0, url: workerUrlFor(hash, got), header: wHead }, probeP, deadline);
       }
     }
     // 未校验兜底: 立即回想要形态的 Worker 地址 (播放器自取 = 新一
     // 轮竞速; 配合 detail 双线, 可换另一条线再掷一次)。
     const fb = workerUrlFor(hash, formWanted || 'proxy');
     noteLayer('worker-unverified', 0, false, fb);
-    return { parse: 0, url: fb, header: wHead };
+    return await withProbeName({ parse: 0, url: fb, header: wHead }, probeP, deadline);
   }
   if (hash && playerUrl) {
     // JAVSB_WORKER 未配置时才走旧链路: 官方链 A/B -> 嗅探播放器页
