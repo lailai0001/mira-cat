@@ -2715,15 +2715,50 @@ function extractPlaySeed(html) {
   return { postId, mpu };
 }
 
+// ---------------- 铸造库 (cast-bank, 2026-10-22) ----------------
+// 服务端预铸: VM 侧把当前目录的铸造结果 (embed 路径集) 预先算好
+// 存入 pornfhd-fetch 的 KV; 蜘蛛在铸造 POST 竞速之前先查库, 命中
+// 即以库内路径集走原下游 (resolveEmbed 等完全共用) —— 设备侧 own
+// 出口被站方 CF 按 colo 信誉拉黑时活铸造全灭, 此路只用一次经自有
+// Worker 的 GET, 不碰 POST。
+// 契约: GET {OWN_FETCH}/cast?u=<watch 页完整 URL> -> 命中 200
+// {"paths":[embed 路径数组],"ts":epoch}; 未命中 404。
+// 只走 req (App 运行时无全局 fetch); 仅 1 次, 6s 超时; 未命中/
+// 超时/坏 JSON/空路径集一律 {hit:false}, 调用方无声落回原铸造。
+async function castBankLookup(watchUrl) {
+  try {
+    const w = OWN_FETCH + '/cast?u=' + encodeURIComponent(watchUrl);
+    const r = await reqRaw(w, { 'User-Agent': UA }, 6000);
+    if (!r || r.status !== 200 || !r.body) return { hit: false };
+    let j;
+    try { j = JSON.parse(r.body); } catch (e) { return { hit: false }; }
+    const seen = new Set();
+    const arr = (j && Array.isArray(j.paths))
+      ? j.paths.filter((p) => {
+          if (typeof p !== 'string' || !p.startsWith('//') || seen.has(p)) return false;
+          seen.add(p);
+          return true;
+        })
+      : [];
+    if (!arr.length) return { hit: false };
+    return { hit: true, paths: arr.map((p, i) => ({ lo: i === 0 ? 'main' : 'bak', path: p })) };
+  } catch (e) {
+    return { hit: false };
+  }
+}
+
 // 调 /api/play/ 并解出全部线路的 embed 路径: {paths, stage, via}
 async function fetchEmbedPaths(postId, mpu, referer) {
+  // 铸造库优先: 命中直接用库内路径集, 不打铸造 POST 竞速。
+  const bank = await castBankLookup(referer);
+  if (bank.hit) return { paths: bank.paths, stage: 'ok', via: 'cast-bank', postDiag: '', bank: 'hit' };
   const token = dex(postId, mpu);
   const body = 'sources=' + encodeURIComponent(token) + '&ver=2';
   const r = await httpPostForm(HOST + '/api/play/', body, { referer, timeout: 18000 });
-  if (!r.text) return { paths: [], stage: r.stage || 'post-none', via: '', postDiag: r.diag || '' };
+  if (!r.text) return { paths: [], stage: r.stage || 'post-none', via: '', postDiag: r.diag || '', bank: 'miss' };
   let resp;
-  try { resp = JSON.parse(r.text); } catch (e) { return { paths: [], stage: 'post-bad', via: r.via, postDiag: r.diag || '' }; }
-  if (!resp || resp.status !== true || !resp.data) return { paths: [], stage: 'post-bad', via: r.via, postDiag: r.diag || '' };
+  try { resp = JSON.parse(r.text); } catch (e) { return { paths: [], stage: 'post-bad', via: r.via, postDiag: r.diag || '', bank: 'miss' }; }
+  if (!resp || resp.status !== true || !resp.data) return { paths: [], stage: 'post-bad', via: r.via, postDiag: r.diag || '', bank: 'miss' };
   const paths = [];
   try { paths.push({ lo: t(resp.lo) || 'main', path: dex(postId, resp.data) }); } catch (e) { /* 主线解码失败 */ }
   if (resp.reserve) {
@@ -2736,7 +2771,7 @@ async function fetchEmbedPaths(postId, mpu, referer) {
       }
     } catch (e) { /* reserve 整体解码失败: 只用主线 */ }
   }
-  return { paths: paths.filter(p => p.path && p.path.startsWith('//')), stage: 'ok', via: r.via, postDiag: r.diag || '' };
+  return { paths: paths.filter(p => p.path && p.path.startsWith('//')), stage: 'ok', via: r.via, postDiag: r.diag || '', bank: 'miss' };
 }
 
 const HOST_PRETTY = [
@@ -2823,8 +2858,8 @@ async function resolveLines(durl) {
   if (!html) return { html: '', lines: [], stage: 'page', via: '', pageDiag: pageDiagOf(res ? res.outcomes : []) };
   const { postId, mpu } = extractPlaySeed(html);
   if (!postId || !mpu) return { html, lines: [], stage: 'seed', via: '' };
-  const { paths, stage, via, postDiag } = await fetchEmbedPaths(postId, mpu, durl);
-  if (!paths.length) return { html, lines: [], stage, via, postDiag };
+  const { paths, stage, via, postDiag, bank } = await fetchEmbedPaths(postId, mpu, durl);
+  if (!paths.length) return { html, lines: [], stage, via, postDiag, bank };
   const lines = [];
   await Promise.all(paths.slice(0, 8).map(async (p, idx) => {
     const embedUrl = 'https:' + p.path;
@@ -2838,8 +2873,8 @@ async function resolveLines(durl) {
   // hugstream 前置 (master.txt, 实测不绑 IP、只认 Referer) 次之;
   // 借线解出的绑定型宿主 (令牌绑代理出口, 设备必 403) 末位。
   lines.sort((a, b) => (lineGroup(a) - lineGroup(b)) || (hostRank(a.host) - hostRank(b.host)) || (a.idx - b.idx));
-  if (!lines.length) return { html, lines: [], stage: 'embed', via, postDiag, pathsN: paths.length };
-  return { html, lines, stage: 'ok', via, postDiag };
+  if (!lines.length) return { html, lines: [], stage: 'embed', via, postDiag, pathsN: paths.length, bank };
+  return { html, lines, stage: 'ok', via, postDiag, bank };
 }
 
 // ---------------- 接口 ----------------
@@ -2984,9 +3019,10 @@ async function detail(reqIn) {
     // 下一张截图即可读出死点与 own 是在抖还是恒死。
     fromNames.push('网页嗅探·' + (STAGE_TEXT[stage] || '铸造失败'));
     let epName;
-    if (stage === 'post-none') epName = '正片·铸造全灭 ' + (rl.postDiag || '无记录') + '·仅嗅探';
-    else if (stage === 'post-bad') epName = '正片·铸造被站方拒 ' + (rl.postDiag || '无记录') + '·仅嗅探';
-    else if (stage === 'embed') epName = '正片·embed未解出' + (rl.pathsN ? ' 铸出' + rl.pathsN + '路' : '') + '·仅嗅探';
+    const bankNote = rl.bank === 'hit' ? '库命中·' : '库未命中·';
+    if (stage === 'post-none') epName = '正片·' + bankNote + '铸造全灭 ' + (rl.postDiag || '无记录') + '·仅嗅探';
+    else if (stage === 'post-bad') epName = '正片·' + bankNote + '铸造被站方拒 ' + (rl.postDiag || '无记录') + '·仅嗅探';
+    else if (stage === 'embed') epName = '正片·' + bankNote + 'embed未解出' + (rl.pathsN ? ' 铸出' + rl.pathsN + '路' : '') + '·仅嗅探';
     else if (stage === 'seed') epName = '正片·无播放种子·仅嗅探';
     else epName = '正片·' + (STAGE_TEXT[stage] || '铸造失败') + '·仅嗅探';
     playUrls.push(epName.slice(0, 110) + '$' + durl + '@@sniff');
