@@ -53,6 +53,26 @@
 //      取数竞速, 且用户重重点播还能再掷一轮 —— 严格优于回一个已知
 //      必死的地址。官方链 A/B 仅保留在 JAVSB_WORKER 未配置时走旧链路。
 //
+// 播放 (2026-10-22 第八轮, 只改蜘蛛): 第七轮真机仍报无法播放 (样本:
+// 无码破解 JUFE-608, hash 963f852b…c3e503, 浏览器同片可播)。本轮以
+// 该片逐项复现 (报告 catfix_javsb_r8.md): 官方链 VM 直连 200/1679 片/
+// 分片 0x47 双偏移 —— 文件活着; 蜘蛛 分类->详情->play 的 hash 提取
+// 与用户发来的播放器 iframe 逐字一致 —— 解析无误; 但复现时段 Worker
+// 处于深度坏窗口 (/v 双形态 6/6 + 对照片 2/2 全 502; 每拉一次 /v 是
+// 一张独立彩票: 同一地址播放器式连拉两次, 先 502 苦等 35s、后 0.7s
+// 命中 1679 片)。第七轮在此之上的自伤: detail->play 实测 52.6/53.0s
+// 才返回 (重抓详情页 + 等预热 20s + 多轮串行取数), 疑超 App 请求
+// 耐心 —— URL 还没递到播放器, 请求先被放弃; 且预热与 play 并发
+// 取数互相干扰 (一轮取数已成功, play 仍耗满预算落未校验)。
+// 本轮改法: 1) play 硬顶 18s: hash 走 detail 登记的进程内映射免
+// 重抓详情页; 预热短等 <=6s; 前台只做一次有界尝试 (<=10s, 只查
+// "是否已温", 冷竞速留给后台预热与播放器自取); 到点必回未校验
+// 地址。2) detail 出双线 (全链/直链): 每条线一次点播 = 一次新的
+// /v 竞速, 一条没掷中可换另一条再掷, 不必退回重进。3) 取 Worker
+// 列表的 fetchWorkerPl 预算拆分硬封顶 (小预算时 fetch 占 65% +
+// req 余量, 不再单次传输吃满 44s)。Worker 与官方链均未动, 不
+// 新增任何中转。
+//
 // 抓取通道 (2026-10-20 第六版): 真机双状态 (VPN 开/关) 直连全灭、第三轮的
 // jina 单中转也全灭。复核结论: 第三轮实现无 URL/编码类低级错误, 但有三个结构
 // 问题 —— (1) jina 只走了原生 fetch 一条传输, 而本仓已真机通过的 SexTB 是走
@@ -568,7 +588,10 @@ async function detail(reqIn) {
   // 不拖慢详情返回), 用户停留详情页的时间用于消化中转取列表的慢启动。
   if (JAVSB_WORKER) {
     const ph = extractPlayer(html).hash;
-    if (ph) { try { warmWorker(ph); } catch (e) { /* 预热失败不影响详情 */ } }
+    if (ph) {
+      rememberDetailHash(durl, ph);
+      try { warmWorker(ph); } catch (e) { /* 预热失败不影响详情 */ }
+    }
   }
   return {
     list: [{
@@ -577,8 +600,11 @@ async function detail(reqIn) {
       vod_pic: pic,
       vod_remarks: '',
       vod_content: desc,
-      vod_play_from: 'JAVSB',
-      vod_play_url: `正片$${durl}`,
+      // 第八轮双线: 全链 (分片走 Worker /s) 与直链 (分片 18av 原始
+      // 直链) 两条线, id 尾部 @proxy/@direct 供 play 区分。每条线一
+      // 次点播都是一次新的 /v 取数竞速, 一条没掷中可换另一条再掷。
+      vod_play_from: '全链$$$直链',
+      vod_play_url: `正片$${durl}@proxy$$$正片$${durl}@direct`,
     }],
   };
 }
@@ -654,7 +680,7 @@ async function tryOfficialStream(hash, playerUrl, deadline) {
   return '';
 }
 
-// ---------- Worker 取流 (第七轮: 详情预热 + 多轮竞速 + 未校验兜底) ----------
+// ---------- Worker 取流 (第七轮: 详情预热 + 多轮竞速 + 未校验兜底; 第八轮: play 快返 + 双线) ----------
 // 探针就跑在 App 里, 等于设备出口实测:
 //   形态一 (分片直链, 轻量): 取 Worker 的 seg=direct 列表 (分片保持
 //     18av.mov 原始直链), 再探首分片 (Range 取首字节, 查 0x47 同步字)
@@ -670,6 +696,15 @@ async function tryOfficialStream(hash, playerUrl, deadline) {
 // 全部校验失败时 play 返回未校验的全链地址作兜底 (见 play 注释)。
 const workerState = new Map(); // hash -> { st, form, t, promise }
 const WORKER_STATE_TTL = 600000;
+
+// 第八轮: 详情URL -> hash 登记 (detail 解析时写入), play 命中即免去
+// 开头重抓详情页的一跳 (第七轮每次 play 先重抓, 坏窗口白吃数秒)。
+const hashByDetail = new Map();
+function rememberDetailHash(durl, hash) {
+  if (!durl || !hash) return;
+  hashByDetail.set(durl, hash);
+  if (hashByDetail.size > 60) hashByDetail.delete(hashByDetail.keys().next().value);
+}
 
 function workerUrlFor(hash, form) {
   const base = `${JAVSB_WORKER}/v?hash=${encodeURIComponent(hash)}`;
@@ -689,13 +724,21 @@ const isPlaylist = (s) => typeof s === 'string' && s.includes('#EXTM3U');
 // 取一次 Worker 列表 (先 fetch 传输, 失败换框架 req), 预算内返回正文或 ''
 async function fetchWorkerPl(url, budgetMs) {
   const end = Date.now() + budgetMs;
+  const left = () => end - Date.now();
+  // 第八轮: 预算拆分硬封顶。大预算 (后台预热) 维持第七轮行为 (单
+  // 传输给足, 等 Worker 内部竞速跑完); 小预算 (play 前台) 时 fetch
+  // 只占 65%, 给 req 传输留余量, 两者总和不超预算 —— 第七轮单次
+  // fetch 上限 44s 是 play 53s 的主要构成之一。
+  const fetchCap = budgetMs > 15000
+    ? Math.max(800, Math.min(44000, left()))
+    : Math.max(800, Math.floor(left() * 0.65));
   try {
-    const txt = await viaFetch(url, { 'User-Agent': UA, 'Accept': '*/*' }, Math.max(800, Math.min(44000, end - Date.now())));
+    const txt = await viaFetch(url, { 'User-Agent': UA, 'Accept': '*/*' }, fetchCap);
     if (txt && isPlaylist(txt)) return txt;
   } catch (e) { /* 换 req 传输再试 */ }
-  if (end - Date.now() < 800) return '';
+  if (left() < 800) return '';
   try {
-    const txt = await viaReq(url, { 'User-Agent': UA, 'Accept': '*/*' }, Math.max(800, Math.min(12000, end - Date.now())));
+    const txt = await viaReq(url, { 'User-Agent': UA, 'Accept': '*/*' }, Math.max(800, Math.min(12000, left())));
     if (txt && isPlaylist(txt)) return txt;
   } catch (e) { /* 落空 */ }
   return '';
@@ -736,6 +779,30 @@ async function acquireWorker(hash, budgetMs, maxRounds) {
   for (let r = 0; r < maxRounds && end - Date.now() > 1500; r++) {
     const form = await workerRound(hash, end - Date.now());
     if (form) return form;
+  }
+  return '';
+}
+
+// 第八轮: play 前台单次有界尝试 —— 只掷一轮, 总时长由 budgetMs
+// 硬封顶 (与预热的多轮长竞速分工: 前台只查"是否已温", 冷竞速留给
+// 后台预热与播放器自取)。想要哪条线就只取哪条; 未指定时先直链
+// (取到列表再探首分片), 直链分片探不过改判全链 (列表已取到 =
+// raw 已在 Worker 侧, 全链形态可播)。
+async function playAcquireOnce(hash, want, budgetMs) {
+  const end = Date.now() + budgetMs;
+  const left = () => end - Date.now();
+  const forms = want ? [want] : ['direct', 'proxy'];
+  for (const f of forms) {
+    if (left() < 2000) break;
+    const pl = await fetchWorkerPl(workerUrlFor(hash, f), Math.max(800, left()));
+    if (!pl) continue;
+    if (f === 'proxy') { noteLayer('worker-proxy', 0, true, workerUrlFor(hash, 'proxy')); return 'proxy'; }
+    const seg = pl.split('\n').map(x => x.trim()).find(x => x && !x.startsWith('#'));
+    const ok = seg ? await probeSegment(seg, Math.max(800, Math.min(2500, left()))) : false;
+    noteLayer('worker-probe', 0, ok, seg || '');
+    if (ok) return 'direct';
+    noteLayer('worker-proxy', 0, true, workerUrlFor(hash, 'proxy'));
+    return 'proxy';
   }
   return '';
 }
@@ -781,54 +848,87 @@ async function play(reqIn) {
   let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
   if (id.includes('$')) id = id.split('$').pop().trim();
+  // 第八轮: detail 双线在 id 尾部带 @proxy / @direct 线路标记 (老
+  // 缓存的无标记 id 照旧走未指定形态流程)。
+  let formWanted = '';
+  const fm = id.match(/@(proxy|direct)$/);
+  if (fm) { formWanted = fm[1]; id = id.slice(0, -fm[0].length); }
   if (/\.m3u8(\?|$)/i.test(id)) {
     return { parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': REFERER } };
   }
   const durl = /^https?:\/\//.test(id) ? id : absUrl(id);
-  const deadline = Date.now() + 55000; // 第六轮: Worker 首播含中转取列表 (实测可达 10~35s), 放宽总预算; 命中缓存时秒回
-  const remain = () => Math.max(400, deadline - Date.now());
-  const html = await getDetailPage(durl, remain());
-  const { playerUrl, hash } = html ? extractPlayer(html) : { playerUrl: '', hash: '' };
+  // 第八轮: play 硬顶 18s (第七轮坏窗口实测 52~53s 才返回, 疑超
+  // App 请求耐心 —— 与 URL 对错无关的独立死因)。每一步按剩余预算
+  // 封顶, 到点必回未校验地址, 绝不把用户晾在转圈上。取数主力是
+  // detail 阶段的后台预热 (110s 长竞速), play 前台只做快查。
+  const deadline = Date.now() + 18000;
+  const remain = () => Math.max(0, deadline - Date.now());
+  const offDeadline = Date.now() + 30000; // 仅 JAVSB_WORKER 未配置时的旧链路用
+  // hash 快速通道: detail 已登记 详情URL->hash, 命中免重抓详情页。
+  let playerUrl = '', hash = '';
+  if (JAVSB_WORKER) hash = hashByDetail.get(durl) || '';
+  if (!hash) {
+    const html = await getDetailPage(durl, Math.max(800, Math.min(6000, remain())));
+    if (html) {
+      const ep = extractPlayer(html);
+      playerUrl = ep.playerUrl; hash = ep.hash;
+      if (hash) rememberDetailHash(durl, hash);
+    }
+  }
   if (hash && JAVSB_WORKER) {
-    // 第七轮 Worker 路径: 预热结果 -> play 内补轮 -> 未校验兜底
+    // 第八轮 Worker 路径: 已知结果秒回 -> 预热短等 (<=6s) -> 单次
+    // 有界尝试 (<=10s) -> 未校验兜底; 全程 <=18s。
     const wHead = { 'User-Agent': UA, 'Referer': REFERER };
-    // 1) 详情阶段的预热结果 (进程内状态): 已 ok 直接复核出地址
     let e = workerState.get(hash);
-    if (e && e.st === 'ok' && Date.now() - e.t < WORKER_STATE_TTL) {
-      const u = await verifiedWorkerUrl(hash, e.form, Math.min(9000, remain()));
-      if (u) { noteLayer('worker-warm-hit', 0, true, u); return { parse: 0, url: u, header: wHead }; }
+    // 无状态/已判失败: 顺手 (重新) 点火后台预热, 惠及下一次点播
+    if (!e || (e.st !== 'ok' && e.st !== 'pending')) {
+      try { e = warmWorker(hash); } catch (err) { /* 预热点火失败不影响本次 */ }
     }
-    // 预热还在跑: 在预算内等它一阵 (上限 ~20s, 给补轮留时间), 等到即用
-    if (e && e.st === 'pending' && e.promise) {
-      const waitMs = Math.max(0, Math.min(20000, deadline - Date.now() - 15000));
+    const freshOk = () => {
+      const s = workerState.get(hash);
+      return (s && s.st === 'ok' && Date.now() - s.t < WORKER_STATE_TTL) ? s : null;
+    };
+    const fromOk = async (s) => {
+      // 指定全链或已知全链: 秒回全链地址; 直链做 <=5s 轻复核
+      // (verifiedWorkerUrl 复核不过时内部回退全链)。
+      if (formWanted === 'proxy' || s.form === 'proxy') {
+        noteLayer('worker-warm-hit', 0, true, workerUrlFor(hash, 'proxy'));
+        return { parse: 0, url: workerUrlFor(hash, 'proxy'), header: wHead };
+      }
+      const u = await verifiedWorkerUrl(hash, 'direct', Math.min(5000, Math.max(800, remain())));
+      noteLayer('worker-warm-hit', 0, true, u);
+      return { parse: 0, url: u, header: wHead };
+    };
+    let okS = freshOk();
+    if (okS && (!formWanted || formWanted === 'proxy' || formWanted === okS.form)) return fromOk(okS);
+    // 预热进行中: 短等 <=6s (第七轮等 20s 是 53s 的主因之一)
+    e = workerState.get(hash);
+    if (e && e.st === 'pending' && e.promise && remain() > 4000) {
+      const waitMs = Math.min(6000, remain() - 2500);
       if (waitMs > 0) await Promise.race([e.promise, new Promise(r => setTimeout(r, waitMs))]);
-      e = workerState.get(hash);
-      if (e && e.st === 'ok') {
-        const u = await verifiedWorkerUrl(hash, e.form, Math.min(9000, remain()));
-        if (u) { noteLayer('worker-warm-hit', 0, true, u); return { parse: 0, url: u, header: wHead }; }
-      }
+      okS = freshOk();
+      if (okS && (!formWanted || formWanted === 'proxy' || formWanted === okS.form)) return fromOk(okS);
     }
-    // 2) play 预算内补跑取数 (预热缺席/已判失败时)
-    if (deadline - Date.now() > 4000) {
-      const form = await acquireWorker(hash, deadline - Date.now() - 2000, 2);
-      if (form) {
-        const en = workerState.get(hash) || { st: 'ok', form, t: Date.now(), promise: null };
-        en.st = 'ok'; en.form = form; en.t = Date.now();
+    // 单次有界尝试 (<=10s): 只掷一轮, 不再多轮串行叠加
+    if (remain() > 2500) {
+      const got = await playAcquireOnce(hash, formWanted, Math.min(10000, remain() - 1200));
+      if (got) {
+        const en = workerState.get(hash) || { st: 'ok', form: got, t: Date.now(), promise: null };
+        en.st = 'ok'; en.form = got; en.t = Date.now();
         workerState.set(hash, en);
-        return { parse: 0, url: workerUrlFor(hash, form), header: wHead };
+        noteLayer('worker-play-once', 0, true, workerUrlFor(hash, got));
+        return { parse: 0, url: workerUrlFor(hash, got), header: wHead };
       }
     }
-    // 3) 校验全灭的兜底: 直接回未校验的全链 Worker 地址。播放器自取
-    // /v 时 Worker 会再跑一轮内部竞速 (等于多一次机会), 用户重重点播
-    // 又是一轮; 严格优于第六轮的回退路 A/B (返回 jav.sb 本域地址,
-    // 播放器直取必被 CF 拦 —— 第五轮真机已证全灭) 与 parse:1 嗅探
-    // (五、六两轮均未出过播)。
-    noteLayer('worker-unverified', 0, false, workerUrlFor(hash, 'proxy'));
-    return { parse: 0, url: workerUrlFor(hash, 'proxy'), header: wHead };
+    // 未校验兜底: 立即回想要形态的 Worker 地址 (播放器自取 = 新一
+    // 轮竞速; 配合 detail 双线, 可换另一条线再掷一次)。
+    const fb = workerUrlFor(hash, formWanted || 'proxy');
+    noteLayer('worker-unverified', 0, false, fb);
+    return { parse: 0, url: fb, header: wHead };
   }
   if (hash && playerUrl) {
     // JAVSB_WORKER 未配置时才走旧链路: 官方链 A/B -> 嗅探播放器页
-    const direct = await tryOfficialStream(hash, playerUrl, deadline);
+    const direct = await tryOfficialStream(hash, playerUrl, offDeadline);
     if (direct) {
       return { parse: 0, url: direct, header: { 'User-Agent': UA, 'Referer': REFERER } };
     }
