@@ -1156,15 +1156,35 @@ async function detail(reqIn) {
   if (desc) contentParts.push(desc);
   const fromNames = [];
   const playUrls = [];
+  // 呈现 (清晰度自选): 按清晰度分组 tab —— tab 名即清晰度
+  // (1080p/720p/480p…, 仅 5 字符, MiraPlayer tab 栏不会截断;
+  // 本仓 missav.js 有质量 tab 先例), tab 按清晰度降序, 默认首
+  // tab = 最高档, 网差时用户切低档 tab。tab 内每线一集, 集名 =
+  // 宿主+lo+「·直」 (同名加 ·N 序号消歧), 集序沿用 lines 全局
+  // 序在同档内的相对序 (出口组→宿主序→原序)。q 不明的线归
+  // 「默认」tab 垫底; 嗅探兜底独立 tab 放最后 (下方 else 分支)。
+  // 注: resolveLines 的全局排序不动 —— play() 靠它做"借线令牌
+  // 在设备必 403 时替用户改走最优线"的守卫, 清晰度只落呈现层。
+  const qGroups = new Map();
   lines.forEach((ln) => {
-    // 线路名: 文件宿主 + 区域线 lo + 清晰度标 (如 ·1080p);
-    // 直连栈解出的加「·直」—— 令牌绑设备 IP, 真机首选。
-    let nm = ln.lo && ln.lo !== 'main' ? `${ln.host}·${ln.lo}` : ln.host;
-    if (ln.q) nm += '·' + ln.q + 'p';
-    if (ln.direct) nm += '·直';
-    fromNames.push(nm);
-    playUrls.push('播放$' + durl + '@@' + ln.idx + '.' + (ln.v || 0));
+    const q = ln.q || 0;
+    if (!qGroups.has(q)) qGroups.set(q, []);
+    qGroups.get(q).push(ln);
   });
+  const qOrder = [...qGroups.keys()].sort((a, b) => b - a);
+  for (const q of qOrder) {
+    fromNames.push(q ? q + 'p' : '默认');
+    const seen = new Map();
+    const eps = qGroups.get(q).map((ln) => {
+      let nm = ln.lo && ln.lo !== 'main' ? `${ln.host}·${ln.lo}` : ln.host;
+      if (ln.direct) nm += '·直';
+      const n = (seen.get(nm) || 0) + 1;
+      seen.set(nm, n);
+      if (n > 1) nm += '·' + n;
+      return nm + '$' + durl + '@@' + ln.idx + '.' + (ln.v || 0);
+    });
+    playUrls.push(eps.join('#'));
+  }
   if (!lines.length) {
     // 铸造链没拿到线路: 给一条嗅探线, 分集名带失败阶段与铸造
     // 通道逐个结论 (MiraPlayer 显示分集名, 截图即可归因)。
@@ -1182,7 +1202,7 @@ async function detail(reqIn) {
   } else {
     if (via) contentParts.push('铸造通道: ' + via);
     const nDirect = lines.filter((l) => l.direct).length;
-    contentParts.push(`线路出口: 直连${nDirect}/${lines.length} (直连线令牌绑本机IP, 优先点带「·直」的线; 线路名带清晰度, 同组高清在前)`);
+    contentParts.push(`线路出口: 直连${nDirect}/${lines.length} (直连线令牌绑本机IP, 优先点带「·直」的线; 已按清晰度分 tab, 首个 tab 为最高档, 网差时切 720p tab)`);
     // 直链仍播不了时的最后兜底: WebView 嗅探详情页
     fromNames.push('网页嗅探·兜底');
     playUrls.push('播放$' + durl + '@@sniff');
