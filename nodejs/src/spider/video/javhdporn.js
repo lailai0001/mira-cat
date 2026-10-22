@@ -70,34 +70,67 @@ function clean(s) {
     .replace(/&#\d+;/g, ''));
 }
 
-// ---------------- 抓取 (多层兜底 + 内容校验; 第四轮改并行竞速, 见下方) ----------------
-// 2026-10-21 第三轮修复 (与 bestjavporn 同病同方):
-// 真机故障根因 (VM 实测坐实): 本站 (与 bestjavporn 同运营网络) 的
-// Cloudflare 按 User-Agent 拉黑 HTTP 库特征 UA —— okhttp / Java /
-// axios / node-fetch / python-requests 等一律 403, 只回 17B~5.5KB
-// 空壳页; 浏览器 UA (含空 UA) 则 200 满页。App 运行时发出的请求
-// 带的正是这类被拉黑的 UA (蜘蛛设置的 Chrome UA 未能生效到站方),
-// 于是真机上 home/category/search/detail 全部只拿到 403 空壳 ->
-// 解析 0 卡 -> "有分类、无内容、点不开"。其他源 (Brazz/javideo/
-// 7mmtv) 的 CF 区没有这条规则, 故独这两站全灭。
-// 对策: 抓取改为多层竞速兜底, 每层结果先过内容校验 (真页面:
-// 长度 >12KB 且含 pornfhd.com 标记且无 CF 空壳特征) 才采纳:
-//   直连 req -> 直连 fetch -> jina 读页 (x-respond-with:html 取
-//   原始 HTML, 实测 1~2s 满页保真) -> allorigins -> codetabs。
-// 记住胜出层 (sticky), 后续请求先试它, 避免每次全程试错。
-// 总预算 70s; 真机典型路径: 直连两层快速吃 403 (~2s) -> jina ~2s。
-function isRealPage(html) {
-  if (!html || html.length < 12000) return false;
-  if (!html.includes('pornfhd.com')) return false;
-  if (/Attention Required|Just a moment|cf-challenge|Checking your browser/i.test(html)) return false;
-  return true;
+// ---------------- 抓取 (第五轮: 解析型校验 + 扩容通道池竞速) ----------------
+// 2026-10-22 第五轮 (与 bestjavporn 同步)。第四轮 (并行竞速) 真机仍
+// 全灭, 本轮逐通道原始应答复测 (VM 出口, 与校验判定分开记录):
+//   直连 fetch / jina(html 模式): 两站均 200 真页 (0.1~2s);
+//   allorigins /raw、codetabs: 当日全程 522, 且各烧约 20s 才回;
+//   allorigins /get (JSON 包装): 对 bestjavporn 可用 (2/2 真页),
+//     对本站被其出口挡 (522/408) —— 两站 CF 区域规则并不一致;
+//   新通道 test.cors.workers.dev (Cloudflare 官方 CORS demo, 须带
+//     X-Requested-With 头): 对规范 URL 直出真页且极快 (0.1~1.5s);
+//     但目标 URL 若会 301 (本站 /category/x/ -> /v3/category/x/),
+//     它回自己的说明页 —— 该通道须喂规范 URL, 前缀从任何成功页的
+//     canonical 链接学习 (默认 /v3, 页面变化时自动更新);
+//   corsproxy.io 已改 API-Key 制 (401)、cors.lol 限流、cors.eu.org /
+//     bridged / whateverorigin 等均已死或不可达, 不纳入。
+//   框架 req (axios) 在 VM 沙箱被出口代理 ECONNRESET (连 httpbin
+//     都挂), 属沙箱假象, 不代表用户服务端; 其线上 UA 经回显实测
+//     确为蜘蛛所设 Chrome UA —— 前轮"蜘蛛 UA 不生效"的说法无直接
+//     证据, 本轮按"多栈并存、不押单栈"设计。
+// (推导, 非实测) 真机全灭的最合理解释仍是出口差异: 用户运行时
+// 出口下直连各栈与 jina (大陆不可达) 同时失效时, 第四轮只剩当时
+// 全 522 的 B 组, 竞速救不了全体通道死亡。本轮对策:
+//   ① 通道池扩容: 新增 workers.dev 通道 (与用户已在用的自有
+//     Worker 同域, 可达性谱系不同于 jina/公共中转) 与 allorigins
+//     /get 形态、原生 https 栈, 全部并行竞速, 存活者最快胜出;
+//   ② 校验改解析型: 列表页以"真能解出卡片"为准、详情页以播放器
+//     /og 标记为准 —— 杜绝"通道拿到了页面却被长度/关键词校验
+//     误杀", 也杜绝垃圾页 (中转说明页/限流页) 被误收;
+//   ③ 慢中转只进第二波且封顶; 全灭回空, 不再回未校验残页。
+import https from 'https';
+import zlib from 'zlib';
+
+const BROWSER_HEADERS = {
+  'User-Agent': UA,
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+  'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Upgrade-Insecure-Requests': '1',
+};
+
+function isShellPage(s) {
+  return /Attention Required|Just a moment|cf-challenge|Checking your browser/i.test(s || '');
+}
+// 解析型校验 (parseCards 为函数声明, 已提升, 此处可直接调用)
+function validListPage(html) {
+  return !!html && !isShellPage(html) && parseCards(html).length > 0;
+}
+function validDetailPage(html) {
+  return !!html && !isShellPage(html) && html.length > 4000 &&
+    (/property="og:(title|image)"/.test(html) || html.includes('videojs.html') || html.includes('data-mpu'));
 }
 
 async function viaReq(url, timeoutMs) {
   try {
     const r = await req.get(url, {
       headers: { 'User-Agent': UA, Referer: REFERER },
-      timeout: timeoutMs || 15000,
+      timeout: timeoutMs || 12000,
     });
     const d = typeof r === 'string' ? r : (r && r.data !== undefined ? r.data : r);
     return typeof d === 'string' ? d : '';
@@ -109,7 +142,7 @@ async function viaReq(url, timeoutMs) {
 async function fetchText(url, headers, timeoutMs) {
   try {
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), timeoutMs || 15000);
+    const timer = setTimeout(() => ctl.abort(), timeoutMs || 12000);
     const r = await fetch(url, { headers, redirect: 'follow', signal: ctl.signal });
     clearTimeout(timer);
     if (!r.ok) return '';
@@ -120,79 +153,134 @@ async function fetchText(url, headers, timeoutMs) {
 }
 
 async function viaFetch(url, timeoutMs) {
-  return fetchText(url, { 'User-Agent': UA, Referer: REFERER }, timeoutMs);
+  return fetchText(url, { ...BROWSER_HEADERS, Referer: REFERER }, timeoutMs);
 }
 
-async function viaJina(url) {
-  // jina 匿名读页偶发 401 (出口 IP 信誉), 立即重试一次常能过
-  for (let i = 0; i < 2; i++) {
-    const html = await fetchText('https://r.jina.ai/' + url, {
-      'User-Agent': UA,
-      'x-respond-with': 'html',
-    }, 15000);
-    if (isRealPage(html)) return html;
-    if (i === 0) await new Promise((res) => setTimeout(res, 1200));
-  }
-  return '';
+// 原生 https 栈 (与 req/fetch 不同的代码路径; 手工重定向 + 解压)
+function viaHttps(url, timeoutMs, depth = 0) {
+  return new Promise((resolve) => {
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const u = new URL(url);
+      const rq = https.request({
+        hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
+        headers: { ...BROWSER_HEADERS, Referer: REFERER, 'Accept-Encoding': 'gzip, deflate, br' },
+        timeout: timeoutMs || 12000,
+      }, (res) => {
+        const loc = res.headers.location;
+        if (res.statusCode >= 300 && res.statusCode < 400 && loc && depth < 3) {
+          res.resume();
+          fin(viaHttps(new URL(loc, url).toString(), timeoutMs, depth + 1));
+          return;
+        }
+        if (res.statusCode !== 200) { res.resume(); fin(''); return; }
+        let stream = res;
+        const enc = String(res.headers['content-encoding'] || '');
+        try {
+          if (enc.includes('gzip')) stream = res.pipe(zlib.createGunzip());
+          else if (enc.includes('deflate')) stream = res.pipe(zlib.createInflate());
+          else if (enc.includes('br')) stream = res.pipe(zlib.createBrotliDecompress());
+        } catch (e) { /* 解压失败则按原文读 */ }
+        const chunks = [];
+        stream.on('data', (c) => chunks.push(c));
+        stream.on('end', () => fin(Buffer.concat(chunks).toString('utf8')));
+        stream.on('error', () => fin(''));
+      });
+      rq.on('timeout', () => { rq.destroy(); fin(''); });
+      rq.on('error', () => fin(''));
+      rq.end();
+    } catch (e) { fin(''); }
+  });
 }
 
-async function viaAllorigins(url) {
+// workers.dev 通道须喂规范 URL: /category|search 前的版本前缀从
+// 成功页面学习 (页面 canonical/og:url 均为规范形态); 默认 /v3。
+let learnedPrefix = '/v3';
+function notePrefix(html) {
+  const m = String(html || '').match(/javhdporn\.net(\/v\d+)\/(?:category|search)\//);
+  if (m) learnedPrefix = m[1];
+}
+function wdTarget(url) {
+  try {
+    const u = new URL(url);
+    if (/^\/(category|search)\//.test(u.pathname)) u.pathname = learnedPrefix + u.pathname;
+    return u.toString();
+  } catch (e) { return url; }
+}
+async function viaWorkersDemo(url, timeoutMs) {
+  return fetchText('https://test.cors.workers.dev/?' + wdTarget(url), {
+    'User-Agent': UA, 'X-Requested-With': 'XMLHttpRequest', Origin: HOST,
+  }, timeoutMs);
+}
+
+async function viaJina(url, timeoutMs) {
+  return fetchText('https://r.jina.ai/' + url, {
+    'User-Agent': UA,
+    'x-respond-with': 'html',
+  }, timeoutMs);
+}
+
+async function viaAlloriginsGet(url, timeoutMs) {
+  const txt = await fetchText('https://api.allorigins.win/get?url=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, timeoutMs);
+  if (!txt) return '';
+  try {
+    const j = JSON.parse(txt);
+    return typeof j.contents === 'string' ? j.contents : '';
+  } catch (e) { return ''; }
+}
+
+async function viaAlloriginsRaw(url, timeoutMs) {
   return fetchText('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
     'User-Agent': UA,
-  }, 20000);
+  }, timeoutMs);
 }
 
-async function viaCodetabs(url) {
+async function viaCodetabs(url, timeoutMs) {
   return fetchText('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), {
     'User-Agent': UA,
-  }, 15000);
+  }, timeoutMs);
 }
 
-// ---------------- 第四轮: 并行竞速 (首个真页面胜出) ----------------
-// 第三轮的串行逐层试错在真机上仍被拖死 (2026-10-22 用户复报:
-// 分类能出、分类下内容加载不出)。复盘 (VM 实测): 直连两层在
-// App 运行时里带被站方拉黑的客户端特征, 注定先吃两记失败; 其后
-// allorigins / codetabs 抽风时各回 522 且各烧 20~30s, 串行叠加
-// 轻松超过 App 的等待耐心 —— 分类页永远等不到能用的通道胜出。
-// 本轮改并行竞速: A 组 (直连 req / 直连 fetch / jina 读页) 同时
-// 发车, 谁先回真页面谁赢, 总耗时 = 最快存活通道 (jina 实测
-// 0.3~2s 全覆盖 home/分类/详情/搜索); A 组全灭才进 B 组
-// (allorigins / codetabs 并行兜底, 各自封顶)。内容校验不变。
-const PAGE_LAYERS_A = [
-  (url, ms) => viaReq(url, ms),
-  (url, ms) => viaFetch(url, ms),
-  (url) => viaJina(url),
-];
-const PAGE_LAYERS_B = [
-  (url) => viaAllorigins(url),
-  (url) => viaCodetabs(url),
-];
-let goodLayer = ''; // 上次胜出通道 (仅记录, 不再决定顺序)
-
-async function firstValid(fns, url, timeoutMs, track) {
-  const jobs = fns.map((fn, i) => (async () => {
+async function raceValid(fns, valid) {
+  const jobs = fns.map((fn) => (async () => {
     let html = '';
-    try { html = await fn(url, timeoutMs); } catch (e) { html = ''; }
-    if (html && html.length > track.best.length) track.best = html;
-    if (isRealPage(html)) return { i, html };
+    try { html = await fn(); } catch (e) { html = ''; }
+    if (valid(html)) return html;
     throw new Error('invalid page');
   })());
   return Promise.any(jobs);
 }
 
-async function getPage(url, timeoutMs) {
-  const track = { best: '' };
+async function getPage(url, kind) {
+  const valid = kind === 'detail' ? validDetailPage : validListPage;
+  const wave1 = [
+    () => viaFetch(url, 12000),
+    () => viaReq(url, 12000),
+    () => viaHttps(url, 12000),
+    () => viaWorkersDemo(url, 12000),
+    () => viaJina(url, 12000),
+    () => viaAlloriginsGet(url, 15000),
+  ];
   try {
-    const win = await firstValid(PAGE_LAYERS_A, url, timeoutMs, track);
-    goodLayer = 'A' + win.i;
-    return win.html;
-  } catch (e) { /* A 组全灭, 进 B 组 */ }
+    const html = await raceValid(wave1, valid);
+    notePrefix(html);
+    return html;
+  } catch (e) { /* 第一波全灭, 进第二波 */ }
+  const wave2 = [
+    () => viaAlloriginsRaw(url, 15000),
+    () => viaCodetabs(url, 12000),
+    () => viaJina(url, 10000),
+    () => viaWorkersDemo(url, 10000),
+  ];
   try {
-    const win = await firstValid(PAGE_LAYERS_B, url, timeoutMs, track);
-    goodLayer = 'B' + win.i;
-    return win.html;
-  } catch (e) { /* 全灭: 回最长的残页 (与旧版兜底口径一致) */ }
-  return track.best;
+    const html = await raceValid(wave2, valid);
+    notePrefix(html);
+    return html;
+  } catch (e) { /* 全灭: 回空, 不再回未校验残页 */ }
+  return '';
 }
 
 // ---------------- 解析 ----------------
@@ -283,7 +371,7 @@ async function detail(reqIn) {
   const id = t(body.id);
   if (!id) return { list: [] };
   const durl = /^https?:\/\//.test(id) ? id : HOST + (id.startsWith('/') ? id : '/' + id);
-  const html = await getPage(durl);
+  const html = await getPage(durl, 'detail');
   if (!html) return { list: [] };
   let name = og(html, 'title').replace(/\s*-\s*JAV HD Porn\s*$/i, '');
   if (!name) {

@@ -65,6 +65,10 @@
 //   POST 全部改并行竞速、首个合格响应胜出 (jina 实测 0.3~2s 全
 //   覆盖), 中转只作 B 组/末位兜底并封顶; validPlayResp 收紧为
 //   status===true, 防 allorigins 丢 body 的假成功抢答。
+// 2026-10-22 第五轮: 第四轮真机仍全灭 —— 见抓取层上方长注:
+//   通道池扩容 (workers.dev + allorigins/get + 原生 https 栈)、
+//   校验改解析型、慢中转降第二波。根因裁定区分实测/推导, 详见
+//   catfix_jhp_bjp_r3.md。
 import req from '../../util/req.js';
 
 const KEY = 'py_bestjavporn';
@@ -2007,32 +2011,59 @@ function absUrl(u) {
   return HOST + (u.startsWith('/') ? u : '/' + u);
 }
 
-// ---------- 基础传输: 框架 req 优先, 原生 fetch 兜底 ----------
-// ---------- 抓取层 (第三轮: 多层兜底 + 内容校验 + 胜出层记忆) ----------
-// 病因见文件头第三轮注释: 站方 CF 按 UA 拉黑库特征 UA, App 运行时
-// 直连只回 403 空壳。本层逐层试, 每层结果先过校验才采纳, 并记住
-// 胜出层供后续请求优先 (sticky)。校验分两档: 本站 www 页面用严档
-// (真页面 >12KB 且含 pornfhd.com 标记、无 CF 空壳特征); embed 等
-// 外站页面用宽档 (非空、够长、无空壳特征)。
+// ---------- 抓取层 (第五轮: 解析型校验 + 扩容通道池竞速) ----------
+// 2026-10-22 第五轮 (与 javhdporn 同步)。第四轮真机仍全灭后, 逐
+// 通道原始应答复测 (VM 出口, 原始应答与校验判定分开记录):
+//   直连 fetch、jina(html 模式): 两站均 200 真页 (0.1~2s);
+//   allorigins /raw、codetabs: 当日全程 522 (各烧约 20s);
+//   allorigins /get (JSON 包装, 旧版未用): 对本站可用 (2/2 真页,
+//     7~8s), 对 javhdporn 被其出口挡 —— 两站区域规则不一致;
+//   新通道 test.cors.workers.dev (Cloudflare 官方 CORS demo, 须带
+//     X-Requested-With 头): GET 对规范 URL 直出真页且极快
+//     (0.1~1.5s); POST /api/play/ 转发 body 后回本站真 JSON
+//     (status:true, 与直连应答逐字节一致, 120ms) —— GET/POST
+//     双通道成立。但目标 URL 若会 301 (如 /search/ 的无前缀
+//     形态), 它回自己的说明页, 故该通道对 /search/ 喂学习到的
+//     规范前缀 (从成功页面的 /v{n}/ 链接学习);
+//   框架 req (axios) 在 VM 沙箱被出口代理 ECONNRESET (连
+//     httpbin 都挂), 属沙箱假象; 其线上 UA 经回显实测确为蜘蛛
+//     所设 Chrome UA —— 前轮"蜘蛛 UA 不生效"无直接证据, 本轮
+//     按"多栈并存、不押单栈"设计。
+// (推导, 非实测) 真机全灭的最合理解释仍是出口差异: 用户运行时
+// 出口下直连各栈与 jina (大陆不可达) 同时失效时, 第四轮只剩
+// 当时全 522 的中转组。本轮对策与 javhdporn 同构: 通道池扩容
+// (workers.dev + allorigins/get + 原生 https 栈) 全部竞速;
+// 校验改解析型 (列表=能解出卡片, 详情=带 data-mpu/og 标记,
+// embed=带 data-config), 杜绝误杀与误收; 慢中转只进第二波且
+// 封顶; 全灭回空, 不再回未校验残页。
+import https from 'https';
+import zlib from 'zlib';
+
 function isShellPage(s) {
   return /Attention Required|Just a moment|cf-challenge|Checking your browser/i.test(s || '');
 }
-function isRealPage(html) {
-  if (!html || html.length < 12000) return false;
-  if (!html.includes('pornfhd.com')) return false;
-  return !isShellPage(html);
+// 解析型校验 (parseCards 为函数声明, 已提升)
+function validListPage(html) {
+  return !!html && !isShellPage(html) && parseCards(html).length > 0;
 }
-function validFor(url, html) {
-  if (!html) return false;
-  if (/^https:\/\/(www\.)?(bestjavporn\.com|javhdporn\.net)\//i.test(url)) return isRealPage(html);
-  return html.length > 800 && !isShellPage(html);
+function validDetailPage(html) {
+  return !!html && !isShellPage(html) && html.length > 4000 &&
+    (html.includes('data-mpu') || html.includes('video-id=') || /property="og:title"/.test(html));
+}
+function validEmbedPage(html) {
+  return !!html && !isShellPage(html) && html.length > 200 && html.includes('data-config');
+}
+function validFor(url, html, kind) {
+  if (kind === 'detail') return validDetailPage(html);
+  if (kind === 'embed') return validEmbedPage(html);
+  return validListPage(html);
 }
 
-async function fetchRaw(url, headers, timeout) {
+async function fetchRaw(url, headers, timeout, method, body) {
   const ctl = new AbortController();
-  const to = setTimeout(() => ctl.abort(), timeout);
+  const to = setTimeout(() => ctl.abort(), timeout || 12000);
   try {
-    const r = await fetch(url, { headers, signal: ctl.signal, redirect: 'follow' });
+    const r = await fetch(url, { headers, signal: ctl.signal, redirect: 'follow', method: method || 'GET', body });
     if (!r.ok) return '';
     return await r.text();
   } catch (e) {
@@ -2040,31 +2071,112 @@ async function fetchRaw(url, headers, timeout) {
   } finally { clearTimeout(to); }
 }
 
-async function getViaJina(url, headers, timeout) {
-  // jina 匿名读页偶发 401 (出口 IP 信誉), 立即重试一次常能过
-  for (let i = 0; i < 2; i++) {
-    const html = await fetchRaw('https://r.jina.ai/' + url, {
-      'User-Agent': headers['User-Agent'] || UA,
-      'x-respond-with': 'html',
-    }, 15000);
-    if (validFor(url, html)) return html;
-    if (i === 0) await new Promise((res) => setTimeout(res, 1200));
-  }
+async function viaReqGet(url, headers, timeout) {
+  try {
+    const { data, status } = await req.get(url, { headers, timeout: timeout || 12000 });
+    if ((!status || status === 200) && data != null && data !== '') {
+      return typeof data === 'string' ? data : JSON.stringify(data);
+    }
+  } catch (e) { /* 落空 */ }
   return '';
 }
 
-// 第四轮 (与 javhdporn 同步): 串行逐层试错改并行竞速。真机上
-// 直连两层带被拉黑的客户端特征注定先败, 串行再叠上 allorigins /
-// codetabs 抽风时 20~30s 的 522, 总耗时超过 App 耐心 -> 分类页
-// 永远等不到胜出。竞速后总耗时 = 最快存活通道 (jina 实测
-// 0.3~2s 全覆盖); A 组 (直连 req / 直连 fetch / jina) 全灭才进
-// B 组 (allorigins / codetabs 并行兜底, 各自封顶)。
-async function raceLayers(url, fns, track) {
+// 原生 https 栈 (独立代码路径; 手工重定向 + 解压)
+function viaHttps(url, headers, timeoutMs, depth = 0) {
+  return new Promise((resolve) => {
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const u = new URL(url);
+      const rq = https.request({
+        hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
+        headers: { ...headers, 'Accept-Encoding': 'gzip, deflate, br' },
+        timeout: timeoutMs || 12000,
+      }, (res) => {
+        const loc = res.headers.location;
+        if (res.statusCode >= 300 && res.statusCode < 400 && loc && depth < 3) {
+          res.resume();
+          fin(viaHttps(new URL(loc, url).toString(), headers, timeoutMs, depth + 1));
+          return;
+        }
+        if (res.statusCode !== 200) { res.resume(); fin(''); return; }
+        let stream = res;
+        const enc = String(res.headers['content-encoding'] || '');
+        try {
+          if (enc.includes('gzip')) stream = res.pipe(zlib.createGunzip());
+          else if (enc.includes('deflate')) stream = res.pipe(zlib.createInflate());
+          else if (enc.includes('br')) stream = res.pipe(zlib.createBrotliDecompress());
+        } catch (e) { /* 按原文读 */ }
+        const chunks = [];
+        stream.on('data', (c) => chunks.push(c));
+        stream.on('end', () => fin(Buffer.concat(chunks).toString('utf8')));
+        stream.on('error', () => fin(''));
+      });
+      rq.on('timeout', () => { rq.destroy(); fin(''); });
+      rq.on('error', () => fin(''));
+      rq.end();
+    } catch (e) { fin(''); }
+  });
+}
+
+// workers.dev 通道: /search/ 需规范前缀 (从成功页学习; 分类路径
+// 的 type_id 本就带前缀, 详情 /video/ 本就规范, 均不改写)
+let learnedPrefix = '';
+function notePrefix(html) {
+  const m = String(html || '').match(/bestjavporn\.com(\/v\d+)\/search\//);
+  if (m) { learnedPrefix = m[1]; return; }
+  if (!learnedPrefix) {
+    const m2 = String(html || '').match(/bestjavporn\.com(\/v\d+)\//);
+    if (m2) learnedPrefix = m2[1];
+  }
+}
+function wdTarget(url) {
+  try {
+    const u = new URL(url);
+    if (u.pathname.startsWith('/search/') && learnedPrefix) u.pathname = learnedPrefix + u.pathname;
+    return u.toString();
+  } catch (e) { return url; }
+}
+const WD_HEADERS = { 'User-Agent': UA, 'X-Requested-With': 'XMLHttpRequest', Origin: HOST };
+async function viaWorkersDemo(url, timeout) {
+  return fetchRaw('https://test.cors.workers.dev/?' + wdTarget(url), WD_HEADERS, timeout || 12000);
+}
+
+async function viaJina(url, timeout) {
+  return fetchRaw('https://r.jina.ai/' + url, {
+    'User-Agent': UA,
+    'x-respond-with': 'html',
+  }, timeout || 12000);
+}
+
+async function viaAlloriginsGet(url, timeout) {
+  const txt = await fetchRaw('https://api.allorigins.win/get?url=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, timeout || 15000);
+  if (!txt) return '';
+  try {
+    const j = JSON.parse(txt);
+    return typeof j.contents === 'string' ? j.contents : '';
+  } catch (e) { return ''; }
+}
+
+async function viaAlloriginsRaw(url, timeout) {
+  return fetchRaw('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, timeout || 15000);
+}
+
+async function viaCodetabs(url, timeout) {
+  return fetchRaw('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, timeout || 12000);
+}
+
+async function raceValid(fns, valid) {
   const jobs = fns.map((fn) => (async () => {
     let html = '';
     try { html = await fn(); } catch (e) { html = ''; }
-    if (html && html.length > track.best.length) track.best = html;
-    if (validFor(url, html)) return html;
+    if (valid(html)) return html;
     throw new Error('invalid page');
   })());
   return Promise.any(jobs);
@@ -2073,39 +2185,59 @@ async function raceLayers(url, fns, track) {
 async function httpGet(url, opts = {}) {
   const headers = {
     'User-Agent': UA,
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+    'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Upgrade-Insecure-Requests': '1',
     'Referer': opts.referer || REFERER,
   };
-  const timeout = opts.timeout || 15000;
-  const track = { best: '' };
-  const layerA = [
-    async () => { // 直连 req (axios)
-      try {
-        const { data, status } = await req.get(url, { headers, timeout });
-        if ((!status || status === 200) && data != null && data !== '') {
-          return typeof data === 'string' ? data : JSON.stringify(data);
-        }
-      } catch (e) { /* 落空, 竞速里不阻塞 */ }
-      return '';
-    },
-    async () => fetchRaw(url, headers, timeout), // 直连 fetch
-    async () => getViaJina(url, headers), // jina 读页 (原始 HTML)
+  const valid = (html) => validFor(url, html, opts.kind);
+  // embed 页小而多 (detail 并行解 ≤8 条): 用精简通道组, 避免
+  // 每条 embed 都拉满 6 通道造成连接风暴 (harness 追踪实测全量
+  // 竞速下 embed 阶段被并发拖到 12s+; 精简后回落到 ~2s 级)。
+  const isEmbed = opts.kind === 'embed';
+  const wave1 = isEmbed ? [
+    () => fetchRaw(url, headers, 10000),
+    () => viaWorkersDemo(url, 10000),
+    () => viaReqGet(url, headers, 10000),
+  ] : [
+    () => fetchRaw(url, headers, 12000),
+    () => viaReqGet(url, headers, 12000),
+    () => viaHttps(url, headers, 12000),
+    () => viaWorkersDemo(url, 12000),
+    () => viaJina(url, 12000),
+    () => viaAlloriginsGet(url, 15000),
   ];
-  try { return await raceLayers(url, layerA, track); } catch (e) { /* A 组全灭, 进 B 组 */ }
-  const layerB = [
-    async () => fetchRaw('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), { 'User-Agent': UA }, 20000),
-    async () => fetchRaw('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), { 'User-Agent': UA }, 15000),
+  try {
+    const html = await raceValid(wave1, valid);
+    notePrefix(html);
+    return html;
+  } catch (e) { /* 第一波全灭, 进第二波 */ }
+  const wave2 = isEmbed ? [
+    () => viaJina(url, 10000),
+    () => viaAlloriginsGet(url, 12000),
+  ] : [
+    () => viaAlloriginsRaw(url, 15000),
+    () => viaCodetabs(url, 12000),
+    () => viaJina(url, 10000),
+    () => viaWorkersDemo(url, 10000),
   ];
-  try { return await raceLayers(url, layerB, track); } catch (e) { /* 全灭 */ }
-  return track.best;
+  try {
+    const html = await raceValid(wave2, valid);
+    notePrefix(html);
+    return html;
+  } catch (e) { /* 全灭: 回空 */ }
+  return '';
 }
 
 function validPlayResp(text) {
-  // 第四轮收紧: 必须 status === true 才算铸造成功。allorigins 转发
-  // POST 时会丢 body, 站方回 {"status":false,"msg":"no sources"} ——
-  // 旧校验 ('status' in j) 会把这种假成功当胜出, 竞速里更会挡住
-  // 较慢但真实的直连结果, 故此处与 fetchEmbedPaths 的口径对齐。
+  // 必须 status === true 才算铸造成功 (第四轮已坐实: allorigins
+  // 转发 POST 会丢 body, 站方回 {"status":false,...} 假成功)。
   if (!text) return false;
   try {
     const j = JSON.parse(text);
@@ -2115,23 +2247,20 @@ function validPlayResp(text) {
 
 async function postViaAllorigins(url, bodyStr, headers, timeout) {
   const relay = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url);
-  for (let i = 0; i < 2; i++) { // allorigins 偶发 502/522, 给两次机会
-    const ctl = new AbortController();
-    const to = setTimeout(() => ctl.abort(), Math.max(timeout, 20000));
-    try {
-      const r = await fetch(relay, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': headers['User-Agent'] || UA },
-        body: bodyStr,
-        signal: ctl.signal,
-      });
-      if (r.ok) {
-        const text = await r.text();
-        if (validPlayResp(text)) return text;
-      }
-    } catch (e) { /* 再试/落空 */ } finally { clearTimeout(to); }
-    if (i < 1) await new Promise((res) => setTimeout(res, 2000));
-  }
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), timeout || 10000);
+  try {
+    const r = await fetch(relay, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': headers['User-Agent'] || UA },
+      body: bodyStr,
+      signal: ctl.signal,
+    });
+    if (r.ok) {
+      const text = await r.text();
+      if (validPlayResp(text)) return text;
+    }
+  } catch (e) { /* 落空 */ } finally { clearTimeout(to); }
   return '';
 }
 
@@ -2144,41 +2273,37 @@ async function httpPostForm(url, bodyStr, opts = {}) {
     'Referer': opts.referer || REFERER,
     'Origin': HOST,
   };
-  const timeout = opts.timeout || 15000;
-  // 三通道并行竞速, 首个 status===true 的响应胜出 (理由同 httpGet)
-  const attempts = [
-    async () => { // 直连 req (axios)
-      try {
-        const { data, status } = await req.post(url, bodyStr, { headers, timeout });
-        if ((!status || status === 200) && data != null && data !== '') {
-          return typeof data === 'string' ? data : JSON.stringify(data);
-        }
-      } catch (e) { /* 落空 */ }
-      return '';
-    },
+  // 第一波: 直连 fetch / 直连 req / workers.dev 转发 (实测回真
+  // JSON 且最快); 第二波: allorigins 转发兜底。总截止约 22s,
+  // 铸造全灭时快速落嗅探, 不陪慢通道死等。
+  const wave1 = [
     async () => { // 直连 fetch
       const ctl = new AbortController();
-      const to = setTimeout(() => ctl.abort(), timeout);
+      const to = setTimeout(() => ctl.abort(), 12000);
       try {
         const r = await fetch(url, { method: 'POST', headers, body: bodyStr, signal: ctl.signal, redirect: 'follow' });
         if (r.ok) return await r.text();
       } catch (e) { /* 落空 */ } finally { clearTimeout(to); }
       return '';
     },
-    async () => postViaAllorigins(url, bodyStr, headers, timeout), // 中转转发
+    async () => { // 直连 req (axios)
+      try {
+        const { data, status } = await req.post(url, bodyStr, { headers, timeout: 12000 });
+        if ((!status || status === 200) && data != null && data !== '') {
+          return typeof data === 'string' ? data : JSON.stringify(data);
+        }
+      } catch (e) { /* 落空 */ }
+      return '';
+    },
+    async () => fetchRaw('https://test.cors.workers.dev/?' + url, {
+      ...WD_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded',
+    }, 12000, 'POST', bodyStr),
   ];
-  const jobs = attempts.map((fn) => (async () => {
-    const text = await fn().catch(() => '');
-    if (validPlayResp(text)) return text;
-    throw new Error('invalid play resp');
-  })());
-  // 总截止 12s: 铸造全灭时别让详情/播放陪着慢通道一起等到天荒地老
-  const capped = Promise.race([
-    Promise.any(jobs),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('post race deadline')), 12000)),
-  ]);
-  try { return await capped; } catch (e) { return ''; }
+  try { return await raceValid(wave1, validPlayResp); } catch (e) { /* 进第二波 */ }
+  try { return await raceValid([() => postViaAllorigins(url, bodyStr, headers, 10000)], validPlayResp); }
+  catch (e) { return ''; }
 }
+
 
 // ---------- 页面缓存 (详情供 play 复用, 省一次整链) ----------
 const pageCache = new Map();
@@ -2194,7 +2319,7 @@ function cacheSet(url, s) {
 async function getDetailHtml(durl) {
   const hit = cacheGet(durl, 300000);
   if (hit) return hit;
-  const html = await httpGet(durl, { timeout: 18000 });
+  const html = await httpGet(durl, { timeout: 18000, kind: 'detail' });
   if (html) cacheSet(durl, html);
   return html;
 }
@@ -2383,8 +2508,14 @@ function hostRank(name) {
 }
 
 // embed 页 -> 配置里的源数组 (含宿主标注)
+// 单条 embed 硬顶 15s: detail 要并行解最多 8 条, 不能让某一条的
+// 慢通道把整个详情拖过 App 耐心 (第五轮 harness 实测个别 embed
+// 宿主会让全波次跑满, 详情总耗时冲到 26s)。
 async function resolveEmbed(embedUrl, referer) {
-  const html = await httpGet(embedUrl, { referer, timeout: 15000 });
+  const html = await Promise.race([
+    httpGet(embedUrl, { referer, timeout: 15000, kind: 'embed' }),
+    new Promise((res) => setTimeout(() => res(''), 15000)),
+  ]);
   if (!html) return null;
   const cfg = (html.match(/data-config="([^"]+)"/) || [])[1];
   if (!cfg) return null;
