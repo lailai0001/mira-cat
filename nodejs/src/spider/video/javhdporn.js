@@ -935,25 +935,102 @@ function hostRank(name) {
   return 5;
 }
 // 线路出口分组: 直连解出 (令牌绑设备 IP) > hugstream 前置
-// (master.txt, 不绑 IP 只认 Referer) > 借线绑定型 (设备必 403)
+// (master.txt, 不绑 IP 只认 Referer) > 借线绑定型 (设备必 403)。
+// 变体线的文件是变体清单本身, 分组按其父清单 (parentFile) 判。
 function lineGroup(ln) {
   if (ln.direct) return 0;
-  if (/master\.txt(\?|$)/i.test(ln.file || '')) return 1;
+  if (/master\.txt(\?|$)/i.test(ln.parentFile || ln.file || '')) return 1;
   return 2;
 }
 
-function pickSource(sources) {
-  if (!sources || !sources.length) return null;
-  let best = sources[0], bestScore = -1;
-  for (const s of sources) {
-    const label = t(s.label);
-    let score = 0;
-    const res = label.match(/(\d{3,4})\s*p/i);
-    if (res) score = parseInt(res[1], 10);
-    if (/hls|m3u8/i.test(s.type || '') || /\.m3u8(\?|$)/i.test(s.file || '')) score += 1;
-    if (score > bestScore) { bestScore = score; best = s; }
+// ---------------- 清晰度展开 (2026-10-22 高清修复) ----------------
+// 普查坐实 (两站各 4 部样本, castbank/REPORT_hires.md): 每个 embed
+// 的 data-config 只给 1 个 source, "低清"不在选源层 —— (1) 旧排序
+// 同组内 MaxStream (主清单实测单档 720p) 压在 CloudCDN (1080p
+// MP4) 前, 默认首线即 720p; (2) hugstream urlset 主清单含
+// 480/720/1080 三档却被整张直出, 播放器从首档 480p 起播。故:
+// HLS 主清单在 detail 时经直连栈取回展开变体, 多档逐档出线 (线
+// 路名标清晰度, 组内按清晰度降序), 单档主清单照旧直出、只借其
+// 标称清晰度参与排序/命名; MP4 按 label 标清晰度。
+function labelRes(label) {
+  const m = t(label).match(/(\d{3,4})\s*p/i);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+// 主清单正文 -> 变体表 [{file, q, bw}] (q 降序, 同 q 码率降序);
+// 变体 URI 相对主清单地址解析。无变体回 []。
+function parseVariants(body, base) {
+  const out = [];
+  const lines = String(body || '').split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/#EXT-X-STREAM-INF:([^\r\n]*)/);
+    if (!m) continue;
+    const bw = parseInt((m[1].match(/BANDWIDTH=(\d+)/) || [])[1] || '0', 10);
+    const rm = m[1].match(/RESOLUTION=(\d+)x(\d+)/);
+    let q = rm ? parseInt(rm[2], 10) : 0;
+    if (!q && bw) q = bw >= 2500000 ? 1080 : (bw >= 1100000 ? 720 : 480);
+    let uri = '';
+    for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+      const s = lines[j].trim();
+      if (s && !s.startsWith('#')) { uri = s; break; }
+    }
+    if (!uri) continue;
+    try { uri = new URL(uri, base).toString(); } catch (e) { continue; }
+    out.push({ file: uri, q, bw });
   }
-  return best;
+  out.sort((a, b) => (b.q - a.q) || (b.bw - a.bw));
+  return out;
+}
+
+// 取清单并判形态: {master:true, variants} / {master:false} (本体
+// 即媒体清单) / null (取不到/不是清单)。只走 reqRaw 直连栈 ——
+// 与 embed 同为设备出口, 清单令牌自洽; 借线出口取回的变体令牌
+// 与播放器 IP 不符, 不用代理通道。
+async function fetchMasterVariants(file, referer) {
+  try {
+    const r = await reqRaw(file, { 'User-Agent': UA, Referer: referer, Accept: '*/*' }, 8000);
+    if (!r || !r.body || !r.body.includes('#EXTM3U')) return null;
+    const variants = parseVariants(r.body, file);
+    if (variants.length) return { master: true, variants };
+    if (r.body.includes('#EXTINF')) return { master: false, variants: [] };
+    return null;
+  } catch (e) { return null; }
+}
+
+// 一个 embed 的全部 sources -> 线路表 [{file, type, q, v, parent}]:
+// MP4 单条 (q 取 label); HLS 多档主清单逐档一条 (q 降序); 单档
+// 主清单/媒体清单/清单取不到时按原文件一条 (q 借变体或 label,
+// 借不到为 0)。v = 该 embed 内的序号 (detail/play 对位用)。
+async function expandSources(sources, embedUrl) {
+  const out = [];
+  for (const s of (sources || [])) {
+    if (!s || !s.file) continue;
+    const isHls = /hls|m3u8/i.test(s.type || '') || /\.m3u8(\?|$)/i.test(s.file) || /\.txt(\?|$)/i.test(s.file);
+    if (!isHls) { out.push({ file: s.file, type: t(s.type), q: labelRes(s.label), parent: s.file }); continue; }
+    const mv = await fetchMasterVariants(s.file, embedUrl);
+    if (mv && mv.master && mv.variants.length > 1) {
+      for (const v of mv.variants) out.push({ file: v.file, type: 'hls', q: v.q, parent: s.file });
+    } else if (mv && mv.master && mv.variants.length === 1) {
+      out.push({ file: s.file, type: t(s.type), q: mv.variants[0].q || labelRes(s.label), parent: s.file });
+    } else {
+      out.push({ file: s.file, type: t(s.type), q: labelRes(s.label), parent: s.file });
+    }
+  }
+  out.forEach((e, i) => { e.v = i; });
+  return out;
+}
+
+// 线路显示宿主: 文件宿主无家族命中 (urlset 轮换 CDN 域名) 时回
+// 落 embed 家族名 (如 HugStream) —— 轮换域名不是用户能认的宿主。
+function displayHost(file, embedUrl) {
+  const h = prettyHost(file);
+  try {
+    if (new URL(file).hostname.replace(/^www\./, '') === h) {
+      const eh = prettyHost(embedUrl);
+      if (eh && eh !== h) return eh;
+    }
+  } catch (e) { /* 保持原名 */ }
+  return h;
 }
 
 const STAGE_TEXT = {
@@ -977,12 +1054,15 @@ async function resolveLines(durl) {
   await Promise.all(paths.slice(0, 8).map(async (p, idx) => {
     const embedUrl = 'https:' + p.path;
     const r = await resolveEmbed(embedUrl, durl);
-    const src = r && pickSource(r.sources);
-    if (src && src.file) {
-      lines.push({ idx, lo: p.lo, embedUrl, file: src.file, type: t(src.type), host: prettyHost(src.file), direct: !!r.direct });
+    if (!r) return;
+    const expanded = await expandSources(r.sources, embedUrl);
+    for (const e of expanded) {
+      lines.push({ idx, v: e.v, lo: p.lo, embedUrl, file: e.file, parentFile: e.parent, type: e.type, host: displayHost(e.file, embedUrl), q: e.q, direct: !!r.direct });
     }
   }));
-  lines.sort((a, b) => (lineGroup(a) - lineGroup(b)) || (hostRank(a.host) - hostRank(b.host)) || (a.idx - b.idx));
+  // 排序骨架不变 (出口组优先), 组内先比清晰度 (高清在前), 再比
+  // 宿主可靠性与原序 —— 修 (1): 1080p 线不再被 720p 线压在后面。
+  lines.sort((a, b) => (lineGroup(a) - lineGroup(b)) || ((b.q || 0) - (a.q || 0)) || (hostRank(a.host) - hostRank(b.host)) || (a.idx - b.idx) || ((a.v || 0) - (b.v || 0)));
   if (!lines.length) return { html, res, lines: [], stage: 'embed', via, postDiag, pathsN: paths.length, bank };
   return { html, res, lines, stage: 'ok', via, postDiag, bank };
 }
@@ -1077,12 +1157,13 @@ async function detail(reqIn) {
   const fromNames = [];
   const playUrls = [];
   lines.forEach((ln) => {
-    // 线路名: 文件宿主 + 区域线 lo; 直连栈解出的加「·直」——
-    // 令牌绑设备 IP, 真机首选。
+    // 线路名: 文件宿主 + 区域线 lo + 清晰度标 (如 ·1080p);
+    // 直连栈解出的加「·直」—— 令牌绑设备 IP, 真机首选。
     let nm = ln.lo && ln.lo !== 'main' ? `${ln.host}·${ln.lo}` : ln.host;
+    if (ln.q) nm += '·' + ln.q + 'p';
     if (ln.direct) nm += '·直';
     fromNames.push(nm);
-    playUrls.push('播放$' + durl + '@@' + ln.idx);
+    playUrls.push('播放$' + durl + '@@' + ln.idx + '.' + (ln.v || 0));
   });
   if (!lines.length) {
     // 铸造链没拿到线路: 给一条嗅探线, 分集名带失败阶段与铸造
@@ -1101,7 +1182,7 @@ async function detail(reqIn) {
   } else {
     if (via) contentParts.push('铸造通道: ' + via);
     const nDirect = lines.filter((l) => l.direct).length;
-    contentParts.push(`线路出口: 直连${nDirect}/${lines.length} (直连线令牌绑本机IP, 优先点带「·直」的线)`);
+    contentParts.push(`线路出口: 直连${nDirect}/${lines.length} (直连线令牌绑本机IP, 优先点带「·直」的线; 线路名带清晰度, 同组高清在前)`);
     // 直链仍播不了时的最后兜底: WebView 嗅探详情页
     fromNames.push('网页嗅探·兜底');
     playUrls.push('播放$' + durl + '@@sniff');
@@ -1134,16 +1215,17 @@ async function play(reqIn) {
   // 第二次常能成), 实在不行才落嗅探。
   const sniffOnly = id.endsWith('@@sniff');
   if (sniffOnly) id = id.slice(0, -'@@sniff'.length);
-  const mm = id.match(/^(https?:\/\/\S+?)@@(\d+)$/);
+  const mm = id.match(/^(https?:\/\/\S+?)@@(\d+)(?:\.(\d+))?$/);
   const durl = mm ? mm[1] : absUrl(id);
   const wantIdx = mm ? parseInt(mm[2], 10) : -1;
+  const wantV = mm && mm[3] !== undefined ? parseInt(mm[3], 10) : 0;
   // 现场重铸整链 (令牌时效 + IP 绑定的双重要求), 线路已按出口
   // 一致性排序: 用户点的线若与最优线同组则尊重其选择, 否则回
   // 最优线 —— 借线解出的绑定型令牌在设备上必 403, 点了也是白点。
   let lines = [];
   try { ({ lines } = await resolveLines(durl)); } catch (e) { lines = []; }
   if (!lines.length) return sniffResult(durl);
-  const tapped = lines.find((l) => l.idx === wantIdx);
+  const tapped = lines.find((l) => l.idx === wantIdx && (l.v || 0) === wantV) || lines.find((l) => l.idx === wantIdx);
   const best = lines[0];
   const pick = (tapped && lineGroup(tapped) <= lineGroup(best)) ? tapped : best;
   return { parse: 0, url: pick.file, header: { 'User-Agent': UA, 'Referer': pick.embedUrl } };
