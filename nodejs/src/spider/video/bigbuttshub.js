@@ -41,6 +41,19 @@ import req from '../../util/req.js';
 //    封面用 _embedded 特征图的 wpst_thumb_large (640x360); REST 无
 //    时长字段, 卡片 vod_remarks 留空 (详情仍有)。REST 不可用时回退
 //    HTML 第一页解析 (仅第 1 页, 降级保命)。
+//
+// ===== 2026-10-22 第四轮 (针对真机反馈"个别分类如 Savannah Bond 全灭") =====
+// 全分类普查 (演员 Savannah Bond 37 帖逐帖登记): 这类老演员分类的帖
+// 几乎全是单源老帖, 与最新帖的多源构成完全不同——filemoon.sx 占 17/37
+// (46%)、vidhide 10 条 embed 里 6 条文件已被宿主删除、3 条只有
+// hls2/hls3 (经 Worker 必 502)、仅 1 条强线; Byse 3 帖、porntoday 3 帖。
+// 主病: filemoon.sx 此前不认识, 被丢进嗅探桶只出嗅探线; 实锤其
+// embed 页标题 "Byse Frontend"、/e/<code> 形态与其自家播放器调的
+// /api/videos/<code> 与 bigbuttshub2.top 同一套系统 (REX 侧已同判),
+// 现归入 Byse 线由设备侧现场铸造 (与既有 Byse 帖同命, 机房出口被
+// API 拒、只能真机定)。附带: vetVidhide 对"有 packer 却无流 key"的
+// 空壳 embed 判 dead (Worker 实测 links=[] 的就是这种); 弱 vidhide
+// 帖的备用线改嗅探 embed 页 (设备 WebView 原播放器走 hls2/hls3)。
 // 7) 分类全量重收: wp-json 三个 taxonomy (category/post_tag/actors)
 //    count>0 共 915 个逐个实测有帖 (含加回 Adult Time 2 帖 / All Anal
 //    3 帖; shedoesanal count=0 已剔除)。n 字段为站方 term id。
@@ -1283,7 +1296,7 @@ async function resolveByse(embedUrl) {
   } catch (e) { return ''; }
   if (!code) return '';
   const origins = [];
-  for (const o of [origin, 'https://bigbuttshub2.top', 'https://bysetayico.com']) {
+  for (const o of [origin, 'https://bigbuttshub2.top', 'https://bysetayico.com', 'https://filemoon.sx']) {
     if (o && !origins.includes(o)) origins.push(o);
   }
   for (const o of origins) {
@@ -1322,13 +1335,26 @@ function unpackDeanEdwards(html) {
 
 // 验一条 vidhide embed 的存活状态: strong=有 hls4 / weak=有 links 无 hls4 /
 // dead=宿主已删 (426B 删除页) / unknown=取证失败 (按 strong 对待)
-async function vetVidhide(embedUrl) {
-  const { text } = await getRaw(embedUrl, { Referer: REFERER }, 9000);
+function classifyVidhide(text) {
   if (!text) return 'unknown';
   if (/no longer available|has been deleted/i.test(text)) return 'dead';
   const src = unpackDeanEdwards(text) || text;
   if (/"hls4"\s*:/.test(src)) return 'strong';
   if (/"hls\d+"\s*:|"file"\s*:/.test(src)) return 'weak';
+  // 有 packer 却解不出任何流 key: 宿主回的是空壳 (文件数据已没了,
+  // Worker 实测 links=[] 同此形态), 与已删同等对待, 不再生成必死线
+  if (/eval\(function\(p,a,c,k,e,d\)/.test(text)) return 'dead';
+  return 'unknown';
+}
+
+async function vetVidhide(embedUrl) {
+  // 宿主应答不稳 (同一 embed 不同时刻回完整页/空壳/删除页), 首轮
+  // 判不准 (unknown) 时再取一轮, 取首个有结论的结果
+  for (let i = 0; i < 2; i++) {
+    const { text } = await getRaw(embedUrl, { Referer: REFERER }, 9000);
+    const st = classifyVidhide(text);
+    if (st !== 'unknown') return st;
+  }
   return 'unknown';
 }
 
@@ -1587,7 +1613,7 @@ function extractEmbeds(html) {
     seen.add(url);
     if (host === 'bigbuttshub.top' || host === 'bigbuttshub3.top') out.vidhide.push(url);
     else if (host === 'streamcash.to') out.streamcash.push(url);
-    else if (host === 'bigbuttshub2.top' || host === 'bysetayico.com') out.byse.push(url);
+    else if (host === 'bigbuttshub2.top' || host === 'bysetayico.com' || host === 'filemoon.sx') out.byse.push(url);
     else out.sniff.push(url);
   }
   return out;
@@ -1682,6 +1708,12 @@ async function detail(reqIn) {
   // 备用嗅探: 优先未分类宿主; Byse 帖不再重复嗅探同一 SPA
   // (b: 失败时自身就会回退嗅探该页)
   if (emb.sniff.length) cands.push({ score: 20, name: '备用', entry: '正片$x:' + emb.sniff[0] });
+  else if (vid && vidState === 'weak') {
+    // 弱 vidhide (只有 hls2/hls3) 经 Worker 必 502 (分片对机房出口 403);
+    // 备用改嗅探 embed 页本身: 设备 WebView 里的原播放器从设备出口
+    // 取 hls2/hls3, 与机房出口不同命, 这是猫源独有的活路
+    cands.push({ score: 30, name: '备用', entry: '正片$x:' + vid });
+  }
   else cands.push({ score: 10, name: '备用', entry: '正片$x:' + durl });
   cands.sort((a, b) => b.score - a.score);
 
