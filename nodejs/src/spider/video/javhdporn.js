@@ -9,13 +9,25 @@
 // 跟随重定向, 不写死版本号)。每页 24 条; 分页 /page/{n}/;
 // 搜索 /search/{kw}/ (实测可用; 站内无 results.php, /?s= 与之等价)。
 //
-// 播放链 (2026-10-21 侦察坐实, 沿用至今未变):
-// 详情页 .play-button 点击 -> cast.js 在客户端把 data-mpu 密文换成
-// sources 令牌 -> POST /api/play/ -> embed 页解密得 JW sources。
-// 蜘蛛运行时无 DOM、禁用 vm, 铸造链无法在蜘蛛内复现。故 play 设计:
-//   1) 自建中转 RELAY (留空, 部署后回填): 中转铸造 + 解直链;
-//   2) 中转未部署/失败 -> parse:1 嗅探详情页 (真机 WebView 是真实
-//      浏览器, 站方整条链可在页内原生跑)。详情里该线标注家族「嗅探」。
+// 播放链 (2026-10-22 第九轮反混淆破解, 机制与 bestjavporn 同构):
+// 详情页 #video-player[data-mpu][data-ver] + #video-player-area
+// [data-video-id] -> dex 铸造 sources 令牌 -> POST /api/play/
+// (sources=token&ver=<data-ver>) -> 响应 data/reserve 再经 dex 解出
+// //video{,1}.javhdporn.net / hugstream.xyz 的 embed 路径 -> GET
+// embed 页取 data-config 解密得 JW sources [{file,type,label}]。
+// dex(seed, data) = b64decode( RC4( reverse(b64(seed + salt)),
+// b64decode(data) ) ); 盐按用途分 (cast.js 常量数组实测):
+//   令牌: data-ver='2' -> 'SyntaxError'; '1' -> 'QxLUF1bgIAdeQX';
+//         其他 -> '_0x58fe15' (主盐不对时按序换盐重试 POST);
+//   响应 (data/reserve): '_0x58fe15'; reserve 解出为 JSON 数组
+//         [{data, lo}], 每条再 dex 得一条 embed 路径。
+// embed data-config 盐 '_0x59a0e4' (与 BJP 相同):
+//   key = reverse( b64( b64(pathname+search).substr(4,20) + salt ) )。
+// IP 绑定 (实测, 与 BJP 第八轮同结论): MaxStream 等 lk 家族文件
+// 令牌绑 embed 查看者出口 —— 直连看页解出的链同出口取流 200,
+// 经 Worker/jina 看页解出的一律 403。故 embed 取页直连三栈优先,
+// 线路按出口分组排序 (直连 > hugstream 前置 > 借线绑定型), 全链
+// 失败才落 parse:1 嗅探详情页兜底。
 //
 // 2026-10-22 第七轮 (删除重写, 与 bestjavporn 同步):
 // 前四轮 (并行竞速/通道扩容/自有 Worker) 本地 harness 全过、真机
@@ -48,8 +60,6 @@ const NAME = 'JAVHDPorn';
 const HOST = 'https://www.javhdporn.net';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const REFERER = HOST + '/';
-// 播放中转 (javhdporn-relay, 用户部署后回填; 留空则 play 直接落嗅探)
-const RELAY = '';
 // 自有取页跳板 pornfhd-fetch (用户自有 Cloudflare Worker, 第一通道)
 const OWN_FETCH = 'https://pornfhd-fetch.li768435813.workers.dev';
 const DIAG_ID = '__diag__';
@@ -538,6 +548,415 @@ function searchUrl(kw, page) {
   return page > 1 ? `${base}page/${page}/` : base;
 }
 
+// ---------------- 纯 JS 密码件 (cast.js 反混淆复刻, 2026-10-22 实测) ----------------
+const B64CH = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const B64REV = (() => {
+  const o = {};
+  for (let i = 0; i < 64; i++) o[B64CH[i]] = i;
+  o['-'] = 62; o['_'] = 63;
+  return o;
+})();
+
+function b64ToBytes(s) {
+  const str = String(s || '').replace(/[^A-Za-z0-9+/=_-]/g, '');
+  const out = [];
+  let acc = 0, bits = 0;
+  for (const ch of str) {
+    if (ch === '=') break;
+    const v = B64REV[ch];
+    if (v == null) continue;
+    acc = (acc << 6) | v; bits += 6;
+    if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 0xff); }
+  }
+  return Uint8Array.from(out);
+}
+
+function bytesToB64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i], b = i + 1 < bytes.length ? bytes[i + 1] : 0, c = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    s += B64CH[a >> 2] + B64CH[((a & 3) << 4) | (b >> 4)] +
+      (i + 1 < bytes.length ? B64CH[((b & 15) << 2) | (c >> 6)] : '=') +
+      (i + 2 < bytes.length ? B64CH[c & 63] : '=');
+  }
+  return s;
+}
+
+function strToB64(str) { // 入参均为 ASCII
+  return bytesToB64(new TextEncoder().encode(String(str || '')));
+}
+
+function bytesToLatin1(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 8192) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  }
+  return s;
+}
+
+function bytesToUtf8(bytes) {
+  try { return new TextDecoder('utf-8').decode(bytes); } catch (e) { return bytesToLatin1(bytes); }
+}
+
+function rc4(keyStr, data) {
+  const S = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) S[i] = i;
+  const kb = [];
+  for (let i = 0; i < keyStr.length; i++) kb.push(keyStr.charCodeAt(i) & 0xff);
+  let j = 0;
+  for (let i = 0; i < 256; i++) {
+    j = (j + S[i] + kb[i % kb.length]) & 0xff;
+    const tmp = S[i]; S[i] = S[j]; S[j] = tmp;
+  }
+  let a = 0; j = 0;
+  const out = new Uint8Array(data.length);
+  for (let n = 0; n < data.length; n++) {
+    a = (a + 1) & 0xff;
+    j = (j + S[a]) & 0xff;
+    const tmp = S[a]; S[a] = S[j]; S[j] = tmp;
+    out[n] = data[n] ^ S[(S[a] + S[j]) & 0xff];
+  }
+  return out;
+}
+
+// dex(salt, seed, data) = b64decode( RC4( reverse(b64(seed + salt)), b64decode(data) ) )
+function dexSalt(salt, seed, data) {
+  const key = strToB64(String(seed) + salt).split('').reverse().join('');
+  const mid = bytesToLatin1(rc4(key, b64ToBytes(data)));
+  return bytesToLatin1(b64ToBytes(mid));
+}
+function dexSaltUtf8(salt, seed, data) {
+  const key = strToB64(String(seed) + salt).split('').reverse().join('');
+  const mid = bytesToLatin1(rc4(key, b64ToBytes(data)));
+  return bytesToUtf8(b64ToBytes(mid));
+}
+
+// 盐表 (cast.js _0xc21c 常量数组实测): 响应恒用主盐; 令牌按
+// data-ver 分支选盐, fetchEmbedPaths 里按序兜底重试。
+const SALT_MAIN = '_0x58fe15';
+function tokenSalts(ver) {
+  if (ver === '1') return ['QxLUF1bgIAdeQX', SALT_MAIN, 'SyntaxError'];
+  if (ver === '2') return ['SyntaxError', SALT_MAIN, 'QxLUF1bgIAdeQX'];
+  return [SALT_MAIN, 'SyntaxError', 'QxLUF1bgIAdeQX'];
+}
+function dexResp(seed, data) { return dexSalt(SALT_MAIN, seed, data); }
+function dexRespUtf8(seed, data) { return dexSaltUtf8(SALT_MAIN, seed, data); }
+
+// embed 页 data-config 解密: key = reverse( b64( b64(pathname+search).substr(4,20) + '_0x59a0e4' ) )
+function decryptConfig(cfgB64, pathname, search) {
+  const arg = strToB64(String(pathname) + String(search)).substring(4, 20);
+  const key = strToB64(arg + '_0x59a0e4').split('').reverse().join('');
+  const pt = bytesToLatin1(rc4(key, b64ToBytes(cfgB64)));
+  const json = JSON.parse(bytesToUtf8(b64ToBytes(pt)));
+  const sources = JSON.parse(bytesToUtf8(b64ToBytes(json.src || '')));
+  return { json, sources };
+}
+
+// ---------------- POST /api/play/ (铸造, 带通道归因) ----------------
+function validPlayResp(text) {
+  // 必须 status === true 才算铸造成功 (公共中转转发 POST 可能丢
+  // body, 站方回 {"status":false,...} 假成功, BJP 旧轮已坐实)。
+  if (!text) return false;
+  try {
+    const j = JSON.parse(text);
+    return !!j && typeof j === 'object' && j.status === true;
+  } catch (e) { return false; }
+}
+
+// POST 通道逐个结论的短串 (进分集名, 真机截图可直接读)
+function postDiagOf(outcomes) {
+  if (!outcomes || !outcomes.length) return '';
+  const st = (o) => (o.status ? String(o.status) : (o.err === 'timeout' ? '超时' : 'ERR'));
+  const parts = [];
+  const owns = outcomes.filter((o) => /^own\d*$/.test(o.name));
+  if (owns.length) parts.push('own' + owns.map(st).join('>'));
+  const dirs = outcomes.filter((o) => o.name === 'fetch' || o.name === 'req');
+  if (dirs.length) parts.push('直连' + [...new Set(dirs.map(st))].join('/'));
+  for (const o of outcomes) {
+    if (/^own\d*$/.test(o.name) || o.name === 'fetch' || o.name === 'req') continue;
+    parts.push(o.name + st(o));
+  }
+  return parts.join(' ');
+}
+
+// GET 通道逐个结论的短串 (取页全灭时进分集名/正文)
+function pageDiagOf(outcomes) {
+  if (!outcomes || !outcomes.length) return '';
+  const st = (o) => (o.status ? String(o.status) : (o.err === 'timeout' ? '超时' : 'ERR'));
+  return outcomes.map((o) => o.name + st(o)).join(' ');
+}
+
+const WD_HEADERS = { 'User-Agent': UA, 'X-Requested-With': 'XMLHttpRequest', Origin: HOST };
+
+async function httpPostForm(url, bodyStr, opts = {}) {
+  const referer = opts.referer || REFERER;
+  const formHeaders = {
+    'User-Agent': UA,
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Referer': referer,
+    'Origin': HOST,
+  };
+  const t0 = Date.now();
+  const budget = 30000; // POST 铸造全局总截止 (各波共享)
+  const outcomes = [];
+  let winner = null;
+  let resolveWin;
+  const winP = new Promise((r) => { resolveWin = r; });
+  const judge = (name, res) => {
+    const text = (res && res.body) || '';
+    const oc = { name, status: (res && res.status) || 0, bytes: text.length, ok: validPlayResp(text), sawJson: false, err: (res && res.err) || '' };
+    if (text) {
+      try { const j = JSON.parse(text); if (j && typeof j === 'object' && 'status' in j) oc.sawJson = true; } catch (e) { /* 非 JSON */ }
+    }
+    outcomes.push(oc);
+    if (oc.ok && !winner) { winner = { text, via: name }; resolveWin(winner); }
+    return oc;
+  };
+  const runWave = async (wave) => {
+    const jobs = wave.map(([name, fn]) => (async () => {
+      let res;
+      try { res = await fn(); } catch (e) { res = { status: 0, body: '' }; }
+      return judge(name, res);
+    })());
+    const all = Promise.allSettled(jobs);
+    const remain = Math.max(3000, budget - (Date.now() - t0));
+    const deadline = new Promise((r) => setTimeout(r, remain));
+    await Promise.race([winP, all, deadline]);
+  };
+  const ownPostTo = async (target) => {
+    const w = OWN_FETCH + '/post?u=' + encodeURIComponent(target) + '&ref=' + encodeURIComponent(referer);
+    return fetchRaw2(w, { 'User-Agent': UA, 'Content-Type': 'application/x-www-form-urlencoded' }, 12000, 'POST', bodyStr);
+  };
+  const ownPost = async () => ownPostTo(url);
+  // 'fetch' 铸造通道: 有全局 fetch 时用它; 设备无 fetch 时退化为
+  // req POST (与 ownPost/reqPost 同栈多一发), 通道不许死。
+  const fetchPost = async () => (HAS_FETCH
+    ? fetchViaGlobal(url, formHeaders, 12000, 'POST', bodyStr)
+    : fetchRaw2(url, formHeaders, 12000, 'POST', bodyStr));
+  const reqPost = async () => {
+    try {
+      const r = await req.post(url, bodyStr, { headers: formHeaders, timeout: 12000 });
+      const status = (r && typeof r.status === 'number') ? r.status : 200;
+      const d = typeof r === 'string' ? r : (r && r.data !== undefined ? r.data : r);
+      return { status, body: typeof d === 'string' ? d : JSON.stringify(d || '') };
+    } catch (e) {
+      const st = e && e.response && typeof e.response.status === 'number' ? e.response.status : 0;
+      return { status: st, body: '' };
+    }
+  };
+  const demoPost = async () => fetchRaw2('https://test.cors.workers.dev/?' + url, {
+    ...WD_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded',
+  }, 12000, 'POST', bodyStr);
+  const aoPost = async () => fetchRaw2('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
+    'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA,
+  }, 10000, 'POST', bodyStr);
+  await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost]]);
+  if (!winner && !outcomes.some((o) => o.sawJson)) {
+    // own 重试: own 的上游 403 是站方 CF 对 Workers 出口的时段/
+    // colo 间歇拒绝 (BJP 真机 16:07 403、16:10 同请求 200), 隔
+    // 1.2s / 2.5s 再各打一发。前提是没有任何通道拿到站方 JSON
+    // —— 拿到过 JSON=false 说明令牌本身被拒, 由上层换盐处理。
+    const tryOwn = async (name, target) => {
+      let res;
+      try { res = await ownPostTo(target); } catch (e) { res = { status: 0, body: '' }; }
+      judge(name, res);
+    };
+    await new Promise((r) => setTimeout(r, 1200));
+    await tryOwn('own2', url);
+    if (!winner) {
+      await new Promise((r) => setTimeout(r, 2500));
+      await tryOwn('own3', url);
+    }
+  }
+  if (!winner) await runWave([['aoRaw', aoPost]]);
+  if (winner) return { text: winner.text, via: winner.via, outcomes, diag: postDiagOf(outcomes) };
+  const sawJson = outcomes.some((o) => o.sawJson);
+  return { text: '', via: '', outcomes, stage: sawJson ? 'post-bad' : 'post-none', diag: postDiagOf(outcomes) };
+}
+
+// ---------------- 播放解析 ----------------
+function extractPlaySeed(html) {
+  const postId = (html.match(/id="video-player-area"[^>]*data-video-id="(\d+)"/) || html.match(/data-video-id="(\d+)"/) || [])[1] || '';
+  const mpu = (html.match(/data-mpu="([^"]+)"/) || [])[1] || '';
+  const ver = (html.match(/id="video-player"[^>]*data-ver="([^"]+)"/) || html.match(/data-ver="([^"]+)"/) || [])[1] || '2';
+  return { postId, mpu, ver };
+}
+
+// 调 /api/play/ 并解出全部线路的 embed 路径: {paths, stage, via, postDiag}
+// 令牌盐按 data-ver 选; 站方回 status:false (post-bad) 时换下一盐重试。
+async function fetchEmbedPaths(postId, mpu, ver, referer) {
+  let lastDiag = '';
+  let lastStage = 'post-none';
+  for (const salt of tokenSalts(ver)) {
+    const token = dexSalt(salt, postId, mpu);
+    const body = 'sources=' + encodeURIComponent(token) + '&ver=' + encodeURIComponent(ver || '2');
+    const r = await httpPostForm(HOST + '/api/play/', body, { referer, timeout: 18000 });
+    lastDiag = r.diag || '';
+    if (!r.text) { lastStage = r.stage || 'post-none'; continue; }
+    let resp;
+    try { resp = JSON.parse(r.text); } catch (e) { return { paths: [], stage: 'post-bad', via: r.via, postDiag: lastDiag }; }
+    if (!resp || resp.status !== true || !resp.data) { lastStage = 'post-bad'; continue; }
+    const paths = [];
+    try { paths.push({ lo: t(resp.lo) || 'main', path: dexResp(postId, resp.data) }); } catch (e) { /* 主线解码失败 */ }
+    if (resp.reserve) {
+      try {
+        const arr = JSON.parse(dexRespUtf8(postId, resp.reserve));
+        for (const x of arr) {
+          if (x && x.data) {
+            try { paths.push({ lo: t(x.lo) || 'bak', path: dexResp(postId, x.data) }); } catch (e) { /* 跳过坏备线 */ }
+          }
+        }
+      } catch (e) { /* reserve 整体解码失败: 只用主线 */ }
+    }
+    return { paths: paths.filter(p => p.path && p.path.startsWith('//')), stage: 'ok', via: r.via, postDiag: lastDiag };
+  }
+  return { paths: [], stage: lastStage, via: '', postDiag: lastDiag };
+}
+
+// 直连通道名 (设备自身出口; 与播放器同 IP)。其余通道 (own/demo/
+// jina/ao*) 均为代理出口, 解出的绑定型令牌与播放器 IP 不符。
+const DIRECT_CHANNELS = new Set(['fetch', 'req', 'https']);
+
+// embed 取页: 直连三栈优先 (令牌绑查看者 IP), 代理只兜底。
+// 回 {html, win:{name,status}} —— 有效 = 正文含 data-config。
+async function fetchEmbedPage(url, referer) {
+  const t0 = Date.now();
+  const budget = 20000;
+  const outcomes = [];
+  let winner = null;
+  let resolveWin;
+  const winP = new Promise((r) => { resolveWin = r; });
+  const judge = (name, res, ms) => {
+    const body = (res && res.body) || '';
+    const oc = { name, status: (res && res.status) || 0, bytes: body.length, ms, ok: body.includes('data-config="'), err: (res && res.err) || '' };
+    outcomes.push(oc);
+    if (oc.ok && !winner) { winner = { html: body, oc }; resolveWin(winner); }
+    return oc;
+  };
+  const runWave = async (wave) => {
+    const jobs = wave.map(([name, fn, to]) => (async () => {
+      const s = Date.now();
+      let res;
+      try { res = await fn(url, to); } catch (e) { res = { status: 0, body: '', err: String((e && e.message) || e) }; }
+      return judge(name, res, Date.now() - s);
+    })());
+    const all = Promise.allSettled(jobs);
+    const remain = Math.max(3000, budget - (Date.now() - t0));
+    const deadline = new Promise((r) => setTimeout(r, remain));
+    await Promise.race([winP, all, deadline]);
+  };
+  const hdrs = { ...BROWSER_HEADERS, Referer: referer || REFERER };
+  const eFetch = async (u, to) => (HAS_FETCH ? fetchViaGlobal(u, hdrs, to) : reqRaw(u, hdrs, to));
+  const eReq = async (u, to) => reqRaw(u, hdrs, to);
+  const eDemo = async (u, to) => fetchRaw2('https://test.cors.workers.dev/?' + u, { ...WD_HEADERS }, to);
+  await runWave([['fetch', eFetch, 9000], ['req', eReq, 9000], ['https', chHttps, 9000]]);
+  if (!winner) await runWave([['own', chOwn, 10000], ['demo', eDemo, 10000]]);
+  if (!winner) await runWave([['jina', chJina, 10000], ['aoGet', chAoGet, 10000], ['aoRaw', chAoRaw, 10000], ['codetabs', chCodetabs, 9000]]);
+  if (winner) return { html: winner.html, win: winner.oc, outcomes };
+  return { html: '', win: null, outcomes };
+}
+
+// embed 页 -> {sources, direct, viaName} (direct = 直连栈取回,
+// 文件令牌绑设备 IP, 与播放器自洽)
+async function resolveEmbed(embedUrl, referer) {
+  const r = await fetchEmbedPage(embedUrl, referer);
+  if (!r.html) return null;
+  const cfg = (r.html.match(/data-config="([^"]+)"/) || [])[1];
+  if (!cfg) return null;
+  let u;
+  try { u = new URL(embedUrl); } catch (e) { return null; }
+  try {
+    const { sources } = decryptConfig(cfg, u.pathname, u.search);
+    if (Array.isArray(sources) && sources.length) {
+      return { sources, direct: !!(r.win && DIRECT_CHANNELS.has(r.win.name)), viaName: r.win ? r.win.name : '' };
+    }
+  } catch (e) { /* 解密失败 */ }
+  return null;
+}
+
+const HOST_PRETTY = [
+  [/maxstream/i, 'MaxStream'],
+  [/streamhls/i, 'StreamHLS'],
+  [/hugstream/i, 'HugStream'],
+  [/cloudatacdn|clouddata/i, 'CloudCDN'],
+  [/streamtape|tapecontent/i, 'StreamTape'],
+  [/pianopic/i, 'PianoPic'],
+  [/turbovid|turbo/i, 'TurboVid'],
+  [/filemoon|filemoonu/i, 'FileMoon'],
+  [/vidhide|earnvid/i, 'VidHide'],
+  [/voe/i, 'VOE'],
+];
+function prettyHost(fileUrl) {
+  for (const [re, name] of HOST_PRETTY) if (re.test(fileUrl)) return name;
+  try { return new URL(fileUrl).hostname.replace(/^www\./, ''); } catch (e) { return '线路'; }
+}
+function hostRank(name) {
+  if (name === 'MaxStream') return 0;
+  if (name === 'CloudCDN') return 1;
+  if (name === 'StreamTape') return 2;
+  if (name === 'StreamHLS' || name === 'PianoPic') return 9;
+  return 5;
+}
+// 线路出口分组: 直连解出 (令牌绑设备 IP) > hugstream 前置
+// (master.txt, 不绑 IP 只认 Referer) > 借线绑定型 (设备必 403)
+function lineGroup(ln) {
+  if (ln.direct) return 0;
+  if (/master\.txt(\?|$)/i.test(ln.file || '')) return 1;
+  return 2;
+}
+
+function pickSource(sources) {
+  if (!sources || !sources.length) return null;
+  let best = sources[0], bestScore = -1;
+  for (const s of sources) {
+    const label = t(s.label);
+    let score = 0;
+    const res = label.match(/(\d{3,4})\s*p/i);
+    if (res) score = parseInt(res[1], 10);
+    if (/hls|m3u8/i.test(s.type || '') || /\.m3u8(\?|$)/i.test(s.file || '')) score += 1;
+    if (score > bestScore) { bestScore = score; best = s; }
+  }
+  return best;
+}
+
+const STAGE_TEXT = {
+  page: '详情未取到',
+  seed: '无播放种子',
+  'post-none': '铸造通道不通',
+  'post-bad': '铸造被站方拒',
+  embed: 'embed未解出',
+};
+
+// 全链解析: {html, res, lines, stage, via, postDiag, pageDiag, pathsN}
+async function resolveLines(durl) {
+  const res = await fetchPage(durl, 'detail');
+  const html = res.html;
+  if (!html) return { html: '', res, lines: [], stage: 'page', via: '', pageDiag: pageDiagOf(res.outcomes) };
+  const { postId, mpu, ver } = extractPlaySeed(html);
+  if (!postId || !mpu) return { html, res, lines: [], stage: 'seed', via: '' };
+  const { paths, stage, via, postDiag } = await fetchEmbedPaths(postId, mpu, ver, durl);
+  if (!paths.length) return { html, res, lines: [], stage, via, postDiag };
+  const lines = [];
+  await Promise.all(paths.slice(0, 8).map(async (p, idx) => {
+    const embedUrl = 'https:' + p.path;
+    const r = await resolveEmbed(embedUrl, durl);
+    const src = r && pickSource(r.sources);
+    if (src && src.file) {
+      lines.push({ idx, lo: p.lo, embedUrl, file: src.file, type: t(src.type), host: prettyHost(src.file), direct: !!r.direct });
+    }
+  }));
+  lines.sort((a, b) => (lineGroup(a) - lineGroup(b)) || (hostRank(a.host) - hostRank(b.host)) || (a.idx - b.idx));
+  if (!lines.length) return { html, res, lines: [], stage: 'embed', via, postDiag, pathsN: paths.length };
+  return { html, res, lines, stage: 'ok', via, postDiag };
+}
+
+function absUrl(u) {
+  if (/^https?:\/\//.test(u)) return u;
+  return HOST + (u.startsWith('/') ? u : '/' + u);
+}
+
 // ---------------- 处理函数 ----------------
 async function init(reqIn) {
   return {};
@@ -585,9 +1004,30 @@ async function detail(reqIn) {
       }],
     };
   }
-  const durl = /^https?:\/\//.test(id) ? id : HOST + (id.startsWith('/') ? id : '/' + id);
-  const html = await getPage(durl, 'detail');
-  if (!html) return { list: [] };
+  const durl = absUrl(id);
+  let rl;
+  try { rl = await resolveLines(durl); }
+  catch (e) { rl = { html: '', lines: [], stage: 'error', via: '', pageDiag: '', postDiag: '' }; }
+  const { html, lines, stage, via } = rl;
+  if (!html) {
+    // 取页全灭保底: 永不返回空 —— 名字从 URL slug 派生, 分集名带
+    // 取页通道逐个结论, 点播落嗅探 (重开详情即整链重试)。
+    const slug = (durl.match(/\/video\/([^/]+)\//) || [])[1] || '';
+    const nm = slug ? clean(slug.replace(/[-_]+/g, ' ')) : NAME;
+    const diag = rl.pageDiag || '无记录';
+    const epName = ('正片·取页全灭 ' + diag + '·仅嗅探').slice(0, 110);
+    return {
+      list: [{
+        vod_id: durl,
+        vod_name: nm,
+        vod_pic: '',
+        vod_remarks: '详情取不到·仅嗅探',
+        vod_content: '诊断: 详情页取数全灭\n通道: ' + diag + '\n已附网页嗅探兜底一集; 通道恢复后重开详情即可整链重试。',
+        vod_play_from: '网页嗅探·取页全灭',
+        vod_play_url: epName + '$' + durl + '@@sniff',
+      }],
+    };
+  }
   let name = og(html, 'title').replace(/\s*-\s*JAV HD Porn\s*$/i, '');
   if (!name) {
     const tm = html.match(/<title>([^<]+)<\/title>/);
@@ -597,41 +1037,80 @@ async function detail(reqIn) {
   const desc = og(html, 'description');
   const secM = html.match(/"articleSection":\[([^\]]*)\]/);
   const remarks = secM ? secM[1].replace(/"/g, '').split(',').map(s => s.trim()).filter(Boolean).join(' / ') : '';
+  const contentParts = [];
+  if (desc) contentParts.push(desc);
+  const fromNames = [];
+  const playUrls = [];
+  lines.forEach((ln) => {
+    // 线路名: 文件宿主 + 区域线 lo; 直连栈解出的加「·直」——
+    // 令牌绑设备 IP, 真机首选。
+    let nm = ln.lo && ln.lo !== 'main' ? `${ln.host}·${ln.lo}` : ln.host;
+    if (ln.direct) nm += '·直';
+    fromNames.push(nm);
+    playUrls.push('播放$' + durl + '@@' + ln.idx);
+  });
+  if (!lines.length) {
+    // 铸造链没拿到线路: 给一条嗅探线, 分集名带失败阶段与铸造
+    // 通道逐个结论 (MiraPlayer 显示分集名, 截图即可归因)。
+    fromNames.push('网页嗅探·' + (STAGE_TEXT[stage] || '铸造失败'));
+    let epName;
+    if (stage === 'post-none') epName = '正片·铸造全灭 ' + (rl.postDiag || '无记录') + '·仅嗅探';
+    else if (stage === 'post-bad') epName = '正片·铸造被站方拒 ' + (rl.postDiag || '无记录') + '·仅嗅探';
+    else if (stage === 'embed') epName = '正片·embed未解出' + (rl.pathsN ? ' 铸出' + rl.pathsN + '路' : '') + '·仅嗅探';
+    else if (stage === 'seed') epName = '正片·无播放种子·仅嗅探';
+    else if (stage === 'page') epName = '正片·详情未取到·仅嗅探';
+    else epName = '正片·' + (STAGE_TEXT[stage] || '铸造失败') + '·仅嗅探';
+    playUrls.push(epName.slice(0, 110) + '$' + durl + '@@sniff');
+    contentParts.push('铸造诊断: ' + (STAGE_TEXT[stage] || '铸造失败') + (rl.postDiag ? ' (' + rl.postDiag + ')' : ''));
+  } else {
+    if (via) contentParts.push('铸造通道: ' + via);
+    const nDirect = lines.filter((l) => l.direct).length;
+    contentParts.push(`线路出口: 直连${nDirect}/${lines.length} (直连线令牌绑本机IP, 优先点带「·直」的线)`);
+    // 直链仍播不了时的最后兜底: WebView 嗅探详情页
+    fromNames.push('网页嗅探·兜底');
+    playUrls.push('播放$' + durl + '@@sniff');
+  }
   return {
     list: [{
       vod_id: durl,
       vod_name: name,
       vod_pic: pic,
       vod_remarks: remarks,
-      vod_content: desc,
-      vod_play_from: 'JAVHDPorn',
-      // 线路家族标注: 本站铸造链依赖客户端 JS, 蜘蛛内不可复现,
-      // 唯一线路为 WebView 嗅探详情页 (家族: 嗅探)。
-      vod_play_url: `正片·嗅探$${durl}`,
+      vod_content: contentParts.join('\n'),
+      vod_play_from: fromNames.join('$$$'),
+      vod_play_url: playUrls.join('$$$'),
     }],
   };
 }
 
+function sniffResult(durl) {
+  // 最后兜底: 交给 App 的 WebView 嗅探 (真实浏览器环境可跑站方链)
+  return { parse: 1, jx: 0, url: durl, header: { 'User-Agent': UA, Referer: REFERER } };
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
-  const id = t(body.id);
+  let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
+  if (id.includes('$')) id = id.split('$').pop().trim();
   if (id.includes(DIAG_ID)) return { parse: 0, url: '' };
-  const durl = /^https?:\/\//.test(id) ? id.split('$').pop() : HOST + id;
-  // 1) 自建中转 (部署后生效): 中转铸造 + 解出直链 (走 req, 不用 fetch)
-  if (RELAY) {
-    try {
-      const r = await reqRaw(`${RELAY}/play?url=${encodeURIComponent(durl)}`, { 'User-Agent': UA }, 90000);
-      if (r.status === 200 && r.body) {
-        const j = JSON.parse(r.body);
-        if (j && j.ok && j.url) {
-          return { parse: 0, url: j.url, header: { 'User-Agent': UA, Referer: REFERER } };
-        }
-      }
-    } catch (e) { /* 落兜底 */ }
-  }
-  // 2) 最后兜底: 嗅探详情页 (真机 WebView 为真实浏览器, 站方链可原生跑)
-  return { parse: 1, jx: 0, url: durl, header: { 'User-Agent': UA, Referer: REFERER } };
+  // @@sniff 伪线: 点播时先再试一次完整铸造链 (通道有偶发性,
+  // 第二次常能成), 实在不行才落嗅探。
+  const sniffOnly = id.endsWith('@@sniff');
+  if (sniffOnly) id = id.slice(0, -'@@sniff'.length);
+  const mm = id.match(/^(https?:\/\/\S+?)@@(\d+)$/);
+  const durl = mm ? mm[1] : absUrl(id);
+  const wantIdx = mm ? parseInt(mm[2], 10) : -1;
+  // 现场重铸整链 (令牌时效 + IP 绑定的双重要求), 线路已按出口
+  // 一致性排序: 用户点的线若与最优线同组则尊重其选择, 否则回
+  // 最优线 —— 借线解出的绑定型令牌在设备上必 403, 点了也是白点。
+  let lines = [];
+  try { ({ lines } = await resolveLines(durl)); } catch (e) { lines = []; }
+  if (!lines.length) return sniffResult(durl);
+  const tapped = lines.find((l) => l.idx === wantIdx);
+  const best = lines[0];
+  const pick = (tapped && lineGroup(tapped) <= lineGroup(best)) ? tapped : best;
+  return { parse: 0, url: pick.file, header: { 'User-Agent': UA, 'Referer': pick.embedUrl } };
 }
 
 async function search(reqIn) {
