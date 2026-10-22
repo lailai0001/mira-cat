@@ -69,6 +69,13 @@
 //   通道池扩容 (workers.dev + allorigins/get + 原生 https 栈)、
 //   校验改解析型、慢中转降第二波。根因裁定区分实测/推导, 详见
 //   catfix_jhp_bjp_r3.md。
+// 2026-10-22 第六轮: 第五轮真机仍全灭 —— 公共通道 (含 cors demo)
+//   在用户服务端出口下三轮证明不可靠。本轮 GET 与 POST /api/play/
+//   的第一通道改为用户自有取页跳板 pornfhd-fetch (自己的
+//   Cloudflare Worker; 猫源调自有 Worker 的跳板形态已在 JAVSB/
+//   BBH 真机验通, Workers 出口取 pornfhd 页已由 cors demo 实测
+//   可行)。原竞速池全部保留为后续位: Worker 未部署时自有通道
+//   自动落空, 行为不劣于第五轮。详见 catfix_jhp_bjp_r4.md。
 import req from '../../util/req.js';
 
 const KEY = 'py_bestjavporn';
@@ -76,6 +83,8 @@ const NAME = 'BestJavPorn';
 const HOST = 'https://www.bestjavporn.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const REFERER = HOST + '/';
+// 自有取页跳板 pornfhd-fetch (用户部署在自己的 Cloudflare Workers)
+const OWN_FETCH = 'https://pornfhd-fetch.li768435813.workers.dev';
 
 // 分类: type_id = 站方规范路径 (含 /v{n}/ 版本前缀, 站方 301 的落点);
 // 2026-10-21 逐个抓取第一页验卡 (有视频才收), 顺序: 精选分类 / 片商 / 标签。
@@ -2036,6 +2045,8 @@ function absUrl(u) {
 // 校验改解析型 (列表=能解出卡片, 详情=带 data-mpu/og 标记,
 // embed=带 data-config), 杜绝误杀与误收; 慢中转只进第二波且
 // 封顶; 全灭回空, 不再回未校验残页。
+// 第六轮 (2026-10-22): GET/POST 第一通道改自有 Worker 跳板
+// pornfhd-fetch (见文件头注), 其余不变。
 import https from 'https';
 import zlib from 'zlib';
 
@@ -2142,6 +2153,20 @@ async function viaWorkersDemo(url, timeout) {
   return fetchRaw('https://test.cors.workers.dev/?' + wdTarget(url), WD_HEADERS, timeout || 12000);
 }
 
+// 自有 Worker 跳板 pornfhd-fetch (第六轮第一通道): 蜘蛛 -> 用户自有
+// Worker -> 站点。Worker 内部跟随重定向, 无需像 cors demo 那样喂
+// 规范 URL。白名单自检与 Worker 侧一致: 非 pornfhd 系域名 (第三
+// 方 embed 宿主) 直接落空不发请求, embed 竞速不受影响; Worker
+// 未部署时域名不可达/404 同样落空, 自动回落原通道池。
+const OWN_HOST_RE = /(^|\.)(javhdporn\.net|bestjavporn\.com|pornfhd\.com)$/i;
+async function viaOwnFetch(url, timeout, referer) {
+  try {
+    if (!OWN_HOST_RE.test(new URL(url).hostname)) return '';
+  } catch (e) { return ''; }
+  const w = OWN_FETCH + '/get?u=' + encodeURIComponent(url) + '&ref=' + encodeURIComponent(referer || REFERER);
+  return fetchRaw(w, { 'User-Agent': UA }, timeout || 12000);
+}
+
 async function viaJina(url, timeout) {
   return fetchRaw('https://r.jina.ai/' + url, {
     'User-Agent': UA,
@@ -2202,10 +2227,12 @@ async function httpGet(url, opts = {}) {
   // 竞速下 embed 阶段被并发拖到 12s+; 精简后回落到 ~2s 级)。
   const isEmbed = opts.kind === 'embed';
   const wave1 = isEmbed ? [
+    () => viaOwnFetch(url, 10000, opts.referer),
     () => fetchRaw(url, headers, 10000),
     () => viaWorkersDemo(url, 10000),
     () => viaReqGet(url, headers, 10000),
   ] : [
+    () => viaOwnFetch(url, 12000, opts.referer),
     () => fetchRaw(url, headers, 12000),
     () => viaReqGet(url, headers, 12000),
     () => viaHttps(url, headers, 12000),
@@ -2273,10 +2300,14 @@ async function httpPostForm(url, bodyStr, opts = {}) {
     'Referer': opts.referer || REFERER,
     'Origin': HOST,
   };
-  // 第一波: 直连 fetch / 直连 req / workers.dev 转发 (实测回真
-  // JSON 且最快); 第二波: allorigins 转发兜底。总截止约 22s,
-  // 铸造全灭时快速落嗅探, 不陪慢通道死等。
+  // 第一波: 自有 Worker 转发 (第六轮新增, 第一位) / 直连 fetch /
+  // 直连 req / cors demo 转发; 第二波: allorigins 转发兜底。总
+  // 截止约 22s, 铸造全灭时快速落嗅探, 不陪慢通道死等。
   const wave1 = [
+    async () => { // 自有 Worker 转发 (pornfhd-fetch /post, body 原样)
+      const w = OWN_FETCH + '/post?u=' + encodeURIComponent(url) + '&ref=' + encodeURIComponent(opts.referer || REFERER);
+      return fetchRaw(w, { 'User-Agent': UA, 'Content-Type': 'application/x-www-form-urlencoded' }, 12000, 'POST', bodyStr);
+    },
     async () => { // 直连 fetch
       const ctl = new AbortController();
       const to = setTimeout(() => ctl.abort(), 12000);

@@ -39,6 +39,9 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const REFERER = HOST + '/';
 // 播放中转 (javhdporn-relay, 用户部署后回填; 留空则 play 直接落嗅探)
 const RELAY = '';
+// 自有取页跳板 pornfhd-fetch (用户部署在自己的 Cloudflare Workers,
+// 第六轮新增为第一取页通道; 未部署时该通道自动落空, 行为不劣于第五轮)
+const OWN_FETCH = 'https://pornfhd-fetch.li768435813.workers.dev';
 
 // 分类: 2026-10-21 逐类实测站方计数 (results 数见注释), 全部有真实内容
 const CATS = [
@@ -98,6 +101,13 @@ function clean(s) {
 //     /og 标记为准 —— 杜绝"通道拿到了页面却被长度/关键词校验
 //     误杀", 也杜绝垃圾页 (中转说明页/限流页) 被误收;
 //   ③ 慢中转只进第二波且封顶; 全灭回空, 不再回未校验残页。
+// 2026-10-22 第六轮: 第五轮真机仍全灭 —— 公共通道 (含 cors demo)
+// 在用户服务端出口下三轮证明不可靠。本轮第一通道改为用户自有
+// 取页跳板 pornfhd-fetch (自己的 Cloudflare Worker, 猫源调自有
+// Worker 的跳板形态已在 JAVSB/BBH 真机验通; Workers 出口取
+// pornfhd 页已由 cors demo 实测可行)。原竞速池全部保留为后续
+// 位: Worker 未部署时 viaOwnFetch 自动落空 (域名不可达/404),
+// 竞速行为与第五轮完全一致, 不劣化。
 import https from 'https';
 import zlib from 'zlib';
 
@@ -214,6 +224,19 @@ async function viaWorkersDemo(url, timeoutMs) {
   }, timeoutMs);
 }
 
+// 自有 Worker 跳板 pornfhd-fetch (第六轮第一通道): 蜘蛛 -> 用户自有
+// Worker -> 站点。Worker 内部跟随重定向, 无需像 cors demo 那样喂
+// 规范 URL。白名单自检与 Worker 侧一致: 非 pornfhd 系域名直接
+// 落空, 不发请求。
+const OWN_HOST_RE = /(^|\.)(javhdporn\.net|bestjavporn\.com|pornfhd\.com)$/i;
+async function viaOwnFetch(url, timeoutMs) {
+  try {
+    if (!OWN_HOST_RE.test(new URL(url).hostname)) return '';
+  } catch (e) { return ''; }
+  const w = OWN_FETCH + '/get?u=' + encodeURIComponent(url) + '&ref=' + encodeURIComponent(REFERER);
+  return fetchText(w, { 'User-Agent': UA }, timeoutMs || 12000);
+}
+
 async function viaJina(url, timeoutMs) {
   return fetchText('https://r.jina.ai/' + url, {
     'User-Agent': UA,
@@ -257,6 +280,7 @@ async function raceValid(fns, valid) {
 async function getPage(url, kind) {
   const valid = kind === 'detail' ? validDetailPage : validListPage;
   const wave1 = [
+    () => viaOwnFetch(url, 12000),
     () => viaFetch(url, 12000),
     () => viaReq(url, 12000),
     () => viaHttps(url, 12000),
