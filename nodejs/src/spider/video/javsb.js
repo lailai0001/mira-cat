@@ -29,6 +29,30 @@
 // play 总预算放宽到 55s: Worker 首播要等中转取列表 (实测可达 10~35s),
 // 成品在 Worker 侧缓存 600s, 二次点播直接命中。
 //
+// 播放 (2026-10-22 第七轮, 只改蜘蛛): 第六轮真机仍报无法播放。复测坐实
+// 瓶颈不在地址形态, 而在 Worker 取列表这一环本身: Worker 内部靠
+// allorigins 等公开中转代取 raw 列表, 其健康度逐时波动 —— 2026-10-22
+// 实测冷取 10 个在架视频仅 1 个成功 (allorigins 当日大面积 500/超时),
+// 失败时 Worker 要 20~36s 才回 502; 而第六轮蜘蛛在 play 里只给
+// Worker 两次机会 (direct/proxy 各一轮) 且被 47s 阶段上限截断, 第二轮
+// 常跑不完就落到回退路, 回退路 A/B 返回的又是播放器直取必死的
+// jav.sb 本域地址 —— 于是"列表全好、点播全灭"。同时复核排除的项:
+// 官方链本身完好 (VM 直连 CUS-1811-EP6-K: raw/get_file 200、559 片、
+// 分片首字节 0x47, token->save->get_file 与 raw 逐字节一致);
+// save 附带的 source 索引 (18av.mov) 分片行无逐片 token、补 source
+// token 亦 403, 不可用; 另有约 1/4 在架视频站方本身 404 (文件缺失,
+// 如 SQTE-688/690, 浏览器同样播不了, 非蜘蛛问题)。
+// 本轮改法 (全部在蜘蛛内, 不新增任何中转/代理):
+//   1) 详情预热: detail 拿到 hash 即在后台 (不阻塞详情返回) 启动
+//      Worker 取数, 最多 3 轮竞速、预算 110s —— 用户在详情页停留的
+//      时间就是取数时间, 点播时大概率已取好 (状态进程内缓存 600s,
+//      与 Worker 侧缓存同寿命);
+//   2) play 先等预热结果 (最多等 ~20s), 没有再在 play 预算内补一轮;
+//   3) 校验全失败时的兜底从"回退路 A/B (播放器必死地址)"改为直接
+//      返回未校验的全链 Worker 地址: 播放器这次自取本身就是新一轮
+//      取数竞速, 且用户重重点播还能再掷一轮 —— 严格优于回一个已知
+//      必死的地址。官方链 A/B 仅保留在 JAVSB_WORKER 未配置时走旧链路。
+//
 // 抓取通道 (2026-10-20 第六版): 真机双状态 (VPN 开/关) 直连全灭、第三轮的
 // jina 单中转也全灭。复核结论: 第三轮实现无 URL/编码类低级错误, 但有三个结构
 // 问题 —— (1) jina 只走了原生 fetch 一条传输, 而本仓已真机通过的 SexTB 是走
@@ -540,6 +564,12 @@ async function detail(reqIn) {
   const name = og(html, 'title');
   const pic = og(html, 'image');
   const desc = og(html, 'description');
+  // 第七轮: 详情预热 —— 拿到 hash 立即在后台启动 Worker 取数 (不 await,
+  // 不拖慢详情返回), 用户停留详情页的时间用于消化中转取列表的慢启动。
+  if (JAVSB_WORKER) {
+    const ph = extractPlayer(html).hash;
+    if (ph) { try { warmWorker(ph); } catch (e) { /* 预热失败不影响详情 */ } }
+  }
   return {
     list: [{
       vod_id: durl,
@@ -624,14 +654,28 @@ async function tryOfficialStream(hash, playerUrl, deadline) {
   return '';
 }
 
-// ---------- Worker 取流 (第六轮首选) ----------
+// ---------- Worker 取流 (第七轮: 详情预热 + 多轮竞速 + 未校验兜底) ----------
 // 探针就跑在 App 里, 等于设备出口实测:
 //   形态一 (分片直链, 轻量): 取 Worker 的 seg=direct 列表 (分片保持
 //     18av.mov 原始直链), 再探首分片 (Range 取首字节, 查 0x47 同步字)
 //     —— 列表与分片都通才用它;
 //   形态二 (全链代理): 分片改走 Worker /s, 播放器只连 workers.dev。
-// 任一形态校验通过即返回其地址; 都不过返回 '' (play 回退路 A/B/嗅探)。
-// wDeadline 是 Worker 阶段的截止点 (play 给回退路预留了时间)。
+// 第七轮结构: 一次"取数轮" = direct 形态一轮 + (必要时) proxy 形态一轮
+// (两形态在 Worker 内共用同一份 raw 取数与缓存, 谁先取到都算本轮成)。
+// Worker 内部取数靠公开中转竞速, 单轮成败带随机性且失败要等 20~36s
+// 才回 502, 故取数被拆成进程内状态机:
+//   detail 阶段: warmWorker 后台预热 (最多 3 轮 / 110s, 不阻塞详情);
+//   play 阶段: 先消费预热结果, 无果再在 play 预算内补一轮;
+//   状态 (ok 的形态) 进程内记 600s, 与 Worker 侧缓存同寿命。
+// 全部校验失败时 play 返回未校验的全链地址作兜底 (见 play 注释)。
+const workerState = new Map(); // hash -> { st, form, t, promise }
+const WORKER_STATE_TTL = 600000;
+
+function workerUrlFor(hash, form) {
+  const base = `${JAVSB_WORKER}/v?hash=${encodeURIComponent(hash)}`;
+  return form === 'direct' ? base + '&seg=direct' : base;
+}
+
 async function probeSegment(segUrl, timeoutMs) {
   if (!segUrl || timeoutMs < 800) return false;
   try {
@@ -640,41 +684,96 @@ async function probeSegment(segUrl, timeoutMs) {
   } catch (e) { return false; }
 }
 
-async function tryWorkerStream(hash, wDeadline) {
-  if (!JAVSB_WORKER || Date.now() >= wDeadline) return '';
-  const isPl = (s) => typeof s === 'string' && s.includes('#EXTM3U');
-  const cap = (want) => Math.max(800, Math.min(want, wDeadline - Date.now()));
-  const getPl = async (u) => {
-    try {
-      const txt = await viaFetch(u, { 'User-Agent': UA, 'Accept': '*/*' }, cap(44000));
-      if (txt && isPl(txt)) return txt;
-    } catch (e) { /* 换 req 传输再试 */ }
-    if (Date.now() >= wDeadline) return '';
-    try {
-      const txt = await viaReq(u, { 'User-Agent': UA, 'Accept': '*/*' }, cap(12000));
-      if (txt && isPl(txt)) return txt;
-    } catch (e) { /* 落空 */ }
-    return '';
-  };
-  // 形态一: 分片直链
-  const directUrl = `${JAVSB_WORKER}/v?hash=${encodeURIComponent(hash)}&seg=direct`;
-  const proxyUrl = `${JAVSB_WORKER}/v?hash=${encodeURIComponent(hash)}`;
-  const pl = await getPl(directUrl);
+const isPlaylist = (s) => typeof s === 'string' && s.includes('#EXTM3U');
+
+// 取一次 Worker 列表 (先 fetch 传输, 失败换框架 req), 预算内返回正文或 ''
+async function fetchWorkerPl(url, budgetMs) {
+  const end = Date.now() + budgetMs;
+  try {
+    const txt = await viaFetch(url, { 'User-Agent': UA, 'Accept': '*/*' }, Math.max(800, Math.min(44000, end - Date.now())));
+    if (txt && isPlaylist(txt)) return txt;
+  } catch (e) { /* 换 req 传输再试 */ }
+  if (end - Date.now() < 800) return '';
+  try {
+    const txt = await viaReq(url, { 'User-Agent': UA, 'Accept': '*/*' }, Math.max(800, Math.min(12000, end - Date.now())));
+    if (txt && isPlaylist(txt)) return txt;
+  } catch (e) { /* 落空 */ }
+  return '';
+}
+
+// 一轮取数: 返回胜出形态 'direct' | 'proxy', 全灭返回 ''
+async function workerRound(hash, budgetMs) {
+  const end = Date.now() + budgetMs;
+  const left = () => end - Date.now();
+  const t0 = Date.now();
+  const directUrl = workerUrlFor(hash, 'direct');
+  const proxyUrl = workerUrlFor(hash, 'proxy');
+  const pl = await fetchWorkerPl(directUrl, left());
   if (pl) {
     const seg = pl.split('\n').map(x => x.trim()).find(x => x && !x.startsWith('#'));
-    if (seg && (await probeSegment(seg, cap(5000)))) return directUrl;
-    // 直链分片探不过 → 全链形态。Worker 刚为兄弟形态取过 raw 正文并
-    // 缓存 (按 hash), 这次取数应当很快; 时间实在不够时直接返回全链
-    // 地址 (其取数机制与刚成功的直链形态完全同源, 只差改写方式)。
-    if (wDeadline - Date.now() < 3000) return proxyUrl;
-    const pl2 = await getPl(proxyUrl);
-    return pl2 ? proxyUrl : '';
+    const ok = seg ? await probeSegment(seg, Math.max(800, Math.min(5000, left()))) : false;
+    noteLayer('worker-probe', Date.now() - t0, ok, seg || directUrl);
+    if (ok) { noteLayer('worker-direct', Date.now() - t0, true, directUrl); return 'direct'; }
+    // 直链分片探不过 → 全链形态 (raw 已在 Worker 侧缓存, 取数应很快)
+    if (left() > 1500) {
+      const pl2 = await fetchWorkerPl(proxyUrl, Math.min(15000, left()));
+      if (pl2) { noteLayer('worker-proxy', Date.now() - t0, true, proxyUrl); return 'proxy'; }
+    }
+    return '';
   }
-  // 直链形态列表都没拿到 → 全链形态再试一次 (Worker 内部竞速是随机的,
-  // 第二轮未必同灭), 仍不过才落回退路。
-  if (Date.now() >= wDeadline) return '';
-  const pl2 = await getPl(proxyUrl);
-  return pl2 ? proxyUrl : '';
+  noteLayer('worker-direct', Date.now() - t0, false, directUrl);
+  // 直链形态列表都没拿到 → 全链形态再掷一轮 (Worker 内部是新的竞速)
+  if (left() > 1500) {
+    const pl2 = await fetchWorkerPl(proxyUrl, left());
+    if (pl2) { noteLayer('worker-proxy', Date.now() - t0, true, proxyUrl); return 'proxy'; }
+  }
+  return '';
+}
+
+// 多轮取数: 轮间无间隔 (Worker 的 502 本身就是 20~36s 的节拍)
+async function acquireWorker(hash, budgetMs, maxRounds) {
+  const end = Date.now() + budgetMs;
+  for (let r = 0; r < maxRounds && end - Date.now() > 1500; r++) {
+    const form = await workerRound(hash, end - Date.now());
+    if (form) return form;
+  }
+  return '';
+}
+
+// 详情预热入口: 同一 hash 已有进行中/新鲜的成功状态则复用, 否则起后台取数。
+// 返回状态条目 (调用方不 await 其 promise 即为纯预热)。
+function warmWorker(hash) {
+  let e = workerState.get(hash);
+  const now = Date.now();
+  if (e && e.st === 'ok' && now - e.t < WORKER_STATE_TTL) return e;
+  if (e && e.st === 'pending') return e;
+  e = { st: 'pending', form: '', t: now, promise: null };
+  e.promise = (async () => {
+    let form = '';
+    try { form = await acquireWorker(hash, 110000, 3); } catch (err) { form = ''; }
+    if (form) { e.st = 'ok'; e.form = form; } else { e.st = 'fail'; }
+    e.t = Date.now();
+    return form ? e : null;
+  })();
+  workerState.set(hash, e);
+  if (workerState.size > 40) workerState.delete(workerState.keys().next().value);
+  return e;
+}
+
+// 预热已判 ok 后, 出正式地址前对 direct 形态做一次轻复核 (列表从 Worker
+// 缓存秒回 + 首分片探针): 复核不过改走全链形态 (raw 缓存同在, 可播)。
+// proxy 形态无需复核 (播放器全程只连 Worker, 取数已证)。
+async function verifiedWorkerUrl(hash, form, budgetMs) {
+  if (form !== 'direct') return workerUrlFor(hash, 'proxy');
+  const end = Date.now() + budgetMs;
+  const pl = await fetchWorkerPl(workerUrlFor(hash, 'direct'), Math.max(800, end - Date.now()));
+  if (pl) {
+    const seg = pl.split('\n').map(x => x.trim()).find(x => x && !x.startsWith('#'));
+    if (seg && (await probeSegment(seg, Math.max(800, Math.min(4000, end - Date.now()))))) {
+      return workerUrlFor(hash, 'direct');
+    }
+  }
+  return workerUrlFor(hash, 'proxy');
 }
 
 async function play(reqIn) {
@@ -690,12 +789,45 @@ async function play(reqIn) {
   const remain = () => Math.max(400, deadline - Date.now());
   const html = await getDetailPage(durl, remain());
   const { playerUrl, hash } = html ? extractPlayer(html) : { playerUrl: '', hash: '' };
-  if (hash && playerUrl) {
-    // 首选 Worker (部署即生效): 校验通过即 parse:0 直返 Worker 地址
-    const w = await tryWorkerStream(hash, deadline - 8000);
-    if (w) {
-      return { parse: 0, url: w, header: { 'User-Agent': UA, 'Referer': REFERER } };
+  if (hash && JAVSB_WORKER) {
+    // 第七轮 Worker 路径: 预热结果 -> play 内补轮 -> 未校验兜底
+    const wHead = { 'User-Agent': UA, 'Referer': REFERER };
+    // 1) 详情阶段的预热结果 (进程内状态): 已 ok 直接复核出地址
+    let e = workerState.get(hash);
+    if (e && e.st === 'ok' && Date.now() - e.t < WORKER_STATE_TTL) {
+      const u = await verifiedWorkerUrl(hash, e.form, Math.min(9000, remain()));
+      if (u) { noteLayer('worker-warm-hit', 0, true, u); return { parse: 0, url: u, header: wHead }; }
     }
+    // 预热还在跑: 在预算内等它一阵 (上限 ~20s, 给补轮留时间), 等到即用
+    if (e && e.st === 'pending' && e.promise) {
+      const waitMs = Math.max(0, Math.min(20000, deadline - Date.now() - 15000));
+      if (waitMs > 0) await Promise.race([e.promise, new Promise(r => setTimeout(r, waitMs))]);
+      e = workerState.get(hash);
+      if (e && e.st === 'ok') {
+        const u = await verifiedWorkerUrl(hash, e.form, Math.min(9000, remain()));
+        if (u) { noteLayer('worker-warm-hit', 0, true, u); return { parse: 0, url: u, header: wHead }; }
+      }
+    }
+    // 2) play 预算内补跑取数 (预热缺席/已判失败时)
+    if (deadline - Date.now() > 4000) {
+      const form = await acquireWorker(hash, deadline - Date.now() - 2000, 2);
+      if (form) {
+        const en = workerState.get(hash) || { st: 'ok', form, t: Date.now(), promise: null };
+        en.st = 'ok'; en.form = form; en.t = Date.now();
+        workerState.set(hash, en);
+        return { parse: 0, url: workerUrlFor(hash, form), header: wHead };
+      }
+    }
+    // 3) 校验全灭的兜底: 直接回未校验的全链 Worker 地址。播放器自取
+    // /v 时 Worker 会再跑一轮内部竞速 (等于多一次机会), 用户重重点播
+    // 又是一轮; 严格优于第六轮的回退路 A/B (返回 jav.sb 本域地址,
+    // 播放器直取必被 CF 拦 —— 第五轮真机已证全灭) 与 parse:1 嗅探
+    // (五、六两轮均未出过播)。
+    noteLayer('worker-unverified', 0, false, workerUrlFor(hash, 'proxy'));
+    return { parse: 0, url: workerUrlFor(hash, 'proxy'), header: wHead };
+  }
+  if (hash && playerUrl) {
+    // JAVSB_WORKER 未配置时才走旧链路: 官方链 A/B -> 嗅探播放器页
     const direct = await tryOfficialStream(hash, playerUrl, deadline);
     if (direct) {
       return { parse: 0, url: direct, header: { 'User-Agent': UA, 'Referer': REFERER } };
