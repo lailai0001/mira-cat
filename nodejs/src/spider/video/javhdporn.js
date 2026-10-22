@@ -792,15 +792,35 @@ function extractPlaySeed(html) {
 // Worker 的 GET, 不碰 POST。
 // 契约: GET {OWN_FETCH}/cast?u=<watch 页完整 URL> -> 命中 200
 // {"paths":[embed 路径数组],"ts":epoch}; 未命中 404。
-// 只走 req (App 运行时无全局 fetch); 仅 1 次, 6s 超时; 未命中/
-// 超时/坏 JSON/空路径集一律 {hit:false}, 调用方无声落回原铸造。
-async function castBankLookup(watchUrl) {
+// 只走 req (App 运行时无全局 fetch); 未命中/超时/坏 JSON/空路
+// 径集一律落回原铸造。
+// 形态别名 (2026-10-23 真机坐实): 站方列表/搜索发的 watch 链
+// 接带 /v\d+/ 前缀且会漂移 (本站出现过 /v2//v4/), 入库键多为
+// 去前缀 canonical 形 —— 精确一发未命中时, 明明在库的片也照
+// 样全灭。候选序: 精确址 -> canonical 形 -> 其余前缀形, 最多
+// 3 发 GET (查库不耗写入预算), 命中即停; 首发超时沿用 6s,
+// 变体发 3s。
+const CAST_ALIAS_PREFIXES = '/v2,/v4,/v1'.split(',');
+function castBankCandidates(watchUrl) {
+  const out = [watchUrl];
+  const m = String(watchUrl).match(/^(https?:\/\/[^/]+)(?:\/v\d+)?(\/video\/\S*)$/);
+  if (!m) return out;
+  const canonical = m[1] + m[2];
+  if (!out.includes(canonical)) out.push(canonical);
+  for (const p of CAST_ALIAS_PREFIXES) {
+    const u = m[1] + p + m[2];
+    if (!out.includes(u)) out.push(u);
+  }
+  return out.slice(0, 3);
+}
+
+async function castBankGet(watchUrl, timeoutMs) {
   try {
     const w = OWN_FETCH + '/cast?u=' + encodeURIComponent(watchUrl);
-    const r = await reqRaw(w, { 'User-Agent': UA }, 6000);
-    if (!r || r.status !== 200 || !r.body) return { hit: false };
+    const r = await reqRaw(w, { 'User-Agent': UA }, timeoutMs);
+    if (!r || r.status !== 200 || !r.body) return null;
     let j;
-    try { j = JSON.parse(r.body); } catch (e) { return { hit: false }; }
+    try { j = JSON.parse(r.body); } catch (e) { return null; }
     const seen = new Set();
     const arr = (j && Array.isArray(j.paths))
       ? j.paths.filter((p) => {
@@ -809,11 +829,20 @@ async function castBankLookup(watchUrl) {
           return true;
         })
       : [];
-    if (!arr.length) return { hit: false };
+    if (!arr.length) return null;
     return { hit: true, paths: arr.map((p, i) => ({ lo: i === 0 ? 'main' : 'bak', path: p })) };
   } catch (e) {
-    return { hit: false };
+    return null;
   }
+}
+
+async function castBankLookup(watchUrl) {
+  const cands = castBankCandidates(watchUrl);
+  for (let i = 0; i < cands.length; i++) {
+    const hit = await castBankGet(cands[i], i === 0 ? 6000 : 3000);
+    if (hit) return hit;
+  }
+  return { hit: false };
 }
 
 // 调 /api/play/ 并解出全部线路的 embed 路径: {paths, stage, via, postDiag}
