@@ -1,36 +1,39 @@
 // JAV HD Porn (https://www.javhdporn.net) -> CatPawOpen spider
 // 站点性质: WordPress 聚合站 (kingtube 系主题), 与 bestjavporn.com 同一
 // 运营网络 (共用图片 CDN pics.pornfhd.com / 预览 CDN video.pornfhd.com)。
-// 列表/详情/搜索均为服务端渲染, VM 直连 200, 无验证墙。
-// 封面: pics.pornfhd.com 直连 https, 实测无防盗链 (无 Referer 裸拉 200),
-// 卡片 data-lazy-src 是 /s/ 小图, 去掉 /s/ 即大图; 详情用 og:image。
+// 列表/详情/搜索均为服务端渲染, 无验证墙。
+// 封面: 卡片 data-lazy-src 是 pics.pornfhd.com/s/ 小图, 去掉 /s/ 即大图;
+// 详情用 og:image。
 // 分类 URL 形态: /category/{slug}/ 会 301 到带版本前缀的 /v3/category/
-// {slug}/ (前缀会变, 故蜘蛛用无前缀形态 + 跟随重定向, 不写死版本号)。
-// 每页 24 条; 分页 /page/{n}/; 搜索 /search/{kw}/ (实测可用)。
+// {slug}/ (2026-10-22 侦察复核: 当前前缀仍为 /v3; 蜘蛛用无前缀形态 +
+// 跟随重定向, 不写死版本号)。每页 24 条; 分页 /page/{n}/;
+// 搜索 /search/{kw}/ (实测可用; 站内无 results.php, /?s= 与之等价)。
 //
-// 播放链 (2026-10-21 侦察坐实, 全程 jsdom 跑站方原版 JS 取证):
-// 详情页 .play-button 点击 -> cast.js 在客户端做加密变换 (纯 JS 密码学,
-// 混淆代码内实现, WebCrypto 零调用) 把 data-mpu 密文换成 sources 令牌
-// -> POST /api/play/ -> 响应密文在客户端解密 -> 得到 embed 地址
-// video(1).javhdporn.net/p/{id}?t=&s= -> embed 页 main.js 解密
-// #jwplayer 的 data-config -> JW sources。抽样 3 片的最终托管:
-//   - FC2 片 -> streamtape mp4: get_video 令牌绑铸造方 IP (换出口
-//     403), 但其 302 跳出的 tapecontent 直链不绑 IP —— 机房出口拉
-//     本体 403, CF 出口实测 200 拉到真 mp4。中转负责铸造并解出
-//     tapecontent 直链, 蜘蛛 parse:0 直返, 设备直连。
-//   - 字幕/破解片 -> streamhls.click HLS master: 令牌每次铸造全新,
-//     但 curl / Node fetch 实测全部 403 (embed 页内 fetch 探针两次
-//     均未取得结果, 未证实) —— 非浏览器客户端拉不到, 中转也救不了,
-//     只有真浏览器 (含 App WebView 嗅探) 能播。
-// 蜘蛛运行时无 DOM、无 jsdom、禁用 vm, 铸造链无法在蜘蛛内复现。
-// 故 play 设计:
-//   1) 首选自建中转 (下方 RELAY 常量, 部署后由主代理回填域名):
-//      中转跑站方 JS 铸造 sources, streamtape 线解出 tapecontent
-//      直链回蜘蛛 parse:0 直返; streamhls 线中转如实回失败;
-//   2) 中转未部署/失败 (含 streamhls 线) -> parse:1 嗅探详情页
-//      (真机 WebView 是真实浏览器, 站方整条链在浏览器内原生可跑;
-//      本仓嗅探多次实证不稳定, 仅作最后兜底, 不承诺)。
+// 播放链 (2026-10-21 侦察坐实, 沿用至今未变):
+// 详情页 .play-button 点击 -> cast.js 在客户端把 data-mpu 密文换成
+// sources 令牌 -> POST /api/play/ -> embed 页解密得 JW sources。
+// 蜘蛛运行时无 DOM、禁用 vm, 铸造链无法在蜘蛛内复现。故 play 设计:
+//   1) 自建中转 RELAY (留空, 部署后回填): 中转铸造 + 解直链;
+//   2) 中转未部署/失败 -> parse:1 嗅探详情页 (真机 WebView 是真实
+//      浏览器, 站方整条链可在页内原生跑)。详情里该线标注家族「嗅探」。
+//
+// 2026-10-22 第七轮 (删除重写, 与 bestjavporn 同步):
+// 前四轮 (并行竞速/通道扩容/自有 Worker) 本地 harness 全过、真机
+// 全灭, 且失败形态不可归因 (蜘蛛只回空列表, 无从知道死在哪层)。
+// 本轮按 2026-10-22 当日实况重新侦察后重写:
+//   ① 取数分层、逐通道归因: 每次取页记录每条通道的 状态码/字节/
+//      解卡数/耗时, 胜出者与失败全表都可回溯;
+//   ② 诊断卡: home 与每个分类的首行固定放一张诊断卡 (vod_id 为
+//      __diag__), 卡名写本页命中通道与出卡数 (如「诊断 own 200 ·
+//      36卡」), 全通道失败时卡名带回各通道状态; 点开诊断卡的详情
+//      可见完整通道明细表 —— 真机一点开即可截图归因, 不再盲飞;
+//   ③ 解析双层: 严格层 (原解析, 今日实况复核仍吻合) + 宽松层
+//      (属性顺序无关、相对/绝对 href 通吃、标题多路兜底), 页面
+//      变体导致严格层解 0 卡时宽松层接住, 诊断卡会标注;
+//   ④ 分类/播放/源名/key 与旧版一致, 播放沿用 RELAY->嗅探设计。
 import req from '../../util/req.js';
+import https from 'https';
+import zlib from 'zlib';
 
 const KEY = 'py_javhdporn';
 const NAME = 'JAVHDPorn';
@@ -39,11 +42,11 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const REFERER = HOST + '/';
 // 播放中转 (javhdporn-relay, 用户部署后回填; 留空则 play 直接落嗅探)
 const RELAY = '';
-// 自有取页跳板 pornfhd-fetch (用户部署在自己的 Cloudflare Workers,
-// 第六轮新增为第一取页通道; 未部署时该通道自动落空, 行为不劣于第五轮)
+// 自有取页跳板 pornfhd-fetch (用户自有 Cloudflare Worker, 第一通道)
 const OWN_FETCH = 'https://pornfhd-fetch.li768435813.workers.dev';
+const DIAG_ID = '__diag__';
 
-// 分类: 2026-10-21 逐类实测站方计数 (results 数见注释), 全部有真实内容
+// 分类: 2026-10-21 逐类实测站方计数, 2026-10-22 侦察复核 slug 未变
 const CATS = [
   { type_id: 'censored', type_name: '有码' },                              // 72000
   { type_id: 'uncensored', type_name: '无码' },                            // 36944
@@ -54,8 +57,8 @@ const CATS = [
   { type_id: 'amateur', type_name: '素人' },                               // 56908
   { type_id: 'decensored/uncensored-leaked', type_name: '无码流出' },      // 9026
   { type_id: 'uncensored/tokyo-hot', type_name: 'Tokyo Hot' },              // 2677
-  { type_id: 'subtitle-indonesia', type_name: '印尼字幕' },                // 5567
-  { type_id: 'censored/subthai', type_name: '泰文字幕' },                  // 893
+  { type_id: 'subtitle-indonesia', type_name: '印尼字幕' },                 // 5567
+  { type_id: 'censored/subthai', type_name: '泰文字幕' },                   // 893
 ];
 
 function t(x) {
@@ -73,244 +76,10 @@ function clean(s) {
     .replace(/&#\d+;/g, ''));
 }
 
-// ---------------- 抓取 (第五轮: 解析型校验 + 扩容通道池竞速) ----------------
-// 2026-10-22 第五轮 (与 bestjavporn 同步)。第四轮 (并行竞速) 真机仍
-// 全灭, 本轮逐通道原始应答复测 (VM 出口, 与校验判定分开记录):
-//   直连 fetch / jina(html 模式): 两站均 200 真页 (0.1~2s);
-//   allorigins /raw、codetabs: 当日全程 522, 且各烧约 20s 才回;
-//   allorigins /get (JSON 包装): 对 bestjavporn 可用 (2/2 真页),
-//     对本站被其出口挡 (522/408) —— 两站 CF 区域规则并不一致;
-//   新通道 test.cors.workers.dev (Cloudflare 官方 CORS demo, 须带
-//     X-Requested-With 头): 对规范 URL 直出真页且极快 (0.1~1.5s);
-//     但目标 URL 若会 301 (本站 /category/x/ -> /v3/category/x/),
-//     它回自己的说明页 —— 该通道须喂规范 URL, 前缀从任何成功页的
-//     canonical 链接学习 (默认 /v3, 页面变化时自动更新);
-//   corsproxy.io 已改 API-Key 制 (401)、cors.lol 限流、cors.eu.org /
-//     bridged / whateverorigin 等均已死或不可达, 不纳入。
-//   框架 req (axios) 在 VM 沙箱被出口代理 ECONNRESET (连 httpbin
-//     都挂), 属沙箱假象, 不代表用户服务端; 其线上 UA 经回显实测
-//     确为蜘蛛所设 Chrome UA —— 前轮"蜘蛛 UA 不生效"的说法无直接
-//     证据, 本轮按"多栈并存、不押单栈"设计。
-// (推导, 非实测) 真机全灭的最合理解释仍是出口差异: 用户运行时
-// 出口下直连各栈与 jina (大陆不可达) 同时失效时, 第四轮只剩当时
-// 全 522 的 B 组, 竞速救不了全体通道死亡。本轮对策:
-//   ① 通道池扩容: 新增 workers.dev 通道 (与用户已在用的自有
-//     Worker 同域, 可达性谱系不同于 jina/公共中转) 与 allorigins
-//     /get 形态、原生 https 栈, 全部并行竞速, 存活者最快胜出;
-//   ② 校验改解析型: 列表页以"真能解出卡片"为准、详情页以播放器
-//     /og 标记为准 —— 杜绝"通道拿到了页面却被长度/关键词校验
-//     误杀", 也杜绝垃圾页 (中转说明页/限流页) 被误收;
-//   ③ 慢中转只进第二波且封顶; 全灭回空, 不再回未校验残页。
-// 2026-10-22 第六轮: 第五轮真机仍全灭 —— 公共通道 (含 cors demo)
-// 在用户服务端出口下三轮证明不可靠。本轮第一通道改为用户自有
-// 取页跳板 pornfhd-fetch (自己的 Cloudflare Worker, 猫源调自有
-// Worker 的跳板形态已在 JAVSB/BBH 真机验通; Workers 出口取
-// pornfhd 页已由 cors demo 实测可行)。原竞速池全部保留为后续
-// 位: Worker 未部署时 viaOwnFetch 自动落空 (域名不可达/404),
-// 竞速行为与第五轮完全一致, 不劣化。
-import https from 'https';
-import zlib from 'zlib';
-
-const BROWSER_HEADERS = {
-  'User-Agent': UA,
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
-  'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
-  'sec-ch-ua-mobile': '?0',
-  'sec-ch-ua-platform': '"Windows"',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Upgrade-Insecure-Requests': '1',
-};
-
-function isShellPage(s) {
-  return /Attention Required|Just a moment|cf-challenge|Checking your browser/i.test(s || '');
-}
-// 解析型校验 (parseCards 为函数声明, 已提升, 此处可直接调用)
-function validListPage(html) {
-  return !!html && !isShellPage(html) && parseCards(html).length > 0;
-}
-function validDetailPage(html) {
-  return !!html && !isShellPage(html) && html.length > 4000 &&
-    (/property="og:(title|image)"/.test(html) || html.includes('videojs.html') || html.includes('data-mpu'));
-}
-
-async function viaReq(url, timeoutMs) {
-  try {
-    const r = await req.get(url, {
-      headers: { 'User-Agent': UA, Referer: REFERER },
-      timeout: timeoutMs || 12000,
-    });
-    const d = typeof r === 'string' ? r : (r && r.data !== undefined ? r.data : r);
-    return typeof d === 'string' ? d : '';
-  } catch (e) {
-    return '';
-  }
-}
-
-async function fetchText(url, headers, timeoutMs) {
-  try {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), timeoutMs || 12000);
-    const r = await fetch(url, { headers, redirect: 'follow', signal: ctl.signal });
-    clearTimeout(timer);
-    if (!r.ok) return '';
-    return await r.text();
-  } catch (e) {
-    return '';
-  }
-}
-
-async function viaFetch(url, timeoutMs) {
-  return fetchText(url, { ...BROWSER_HEADERS, Referer: REFERER }, timeoutMs);
-}
-
-// 原生 https 栈 (与 req/fetch 不同的代码路径; 手工重定向 + 解压)
-function viaHttps(url, timeoutMs, depth = 0) {
-  return new Promise((resolve) => {
-    let done = false;
-    const fin = (v) => { if (!done) { done = true; resolve(v); } };
-    try {
-      const u = new URL(url);
-      const rq = https.request({
-        hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
-        headers: { ...BROWSER_HEADERS, Referer: REFERER, 'Accept-Encoding': 'gzip, deflate, br' },
-        timeout: timeoutMs || 12000,
-      }, (res) => {
-        const loc = res.headers.location;
-        if (res.statusCode >= 300 && res.statusCode < 400 && loc && depth < 3) {
-          res.resume();
-          fin(viaHttps(new URL(loc, url).toString(), timeoutMs, depth + 1));
-          return;
-        }
-        if (res.statusCode !== 200) { res.resume(); fin(''); return; }
-        let stream = res;
-        const enc = String(res.headers['content-encoding'] || '');
-        try {
-          if (enc.includes('gzip')) stream = res.pipe(zlib.createGunzip());
-          else if (enc.includes('deflate')) stream = res.pipe(zlib.createInflate());
-          else if (enc.includes('br')) stream = res.pipe(zlib.createBrotliDecompress());
-        } catch (e) { /* 解压失败则按原文读 */ }
-        const chunks = [];
-        stream.on('data', (c) => chunks.push(c));
-        stream.on('end', () => fin(Buffer.concat(chunks).toString('utf8')));
-        stream.on('error', () => fin(''));
-      });
-      rq.on('timeout', () => { rq.destroy(); fin(''); });
-      rq.on('error', () => fin(''));
-      rq.end();
-    } catch (e) { fin(''); }
-  });
-}
-
-// workers.dev 通道须喂规范 URL: /category|search 前的版本前缀从
-// 成功页面学习 (页面 canonical/og:url 均为规范形态); 默认 /v3。
-let learnedPrefix = '/v3';
-function notePrefix(html) {
-  const m = String(html || '').match(/javhdporn\.net(\/v\d+)\/(?:category|search)\//);
-  if (m) learnedPrefix = m[1];
-}
-function wdTarget(url) {
-  try {
-    const u = new URL(url);
-    if (/^\/(category|search)\//.test(u.pathname)) u.pathname = learnedPrefix + u.pathname;
-    return u.toString();
-  } catch (e) { return url; }
-}
-async function viaWorkersDemo(url, timeoutMs) {
-  return fetchText('https://test.cors.workers.dev/?' + wdTarget(url), {
-    'User-Agent': UA, 'X-Requested-With': 'XMLHttpRequest', Origin: HOST,
-  }, timeoutMs);
-}
-
-// 自有 Worker 跳板 pornfhd-fetch (第六轮第一通道): 蜘蛛 -> 用户自有
-// Worker -> 站点。Worker 内部跟随重定向, 无需像 cors demo 那样喂
-// 规范 URL。白名单自检与 Worker 侧一致: 非 pornfhd 系域名直接
-// 落空, 不发请求。
-const OWN_HOST_RE = /(^|\.)(javhdporn\.net|bestjavporn\.com|pornfhd\.com)$/i;
-async function viaOwnFetch(url, timeoutMs) {
-  try {
-    if (!OWN_HOST_RE.test(new URL(url).hostname)) return '';
-  } catch (e) { return ''; }
-  const w = OWN_FETCH + '/get?u=' + encodeURIComponent(url) + '&ref=' + encodeURIComponent(REFERER);
-  return fetchText(w, { 'User-Agent': UA }, timeoutMs || 12000);
-}
-
-async function viaJina(url, timeoutMs) {
-  return fetchText('https://r.jina.ai/' + url, {
-    'User-Agent': UA,
-    'x-respond-with': 'html',
-  }, timeoutMs);
-}
-
-async function viaAlloriginsGet(url, timeoutMs) {
-  const txt = await fetchText('https://api.allorigins.win/get?url=' + encodeURIComponent(url), {
-    'User-Agent': UA,
-  }, timeoutMs);
-  if (!txt) return '';
-  try {
-    const j = JSON.parse(txt);
-    return typeof j.contents === 'string' ? j.contents : '';
-  } catch (e) { return ''; }
-}
-
-async function viaAlloriginsRaw(url, timeoutMs) {
-  return fetchText('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
-    'User-Agent': UA,
-  }, timeoutMs);
-}
-
-async function viaCodetabs(url, timeoutMs) {
-  return fetchText('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), {
-    'User-Agent': UA,
-  }, timeoutMs);
-}
-
-async function raceValid(fns, valid) {
-  const jobs = fns.map((fn) => (async () => {
-    let html = '';
-    try { html = await fn(); } catch (e) { html = ''; }
-    if (valid(html)) return html;
-    throw new Error('invalid page');
-  })());
-  return Promise.any(jobs);
-}
-
-async function getPage(url, kind) {
-  const valid = kind === 'detail' ? validDetailPage : validListPage;
-  const wave1 = [
-    () => viaOwnFetch(url, 12000),
-    () => viaFetch(url, 12000),
-    () => viaReq(url, 12000),
-    () => viaHttps(url, 12000),
-    () => viaWorkersDemo(url, 12000),
-    () => viaJina(url, 12000),
-    () => viaAlloriginsGet(url, 15000),
-  ];
-  try {
-    const html = await raceValid(wave1, valid);
-    notePrefix(html);
-    return html;
-  } catch (e) { /* 第一波全灭, 进第二波 */ }
-  const wave2 = [
-    () => viaAlloriginsRaw(url, 15000),
-    () => viaCodetabs(url, 12000),
-    () => viaJina(url, 10000),
-    () => viaWorkersDemo(url, 10000),
-  ];
-  try {
-    const html = await raceValid(wave2, valid);
-    notePrefix(html);
-    return html;
-  } catch (e) { /* 全灭: 回空, 不再回未校验残页 */ }
-  return '';
-}
-
-// ---------------- 解析 ----------------
-// 卡片: <article class="thumb-block ..."> 内 a.archive-entry(href,title)
-// + img[data-lazy-src] + span.duration / span.views
-function parseCards(html) {
+// ---------------- 解析 (严格层 + 宽松层) ----------------
+// 严格层: 沿用旧解析 (2026-10-22 当日页面复核: <article class=
+// "thumb-block ..."> + <a class="archive-entry" href title> 形态未变)。
+function parseCardsStrict(html) {
   const out = [];
   const seen = new Set();
   const blocks = String(html || '').split('<article');
@@ -339,6 +108,72 @@ function parseCards(html) {
   return out;
 }
 
+// 宽松层: 不假设属性顺序与绝对地址 —— 任何指向 /video/... 的锚点
+// 都收, 标题依次从 title 属性 / img alt / 锚内文本 / slug 兜底,
+// 封面从锚后窗口内的 data-lazy-src / data-wpsrc / img src 取。
+function parseCardsLoose(html) {
+  const out = [];
+  const seen = new Set();
+  const h = String(html || '');
+  const re = /<a\b[^>]*?href\s*=\s*["']((?:https?:\/\/(?:www\.)?javhdporn\.net)?\/video\/[^"']+)["'][^>]*>/gi;
+  let m;
+  while ((m = re.exec(h)) !== null) {
+    let url = m[1];
+    if (url.startsWith('/')) url = HOST + url;
+    url = url.replace(/^http:\/\//, 'https://');
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const tag = m[0];
+    const win = h.slice(m.index, m.index + 1800);
+    let name = '';
+    const tm = tag.match(/title\s*=\s*"([^"]+)"/) || tag.match(/title\s*=\s*'([^']+)'/);
+    if (tm) name = clean(tm[1]);
+    if (!name) {
+      const altM = win.match(/<img[^>]+alt="([^"]{4,})"/);
+      if (altM) name = clean(altM[1]);
+    }
+    if (!name) {
+      const txtM = win.match(/<header class="entry-header">\s*<span>([^<]{4,})<\/span>/);
+      if (txtM) name = clean(txtM[1]);
+    }
+    if (!name) name = url.split('/video/')[1].replace(/\//g, '');
+    let pic = '';
+    const lazyM = win.match(/data-lazy-src="(https:[^"]+)"/);
+    if (lazyM) pic = lazyM[1].replace('pics.pornfhd.com/s/', 'pics.pornfhd.com/');
+    if (!pic) {
+      const wpM = win.match(/data-wpsrc="(https:[^"]+)"/);
+      if (wpM) pic = wpM[1];
+    }
+    if (!pic) {
+      const srcM = win.match(/<img[^>]+src="(https:[^"]+)"/);
+      if (srcM && !srcM[1].startsWith('data:')) pic = srcM[1];
+    }
+    const durM = win.match(/class="duration"[^>]*>(?:<[^>]+>)*\s*([0-9:]+)/);
+    const badgeM = win.match(/class="hd-video"[^>]*>([^<]+)</);
+    out.push({
+      vod_id: url,
+      vod_name: name,
+      vod_pic: pic,
+      vod_remarks: durM ? durM[1] : (badgeM ? clean(badgeM[1]) : ''),
+    });
+  }
+  return out;
+}
+
+// 合并: 严格层优先 (同 URL 以严格层为准), 宽松层补严格层漏掉的卡。
+function parseCardsEx(html) {
+  const strict = parseCardsStrict(html);
+  const byUrl = new Map(strict.map(c => [c.vod_id, c]));
+  let looseOnly = 0;
+  for (const c of parseCardsLoose(html)) {
+    if (!byUrl.has(c.vod_id)) { byUrl.set(c.vod_id, c); looseOnly++; }
+  }
+  return { list: [...byUrl.values()], strict: strict.length, looseOnly };
+}
+function parseCards(html) {
+  return parseCardsEx(html).list;
+}
+
 function pagecountOf(html) {
   let max = 1;
   const re = /\/page\/(\d+)\//g;
@@ -357,11 +192,301 @@ function og(html, prop) {
   return m ? clean(m[1]) : '';
 }
 
+// ---------------- 抓取层 (分层竞速 + 逐通道归因) ----------------
+// 每条通道统一回 {status, body, upst?, note?}: status 为该通道实测
+// HTTP 状态 (0 = 网络错误/超时); fetchPage 把每条通道的 状态/字节/
+// 解卡数/耗时/判定 全部记进 outcomes, 胜出与失败都可归因。
+const BROWSER_HEADERS = {
+  'User-Agent': UA,
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+  'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Upgrade-Insecure-Requests': '1',
+};
+
+function isShellPage(s) {
+  return /Attention Required|Just a moment|cf-challenge|Checking your browser/i.test(s || '');
+}
+function validListPage(html) {
+  return !!html && !isShellPage(html) && parseCards(html).length > 0;
+}
+function validDetailPage(html) {
+  return !!html && !isShellPage(html) && html.length > 4000 &&
+    (/property="og:(title|image)"/.test(html) || html.includes('videojs.html') || html.includes('data-mpu'));
+}
+function validFor(kind, html) {
+  return kind === 'detail' ? validDetailPage(html) : validListPage(html);
+}
+
+async function fetchRaw2(url, headers, timeoutMs, method, body) {
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), timeoutMs || 10000);
+  try {
+    const r = await fetch(url, { headers, signal: ctl.signal, redirect: 'follow', method: method || 'GET', body });
+    const text = await r.text();
+    return { status: r.status, body: r.ok ? text : '', rawBytes: text.length };
+  } catch (e) {
+    return { status: 0, body: '', err: (e && e.name === 'AbortError') ? 'timeout' : String((e && e.message) || e) };
+  } finally { clearTimeout(to); }
+}
+
+// 第一通道: 自有 Worker 跳板 pornfhd-fetch (蜘蛛 -> 用户 Worker -> 站点)
+const OWN_HOST_RE = /(^|\.)(javhdporn\.net|bestjavporn\.com|pornfhd\.com)$/i;
+async function chOwn(url, timeoutMs) {
+  try {
+    if (!OWN_HOST_RE.test(new URL(url).hostname)) return { status: 0, body: '', note: '白名单外跳过' };
+  } catch (e) { return { status: 0, body: '', note: 'URL非法' }; }
+  const w = OWN_FETCH + '/get?u=' + encodeURIComponent(url) + '&ref=' + encodeURIComponent(REFERER);
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), timeoutMs || 10000);
+  try {
+    const r = await fetch(w, { headers: { 'User-Agent': UA }, signal: ctl.signal, redirect: 'follow' });
+    const text = await r.text();
+    return { status: r.status, body: r.ok ? text : '', rawBytes: text.length, upst: r.headers.get('x-pornfhd-upst') || '' };
+  } catch (e) {
+    return { status: 0, body: '', err: (e && e.name === 'AbortError') ? 'timeout' : String((e && e.message) || e) };
+  } finally { clearTimeout(to); }
+}
+
+async function chFetch(url, timeoutMs) {
+  return fetchRaw2(url, { ...BROWSER_HEADERS, Referer: REFERER }, timeoutMs);
+}
+
+async function chReq(url, timeoutMs) {
+  try {
+    const r = await req.get(url, {
+      headers: { 'User-Agent': UA, Referer: REFERER },
+      timeout: timeoutMs || 10000,
+    });
+    const status = (r && typeof r.status === 'number') ? r.status : 200;
+    const d = typeof r === 'string' ? r : (r && r.data !== undefined ? r.data : r);
+    return { status, body: typeof d === 'string' ? d : '' };
+  } catch (e) {
+    const st = e && e.response && typeof e.response.status === 'number' ? e.response.status : 0;
+    return { status: st, body: '', err: String((e && e.message) || e) };
+  }
+}
+
+// 原生 https 栈 (独立代码路径; 手工重定向 + 解压)
+function chHttps(url, timeoutMs, depth = 0) {
+  return new Promise((resolve) => {
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const u = new URL(url);
+      const rq = https.request({
+        hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
+        headers: { ...BROWSER_HEADERS, Referer: REFERER, 'Accept-Encoding': 'gzip, deflate, br' },
+        timeout: timeoutMs || 10000,
+      }, (res) => {
+        const loc = res.headers.location;
+        if (res.statusCode >= 300 && res.statusCode < 400 && loc && depth < 3) {
+          res.resume();
+          fin(chHttps(new URL(loc, url).toString(), timeoutMs, depth + 1));
+          return;
+        }
+        if (res.statusCode !== 200) { res.resume(); fin({ status: res.statusCode || 0, body: '' }); return; }
+        let stream = res;
+        const enc = String(res.headers['content-encoding'] || '');
+        try {
+          if (enc.includes('gzip')) stream = res.pipe(zlib.createGunzip());
+          else if (enc.includes('deflate')) stream = res.pipe(zlib.createInflate());
+          else if (enc.includes('br')) stream = res.pipe(zlib.createBrotliDecompress());
+        } catch (e) { /* 解压失败则按原文读 */ }
+        const chunks = [];
+        stream.on('data', (c) => chunks.push(c));
+        stream.on('end', () => fin({ status: 200, body: Buffer.concat(chunks).toString('utf8') }));
+        stream.on('error', () => fin({ status: 200, body: '', err: 'stream error' }));
+      });
+      rq.on('timeout', () => { rq.destroy(); fin({ status: 0, body: '', err: 'timeout' }); });
+      rq.on('error', (e) => fin({ status: 0, body: '', err: String((e && e.message) || e) }));
+      rq.end();
+    } catch (e) { fin({ status: 0, body: '', err: String((e && e.message) || e) }); }
+  });
+}
+
+// workers.dev 公共 demo 通道须喂规范 URL: /category|search 前的版本
+// 前缀从成功页面学习 (默认 /v3, 站方改版自动跟随)。
+let learnedPrefix = '/v3';
+function notePrefix(html) {
+  const m = String(html || '').match(/javhdporn\.net(\/v\d+)\/(?:category|search)\//);
+  if (m) learnedPrefix = m[1];
+}
+function wdTarget(url) {
+  try {
+    const u = new URL(url);
+    if (/^\/(category|search)\//.test(u.pathname)) u.pathname = learnedPrefix + u.pathname;
+    return u.toString();
+  } catch (e) { return url; }
+}
+async function chDemo(url, timeoutMs) {
+  return fetchRaw2('https://test.cors.workers.dev/?' + wdTarget(url), {
+    'User-Agent': UA, 'X-Requested-With': 'XMLHttpRequest', Origin: HOST,
+  }, timeoutMs);
+}
+
+async function chJina(url, timeoutMs) {
+  return fetchRaw2('https://r.jina.ai/' + url, {
+    'User-Agent': UA,
+    'x-respond-with': 'html',
+  }, timeoutMs);
+}
+
+async function chAoGet(url, timeoutMs) {
+  const r = await fetchRaw2('https://api.allorigins.win/get?url=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, timeoutMs);
+  if (!r.body) return r;
+  try {
+    const j = JSON.parse(r.body);
+    return { status: r.status, body: typeof j.contents === 'string' ? j.contents : '' };
+  } catch (e) { return { status: r.status, body: '' }; }
+}
+
+async function chAoRaw(url, timeoutMs) {
+  return fetchRaw2('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, timeoutMs);
+}
+
+async function chCodetabs(url, timeoutMs) {
+  return fetchRaw2('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, timeoutMs);
+}
+
+// 分层竞速: 第一波 (自有 Worker 为首) -> 第二波 (慢中转兜底)。
+// 第一个通过解析型校验的响应立即胜出; 全部通道的实测结果记入
+// outcomes 供诊断卡归因。总截止 deadlineMs, 到点未齐按现有结果裁定。
+async function fetchPage(url, kind, deadlineMs) {
+  const t0 = Date.now();
+  const budget = deadlineMs || 24000; // 全局总截止 (两波共享)
+  const outcomes = [];
+  let winner = null;
+  let resolveWin;
+  const winP = new Promise((r) => { resolveWin = r; });
+  const judge = (name, res, ms) => {
+    const body = (res && res.body) || '';
+    const oc = {
+      name,
+      status: (res && res.status) || 0,
+      upst: (res && res.upst) || '',
+      bytes: body.length || (res && res.rawBytes) || 0,
+      ms,
+      ok: false,
+      note: (res && res.note) || '',
+      err: (res && res.err) || '',
+    };
+    if (kind !== 'detail') {
+      oc.cards = body ? parseCards(body).length : 0;
+    }
+    oc.ok = validFor(kind, body);
+    outcomes.push(oc);
+    if (oc.ok && !winner) { winner = { html: body, oc }; resolveWin(winner); }
+    return oc;
+  };
+  const runWave = async (wave) => {
+    const jobs = wave.map(([name, fn, to]) => (async () => {
+      const t0 = Date.now();
+      let res;
+      try { res = await fn(url, to); } catch (e) { res = { status: 0, body: '', err: String((e && e.message) || e) }; }
+      return judge(name, res, Date.now() - t0);
+    })());
+    const all = Promise.allSettled(jobs);
+    const remain = Math.max(3000, budget - (Date.now() - t0));
+    const deadline = new Promise((r) => setTimeout(r, remain));
+    await Promise.race([winP, all, deadline]);
+  };
+  const wave1 = [
+    ['own', chOwn, 10000],
+    ['fetch', chFetch, 10000],
+    ['req', chReq, 10000],
+    ['https', chHttps, 10000],
+    ['demo', chDemo, 10000],
+    ['jina', chJina, 12000],
+    ['aoGet', chAoGet, 12000],
+  ];
+  await runWave(wave1);
+  if (!winner) {
+    const wave2 = [
+      ['aoRaw', chAoRaw, 12000],
+      ['codetabs', chCodetabs, 10000],
+      ['jina2', chJina, 8000],
+      ['demo2', chDemo, 8000],
+    ];
+    await runWave(wave2);
+  }
+  if (winner) {
+    notePrefix(winner.html);
+    const ex = kind !== 'detail' ? parseCardsEx(winner.html) : null;
+    return { html: winner.html, win: winner.oc, outcomes, looseOnly: ex ? ex.looseOnly : 0 };
+  }
+  return { html: '', win: null, outcomes, looseOnly: 0 };
+}
+
+// 兼容旧签名: 只要正文 (详情/播放内部用)
+async function getPage(url, kind) {
+  const r = await fetchPage(url, kind || 'list');
+  return r.html;
+}
+
+// ---------------- 诊断卡 ----------------
+// home / 分类首行: 卡名 = 本页命中的通道 + 出卡数; 全灭时卡名带回
+// 各通道状态码与解卡数 (如 own:200/0卡 = 通道活着但解析为 0,
+// own:0 = 通道本身没通)。点开诊断卡 -> detail 给完整明细表。
+function diagCardName(res, cardCount) {
+  if (res && res.win) {
+    let s = `诊断 ${res.win.name} ${res.win.status} · ${cardCount}卡`;
+    if (res.win.upst) s += `·上游${res.win.upst}`;
+    if (res.looseOnly) s += '·含宽松解析';
+    return s;
+  }
+  const parts = (res ? res.outcomes : []).map((o) => {
+    const st = o.status ? String(o.status) : (o.err ? 'ERR' : '0');
+    return o.cards !== undefined ? `${o.name}:${st}/${o.cards}卡` : `${o.name}:${st}`;
+  });
+  return ('诊断 全通道失败 ' + parts.join(' ')).slice(0, 190);
+}
+function diagCard(res, cardCount) {
+  return {
+    vod_id: DIAG_ID,
+    vod_name: diagCardName(res, cardCount),
+    vod_pic: '',
+    vod_remarks: '诊断卡·点开看通道明细',
+  };
+}
+function diagText(url, res) {
+  const lines = [];
+  lines.push('取数通道明细');
+  lines.push('目标: ' + url);
+  lines.push('时间: ' + new Date().toISOString());
+  if (res.win) lines.push(`胜出: ${res.win.name} 状态${res.win.status} ${res.win.ms}ms`);
+  else lines.push('胜出: 无 (全通道失败)');
+  for (const o of res.outcomes) {
+    lines.push(`${o.name}: 状态${o.status || 'ERR'} ${o.bytes}B ${o.ms}ms` +
+      (o.cards !== undefined ? ` 解卡${o.cards}` : '') +
+      (o.upst ? ` 上游${o.upst}` : '') +
+      (o.ok ? ' ✓合格' : '') +
+      (o.note ? ' ' + o.note : '') +
+      (o.err ? ' ' + o.err : ''));
+  }
+  const missing = ['own', 'fetch', 'req', 'https', 'demo', 'jina', 'aoGet', 'aoRaw', 'codetabs']
+    .filter((n) => !res.outcomes.some((o) => o.name === n || o.name === n + '2'));
+  if (missing.length) lines.push('未及返回 (竞速已胜出或总截止): ' + missing.join(' '));
+  lines.push('判读: 200/0卡=通道通但解析为零; 403/5xx=通道被拒; ERR/timeout=通道不通; own=自有Worker, demo=公共cors演示, jina/ao/codetabs=公共中转, fetch/req/https=直连三栈。');
+  return lines.join('\n');
+}
+
+// ---------------- URL 构造 ----------------
 function catUrl(tid, page) {
   const base = `${HOST}/category/${tid}/`;
   return page > 1 ? `${base}page/${page}/` : base;
 }
-
 function searchUrl(kw, page) {
   const base = `${HOST}/search/${encodeURIComponent(kw)}/`;
   return page > 1 ? `${base}page/${page}/` : base;
@@ -374,26 +499,46 @@ async function init(reqIn) {
 
 async function home(reqIn) {
   const cls = CATS.map(c => ({ type_id: c.type_id, type_name: c.type_name }));
-  const html = await getPage(HOST + '/');
-  const list = html ? parseCards(html).slice(0, 30) : [];
-  return { class: cls, list };
+  const url = HOST + '/';
+  const res = await fetchPage(url, 'list');
+  const list = res.html ? parseCards(res.html).slice(0, 30) : [];
+  return { class: cls, list: [diagCard(res, list.length), ...list] };
 }
 
 async function category(reqIn) {
   const body = reqIn?.body || {};
   const tid = t(body.tid || body.id) || CATS[0].type_id;
   const page = Math.max(1, parseInt(body.page, 10) || 1);
-  const html = await getPage(catUrl(tid, page));
-  if (!html) return { page, pagecount: page, limit: 24, total: 0, list: [] };
-  const list = parseCards(html);
-  const pc = pagecountOf(html);
-  return { page, pagecount: Math.max(pc, page), limit: 24, total: list.length, list };
+  const url = catUrl(tid, page);
+  const res = await fetchPage(url, 'list');
+  if (!res.html) {
+    return { page, pagecount: page, limit: 24, total: 0, list: [diagCard(res, 0)] };
+  }
+  const list = parseCards(res.html);
+  const pc = pagecountOf(res.html);
+  return { page, pagecount: Math.max(pc, page), limit: 24, total: list.length, list: [diagCard(res, list.length), ...list] };
 }
 
 async function detail(reqIn) {
   const body = reqIn?.body || {};
   const id = t(body.id);
   if (!id) return { list: [] };
+  if (id === DIAG_ID) {
+    const url = HOST + '/';
+    const res = await fetchPage(url, 'list');
+    const cards = res.html ? parseCards(res.html).length : 0;
+    return {
+      list: [{
+        vod_id: DIAG_ID,
+        vod_name: diagCardName(res, cards),
+        vod_pic: '',
+        vod_remarks: '通道诊断',
+        vod_content: diagText(url, res),
+        vod_play_from: '诊断',
+        vod_play_url: '状态$' + DIAG_ID,
+      }],
+    };
+  }
   const durl = /^https?:\/\//.test(id) ? id : HOST + (id.startsWith('/') ? id : '/' + id);
   const html = await getPage(durl, 'detail');
   if (!html) return { list: [] };
@@ -414,7 +559,9 @@ async function detail(reqIn) {
       vod_remarks: remarks,
       vod_content: desc,
       vod_play_from: 'JAVHDPorn',
-      vod_play_url: `正片$${durl}`,
+      // 线路家族标注: 本站铸造链依赖客户端 JS, 蜘蛛内不可复现,
+      // 唯一线路为 WebView 嗅探详情页 (家族: 嗅探)。
+      vod_play_url: `正片·嗅探$${durl}`,
     }],
   };
 }
@@ -423,8 +570,9 @@ async function play(reqIn) {
   const body = reqIn?.body || {};
   const id = t(body.id);
   if (!id) return { parse: 0, url: '' };
+  if (id.includes(DIAG_ID)) return { parse: 0, url: '' };
   const durl = /^https?:\/\//.test(id) ? id.split('$').pop() : HOST + id;
-  // 1) 自建中转 (部署后生效): 中转铸造 + 解出 tapecontent 直链
+  // 1) 自建中转 (部署后生效): 中转铸造 + 解出直链
   if (RELAY) {
     try {
       const ctl = new AbortController();
@@ -448,10 +596,10 @@ async function search(reqIn) {
   const kw = t(body.wd || body.keyword || body.key);
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!kw) return { page, pagecount: 1, limit: 24, total: 0, list: [] };
-  const html = await getPage(searchUrl(kw, page));
-  if (!html) return { page, pagecount: page, limit: 24, total: 0, list: [] };
-  const list = parseCards(html);
-  const pc = pagecountOf(html);
+  const res = await fetchPage(searchUrl(kw, page), 'list');
+  if (!res.html) return { page, pagecount: page, limit: 24, total: 0, list: [] };
+  const list = parseCards(res.html);
+  const pc = pagecountOf(res.html);
   return { page, pagecount: Math.max(pc, page), limit: 24, total: list.length, list };
 }
 

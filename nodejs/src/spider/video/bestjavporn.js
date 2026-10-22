@@ -2,92 +2,58 @@
 // 暂用名: 站方品牌 BestJavPorn (用户可改)。
 //
 // 站点性质: WordPress + WP-Script RetroTube 主题的 JAV 聚合站, 服务端渲染,
-// 全站公开免费 (无登录/无付费墙, WP REST API 对匿名锁定但页面全开)。
-// 列表卡片 article.thumb-block.loop-video; 分类体系 = 精选分类 17 +
-// 片商 195 + 标签 265 (共 477, 2026-10-21 逐个实测第一页有视频才收,
-// 站方 /categories/ /studios/ /tags/ 索引为据; 女优索引数百页未全量收)。
-// 封面 pics.pornfhd.com 直连无防盗链 (VM 实测 200, 不需要图片代理;
-// bagua-img-proxy 对该域不在白名单, 勿用)。
+// 全站公开免费 (无登录/无付费墙, 页面全开)。
+// 封面 pics.pornfhd.com 直连无防盗链 (VM 实测 200, 不需要图片代理)。
 //
-// 播放链 (2026-10-21 完整逆向 + VM 全链验证):
-//   详情页 #video-player 的 data-mpu + video-id(post_id)
+// 播放链 (2026-10-21 完整逆向, 2026-10-22 侦察复核未变):
+//   详情页 #video-player 的 data-mpu + #video-player-area 的 video-id
+//   (post_id; 今日实况仍为 video-id 属性, 无 data-real-id)
 //   -> token = dex(post_id, data-mpu)
 //   -> POST /api/play/ (sources=token&ver=2) 得 {data, reserve, lo}
-//   -> 主线路径 = dex(post_id, data); 备线 = dex(post_id, reserve) 解出
-//      JSON [{data, lo}...], 每条再 dex 得路径 (区域线 lo=sg/de/nl/fr/...)
-//   -> 路径形如 //video{,1}.bestjavporn.com/p/{code}?t=..&s=..
-//   -> GET 该 embed 页取 data-config, 解密得 {src, img, vtt}:
-//      sources = JSON.parse(b64decode(src)) -> [{file, type, label}]
+//   -> 主线/备线路径各经 dex 解出 //video{,1}.bestjavporn.com/p/{code}
+//      或第三方 embed 前置站 (今日实测新增 hugstream.xyz, 解密同构)
+//   -> GET embed 页取 data-config, 解密得 sources [{file,type,label}]。
 //   dex(seed, data) = b64decode( RC4( key, b64decode(data) ) ),
 //      key = reverse( b64encode( seed + '_0x58fe15' ) )       (cast.js)
-//   embed 配置解密同构 (video 页 main.js):
+//   embed 配置解密同构 (video main.js):
 //      key = reverse( b64encode( b64encode(pathname+search).substr(4,20)
-//             + '_0x59a0e4' ) ), 明文 = b64decode 后的 {src,...} JSON。
-//   两组样本 (SHIND-116 / ACHJ-103) token 与明文逐字节对齐验证通过,
-//   FC2 样本纯 Node 全链跑通 (主线 + 5 条区域备线全部解出)。
+//             + '_0x59a0e4' ) )。
+//   2026-10-22 侦察: 经自有 Worker POST 铸造 6/6 片 status:true;
+//   embed 宿主分布: video/video1.bestjavporn.com (站内) + hugstream.xyz
+//   (前置, 解出 streamhls/pianopic/acek-cdn 文件), MaxStream 仍在。
+//   线的令牌多为 IP 绑定型: 整条链在 App 内 (设备同一出口) 完成才
+//   自洽, 故 play 时现场重铸 (详情只把线路序号编进 play id)。
 //
-// 宿主线 (逐片不同, 详情里逐线标注宿主名):
-//   - MaxStream (HLS, AES-128 标准 EXT-X-KEY 加密): VM 同会话实拉
-//     master+变体+key+首分片, AES 解密后 0x47/188 对齐真 TS —— 全验通。
-//     单档 720p (master 只有一档)。
-//   - CloudDataCDN (MP4 直链): VM 实测 206 Partial Content / video/mp4。
-//   - StreamTape (MP4): get_video 302 跳 tapecontent 成立; 终跳文件对
-//     "取 302 的 IP" 绑定, VM 轮换出口下 403 unauthorized —— 设备单 IP
-//     环境应自洽, VM 无法字节级终验 (如实标注)。
-//   - StreamHLS / PianoPic (HLS): VM 出口拉 master 即 403 (铸造后立即
-//     拉亦然), 疑出口/区域门禁更严; 设备侧结果未知, 排在末尾作备线。
-//   线的令牌多为 IP 绑定型: 整条链在 App 内 (设备同一出口) 完成才自洽,
-//   故 play 时现场重铸 (详情只把线路序号编进 play id, 不缓存流地址)。
-//   播放器不转发 header 给分片的限制对本源无影响: 各线均为 URL 自带
-//   令牌的直链, 分片不依赖蜘蛛给的 Referer (MaxStream 线 VM 实拉时
-//   带了 Referer, 未验无 Referer 形态 —— 真机风险项之一)。
-//
-// 2026-10-21 第三轮修复 (与 javhdporn 同病同方):
-//   真机故障根因 (VM 实测坐实): 本站 (与 javhdporn 同运营网络) 的
-//   Cloudflare 按 User-Agent 拉黑 HTTP 库特征 UA —— okhttp / Java /
-//   axios / node-fetch / python-requests 等一律 403, 只回 17B~5.5KB
-//   空壳页; 浏览器 UA 则 200 满页。App 运行时发出的请求带的正是
-//   这类被拉黑的 UA (蜘蛛设置的 Chrome UA 未能生效到站方), 于是
-//   真机上所有页面抓取都只拿到 403 空壳 -> 解析 0 卡 -> "有分类、
-//   无内容、点不开"。其他源 (Brazz/javideo/7mmtv) 的 CF 区没有
-//   这条规则, 故独这两站全灭。版本前缀 /v{n}/ 经实测不是病因:
-//   旧版本路径 (v2/v3/v9) 至今仍回真实内容页。
-//   对策: GET/POST 抓取全部改为多层兜底 + 内容校验 + 胜出层记忆:
-//   直连 req -> 直连 fetch -> jina 读页 (x-respond-with:html 取
-//   原始 HTML, 实测 1~2s 满页保真) -> allorigins -> codetabs;
-//   POST /api/play/ 走 直连 req -> 直连 fetch -> allorigins 转发。
-//   铸造链若最终仍拿不到线路, play 落 parse:1 嗅探详情页兜底
-//   (真机 WebView 是真实浏览器, 站方 cast 链可在页内原生跑通)。
-// 2026-10-22 第四轮 (与 javhdporn 同步): 第三轮的串行逐层试错在
-//   真机上仍被拖死 (用户复报: 分类能出、内容加载不出)。VM 复测
-//   坐实 allorigins / codetabs 抽风时各回 522 且各烧 20~30s, 串行
-//   叠加 (直连两败 + 两中转) 轻松超过 App 等待耐心。本轮 GET 与
-//   POST 全部改并行竞速、首个合格响应胜出 (jina 实测 0.3~2s 全
-//   覆盖), 中转只作 B 组/末位兜底并封顶; validPlayResp 收紧为
-//   status===true, 防 allorigins 丢 body 的假成功抢答。
-// 2026-10-22 第五轮: 第四轮真机仍全灭 —— 见抓取层上方长注:
-//   通道池扩容 (workers.dev + allorigins/get + 原生 https 栈)、
-//   校验改解析型、慢中转降第二波。根因裁定区分实测/推导, 详见
-//   catfix_jhp_bjp_r3.md。
-// 2026-10-22 第六轮: 第五轮真机仍全灭 —— 公共通道 (含 cors demo)
-//   在用户服务端出口下三轮证明不可靠。本轮 GET 与 POST /api/play/
-//   的第一通道改为用户自有取页跳板 pornfhd-fetch (自己的
-//   Cloudflare Worker; 猫源调自有 Worker 的跳板形态已在 JAVSB/
-//   BBH 真机验通, Workers 出口取 pornfhd 页已由 cors demo 实测
-//   可行)。原竞速池全部保留为后续位: Worker 未部署时自有通道
-//   自动落空, 行为不劣于第五轮。详见 catfix_jhp_bjp_r4.md。
+// 2026-10-22 第七轮 (删除重写, 与 javhdporn 同步):
+// 前四轮本地 harness 全过、真机全灭且不可归因。本轮按当日实况重写:
+//   ① 取数分层、逐通道归因 (状态码/字节/解卡数/耗时全记录);
+//   ② home 与每个分类首行放诊断卡 (vod_id=__diag__), 卡名写命中
+//      通道与出卡数, 全灭时带回各通道状态; 点开可见完整明细表;
+//   ③ 解析双层 (严格层沿用旧解析 + 宽松层属性顺序无关), 页面
+//      变体解 0 卡时宽松层接住并在诊断卡标注;
+//   ④ 分类 type_id 内嵌的 /v{n}/ 前缀会漂移 (今日无前缀请求已跳
+//      /v43/, 表内 /v42/ 尚可用): 分类出 0 卡时自动用无前缀路径
+//      重试一次 (站方 301 到当前前缀), 诊断卡标注;
+//   ⑤ 详情线路名标注来源家族 (宿主 + 区域线 lo); 铸造失败时嗅探
+//      兜底线名带失败阶段 (详情未取到/无种子/铸造通道不通/
+//      铸造被站方拒/embed未解出), 真机截图即可定位死点;
+//   ⑥ 播放铸造/解包算法与旧版逐字沿用 (本地验通的部分不动)。
 import req from '../../util/req.js';
+import https from 'https';
+import zlib from 'zlib';
 
 const KEY = 'py_bestjavporn';
 const NAME = 'BestJavPorn';
 const HOST = 'https://www.bestjavporn.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const REFERER = HOST + '/';
-// 自有取页跳板 pornfhd-fetch (用户部署在自己的 Cloudflare Workers)
+// 自有取页跳板 pornfhd-fetch (用户自有 Cloudflare Worker, 第一通道)
 const OWN_FETCH = 'https://pornfhd-fetch.li768435813.workers.dev';
+const DIAG_ID = '__diag__';
 
-// 分类: type_id = 站方规范路径 (含 /v{n}/ 版本前缀, 站方 301 的落点);
-// 2026-10-21 逐个抓取第一页验卡 (有视频才收), 顺序: 精选分类 / 片商 / 标签。
+// 分类: type_id = 站方规范路径 (含 /v{n}/ 版本前缀); 精选分类 /
+// 片商 / 标签共 477 个, 逐个实测第一页有视频才收 (表体由构建脚本
+// 从上一版逐字拼入, 本轮未增删)。
 const CATS = [
 {
 "type_id": "/v42/category/censored/",
@@ -2020,343 +1986,9 @@ function absUrl(u) {
   return HOST + (u.startsWith('/') ? u : '/' + u);
 }
 
-// ---------- 抓取层 (第五轮: 解析型校验 + 扩容通道池竞速) ----------
-// 2026-10-22 第五轮 (与 javhdporn 同步)。第四轮真机仍全灭后, 逐
-// 通道原始应答复测 (VM 出口, 原始应答与校验判定分开记录):
-//   直连 fetch、jina(html 模式): 两站均 200 真页 (0.1~2s);
-//   allorigins /raw、codetabs: 当日全程 522 (各烧约 20s);
-//   allorigins /get (JSON 包装, 旧版未用): 对本站可用 (2/2 真页,
-//     7~8s), 对 javhdporn 被其出口挡 —— 两站区域规则不一致;
-//   新通道 test.cors.workers.dev (Cloudflare 官方 CORS demo, 须带
-//     X-Requested-With 头): GET 对规范 URL 直出真页且极快
-//     (0.1~1.5s); POST /api/play/ 转发 body 后回本站真 JSON
-//     (status:true, 与直连应答逐字节一致, 120ms) —— GET/POST
-//     双通道成立。但目标 URL 若会 301 (如 /search/ 的无前缀
-//     形态), 它回自己的说明页, 故该通道对 /search/ 喂学习到的
-//     规范前缀 (从成功页面的 /v{n}/ 链接学习);
-//   框架 req (axios) 在 VM 沙箱被出口代理 ECONNRESET (连
-//     httpbin 都挂), 属沙箱假象; 其线上 UA 经回显实测确为蜘蛛
-//     所设 Chrome UA —— 前轮"蜘蛛 UA 不生效"无直接证据, 本轮
-//     按"多栈并存、不押单栈"设计。
-// (推导, 非实测) 真机全灭的最合理解释仍是出口差异: 用户运行时
-// 出口下直连各栈与 jina (大陆不可达) 同时失效时, 第四轮只剩
-// 当时全 522 的中转组。本轮对策与 javhdporn 同构: 通道池扩容
-// (workers.dev + allorigins/get + 原生 https 栈) 全部竞速;
-// 校验改解析型 (列表=能解出卡片, 详情=带 data-mpu/og 标记,
-// embed=带 data-config), 杜绝误杀与误收; 慢中转只进第二波且
-// 封顶; 全灭回空, 不再回未校验残页。
-// 第六轮 (2026-10-22): GET/POST 第一通道改自有 Worker 跳板
-// pornfhd-fetch (见文件头注), 其余不变。
-import https from 'https';
-import zlib from 'zlib';
-
-function isShellPage(s) {
-  return /Attention Required|Just a moment|cf-challenge|Checking your browser/i.test(s || '');
-}
-// 解析型校验 (parseCards 为函数声明, 已提升)
-function validListPage(html) {
-  return !!html && !isShellPage(html) && parseCards(html).length > 0;
-}
-function validDetailPage(html) {
-  return !!html && !isShellPage(html) && html.length > 4000 &&
-    (html.includes('data-mpu') || html.includes('video-id=') || /property="og:title"/.test(html));
-}
-function validEmbedPage(html) {
-  return !!html && !isShellPage(html) && html.length > 200 && html.includes('data-config');
-}
-function validFor(url, html, kind) {
-  if (kind === 'detail') return validDetailPage(html);
-  if (kind === 'embed') return validEmbedPage(html);
-  return validListPage(html);
-}
-
-async function fetchRaw(url, headers, timeout, method, body) {
-  const ctl = new AbortController();
-  const to = setTimeout(() => ctl.abort(), timeout || 12000);
-  try {
-    const r = await fetch(url, { headers, signal: ctl.signal, redirect: 'follow', method: method || 'GET', body });
-    if (!r.ok) return '';
-    return await r.text();
-  } catch (e) {
-    return '';
-  } finally { clearTimeout(to); }
-}
-
-async function viaReqGet(url, headers, timeout) {
-  try {
-    const { data, status } = await req.get(url, { headers, timeout: timeout || 12000 });
-    if ((!status || status === 200) && data != null && data !== '') {
-      return typeof data === 'string' ? data : JSON.stringify(data);
-    }
-  } catch (e) { /* 落空 */ }
-  return '';
-}
-
-// 原生 https 栈 (独立代码路径; 手工重定向 + 解压)
-function viaHttps(url, headers, timeoutMs, depth = 0) {
-  return new Promise((resolve) => {
-    let done = false;
-    const fin = (v) => { if (!done) { done = true; resolve(v); } };
-    try {
-      const u = new URL(url);
-      const rq = https.request({
-        hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
-        headers: { ...headers, 'Accept-Encoding': 'gzip, deflate, br' },
-        timeout: timeoutMs || 12000,
-      }, (res) => {
-        const loc = res.headers.location;
-        if (res.statusCode >= 300 && res.statusCode < 400 && loc && depth < 3) {
-          res.resume();
-          fin(viaHttps(new URL(loc, url).toString(), headers, timeoutMs, depth + 1));
-          return;
-        }
-        if (res.statusCode !== 200) { res.resume(); fin(''); return; }
-        let stream = res;
-        const enc = String(res.headers['content-encoding'] || '');
-        try {
-          if (enc.includes('gzip')) stream = res.pipe(zlib.createGunzip());
-          else if (enc.includes('deflate')) stream = res.pipe(zlib.createInflate());
-          else if (enc.includes('br')) stream = res.pipe(zlib.createBrotliDecompress());
-        } catch (e) { /* 按原文读 */ }
-        const chunks = [];
-        stream.on('data', (c) => chunks.push(c));
-        stream.on('end', () => fin(Buffer.concat(chunks).toString('utf8')));
-        stream.on('error', () => fin(''));
-      });
-      rq.on('timeout', () => { rq.destroy(); fin(''); });
-      rq.on('error', () => fin(''));
-      rq.end();
-    } catch (e) { fin(''); }
-  });
-}
-
-// workers.dev 通道: /search/ 需规范前缀 (从成功页学习; 分类路径
-// 的 type_id 本就带前缀, 详情 /video/ 本就规范, 均不改写)
-let learnedPrefix = '';
-function notePrefix(html) {
-  const m = String(html || '').match(/bestjavporn\.com(\/v\d+)\/search\//);
-  if (m) { learnedPrefix = m[1]; return; }
-  if (!learnedPrefix) {
-    const m2 = String(html || '').match(/bestjavporn\.com(\/v\d+)\//);
-    if (m2) learnedPrefix = m2[1];
-  }
-}
-function wdTarget(url) {
-  try {
-    const u = new URL(url);
-    if (u.pathname.startsWith('/search/') && learnedPrefix) u.pathname = learnedPrefix + u.pathname;
-    return u.toString();
-  } catch (e) { return url; }
-}
-const WD_HEADERS = { 'User-Agent': UA, 'X-Requested-With': 'XMLHttpRequest', Origin: HOST };
-async function viaWorkersDemo(url, timeout) {
-  return fetchRaw('https://test.cors.workers.dev/?' + wdTarget(url), WD_HEADERS, timeout || 12000);
-}
-
-// 自有 Worker 跳板 pornfhd-fetch (第六轮第一通道): 蜘蛛 -> 用户自有
-// Worker -> 站点。Worker 内部跟随重定向, 无需像 cors demo 那样喂
-// 规范 URL。白名单自检与 Worker 侧一致: 非 pornfhd 系域名 (第三
-// 方 embed 宿主) 直接落空不发请求, embed 竞速不受影响; Worker
-// 未部署时域名不可达/404 同样落空, 自动回落原通道池。
-const OWN_HOST_RE = /(^|\.)(javhdporn\.net|bestjavporn\.com|pornfhd\.com)$/i;
-async function viaOwnFetch(url, timeout, referer) {
-  try {
-    if (!OWN_HOST_RE.test(new URL(url).hostname)) return '';
-  } catch (e) { return ''; }
-  const w = OWN_FETCH + '/get?u=' + encodeURIComponent(url) + '&ref=' + encodeURIComponent(referer || REFERER);
-  return fetchRaw(w, { 'User-Agent': UA }, timeout || 12000);
-}
-
-async function viaJina(url, timeout) {
-  return fetchRaw('https://r.jina.ai/' + url, {
-    'User-Agent': UA,
-    'x-respond-with': 'html',
-  }, timeout || 12000);
-}
-
-async function viaAlloriginsGet(url, timeout) {
-  const txt = await fetchRaw('https://api.allorigins.win/get?url=' + encodeURIComponent(url), {
-    'User-Agent': UA,
-  }, timeout || 15000);
-  if (!txt) return '';
-  try {
-    const j = JSON.parse(txt);
-    return typeof j.contents === 'string' ? j.contents : '';
-  } catch (e) { return ''; }
-}
-
-async function viaAlloriginsRaw(url, timeout) {
-  return fetchRaw('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
-    'User-Agent': UA,
-  }, timeout || 15000);
-}
-
-async function viaCodetabs(url, timeout) {
-  return fetchRaw('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), {
-    'User-Agent': UA,
-  }, timeout || 12000);
-}
-
-async function raceValid(fns, valid) {
-  const jobs = fns.map((fn) => (async () => {
-    let html = '';
-    try { html = await fn(); } catch (e) { html = ''; }
-    if (valid(html)) return html;
-    throw new Error('invalid page');
-  })());
-  return Promise.any(jobs);
-}
-
-async function httpGet(url, opts = {}) {
-  const headers = {
-    'User-Agent': UA,
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
-    'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Upgrade-Insecure-Requests': '1',
-    'Referer': opts.referer || REFERER,
-  };
-  const valid = (html) => validFor(url, html, opts.kind);
-  // embed 页小而多 (detail 并行解 ≤8 条): 用精简通道组, 避免
-  // 每条 embed 都拉满 6 通道造成连接风暴 (harness 追踪实测全量
-  // 竞速下 embed 阶段被并发拖到 12s+; 精简后回落到 ~2s 级)。
-  const isEmbed = opts.kind === 'embed';
-  const wave1 = isEmbed ? [
-    () => viaOwnFetch(url, 10000, opts.referer),
-    () => fetchRaw(url, headers, 10000),
-    () => viaWorkersDemo(url, 10000),
-    () => viaReqGet(url, headers, 10000),
-  ] : [
-    () => viaOwnFetch(url, 12000, opts.referer),
-    () => fetchRaw(url, headers, 12000),
-    () => viaReqGet(url, headers, 12000),
-    () => viaHttps(url, headers, 12000),
-    () => viaWorkersDemo(url, 12000),
-    () => viaJina(url, 12000),
-    () => viaAlloriginsGet(url, 15000),
-  ];
-  try {
-    const html = await raceValid(wave1, valid);
-    notePrefix(html);
-    return html;
-  } catch (e) { /* 第一波全灭, 进第二波 */ }
-  const wave2 = isEmbed ? [
-    () => viaJina(url, 10000),
-    () => viaAlloriginsGet(url, 12000),
-  ] : [
-    () => viaAlloriginsRaw(url, 15000),
-    () => viaCodetabs(url, 12000),
-    () => viaJina(url, 10000),
-    () => viaWorkersDemo(url, 10000),
-  ];
-  try {
-    const html = await raceValid(wave2, valid);
-    notePrefix(html);
-    return html;
-  } catch (e) { /* 全灭: 回空 */ }
-  return '';
-}
-
-function validPlayResp(text) {
-  // 必须 status === true 才算铸造成功 (第四轮已坐实: allorigins
-  // 转发 POST 会丢 body, 站方回 {"status":false,...} 假成功)。
-  if (!text) return false;
-  try {
-    const j = JSON.parse(text);
-    return !!j && typeof j === 'object' && j.status === true;
-  } catch (e) { return false; }
-}
-
-async function postViaAllorigins(url, bodyStr, headers, timeout) {
-  const relay = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url);
-  const ctl = new AbortController();
-  const to = setTimeout(() => ctl.abort(), timeout || 10000);
-  try {
-    const r = await fetch(relay, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': headers['User-Agent'] || UA },
-      body: bodyStr,
-      signal: ctl.signal,
-    });
-    if (r.ok) {
-      const text = await r.text();
-      if (validPlayResp(text)) return text;
-    }
-  } catch (e) { /* 落空 */ } finally { clearTimeout(to); }
-  return '';
-}
-
-async function httpPostForm(url, bodyStr, opts = {}) {
-  const headers = {
-    'User-Agent': UA,
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'Referer': opts.referer || REFERER,
-    'Origin': HOST,
-  };
-  // 第一波: 自有 Worker 转发 (第六轮新增, 第一位) / 直连 fetch /
-  // 直连 req / cors demo 转发; 第二波: allorigins 转发兜底。总
-  // 截止约 22s, 铸造全灭时快速落嗅探, 不陪慢通道死等。
-  const wave1 = [
-    async () => { // 自有 Worker 转发 (pornfhd-fetch /post, body 原样)
-      const w = OWN_FETCH + '/post?u=' + encodeURIComponent(url) + '&ref=' + encodeURIComponent(opts.referer || REFERER);
-      return fetchRaw(w, { 'User-Agent': UA, 'Content-Type': 'application/x-www-form-urlencoded' }, 12000, 'POST', bodyStr);
-    },
-    async () => { // 直连 fetch
-      const ctl = new AbortController();
-      const to = setTimeout(() => ctl.abort(), 12000);
-      try {
-        const r = await fetch(url, { method: 'POST', headers, body: bodyStr, signal: ctl.signal, redirect: 'follow' });
-        if (r.ok) return await r.text();
-      } catch (e) { /* 落空 */ } finally { clearTimeout(to); }
-      return '';
-    },
-    async () => { // 直连 req (axios)
-      try {
-        const { data, status } = await req.post(url, bodyStr, { headers, timeout: 12000 });
-        if ((!status || status === 200) && data != null && data !== '') {
-          return typeof data === 'string' ? data : JSON.stringify(data);
-        }
-      } catch (e) { /* 落空 */ }
-      return '';
-    },
-    async () => fetchRaw('https://test.cors.workers.dev/?' + url, {
-      ...WD_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded',
-    }, 12000, 'POST', bodyStr),
-  ];
-  try { return await raceValid(wave1, validPlayResp); } catch (e) { /* 进第二波 */ }
-  try { return await raceValid([() => postViaAllorigins(url, bodyStr, headers, 10000)], validPlayResp); }
-  catch (e) { return ''; }
-}
-
-
-// ---------- 页面缓存 (详情供 play 复用, 省一次整链) ----------
-const pageCache = new Map();
-function cacheGet(url, ttl) {
-  const e = pageCache.get(url);
-  if (e && Date.now() - e.t < ttl) return e.s;
-  return '';
-}
-function cacheSet(url, s) {
-  pageCache.set(url, { t: Date.now(), s });
-  if (pageCache.size > 60) pageCache.delete(pageCache.keys().next().value);
-}
-async function getDetailHtml(durl) {
-  const hit = cacheGet(durl, 300000);
-  if (hit) return hit;
-  const html = await httpGet(durl, { timeout: 18000, kind: 'detail' });
-  if (html) cacheSet(durl, html);
-  return html;
-}
-
-// ---------- 列表解析 ----------
-function parseCards(html) {
+// ---------------- 解析 (严格层 + 宽松层) ----------------
+// 严格层: 沿用旧解析 (文章块 + <a href="...video/..." title="...">)。
+function parseCardsStrict(html) {
   const out = [];
   const re = /<article[^>]*class="[^"]*thumb-block[^"]*"[^>]*>([\s\S]*?)<\/article>/g;
   let m;
@@ -2379,6 +2011,56 @@ function parseCards(html) {
   return out;
 }
 
+// 宽松层: 属性顺序无关、相对/绝对 href 通吃; 标题 title 属性 ->
+// img alt -> 锚内 header 文本 -> slug 兜底。
+function parseCardsLoose(html) {
+  const out = [];
+  const seen = new Set();
+  const h = String(html || '');
+  const re = /<a\b[^>]*?href\s*=\s*["']((?:https?:\/\/(?:www\.)?bestjavporn\.com)?\/(?:v\d+\/)?video\/[^"']+)["'][^>]*>/gi;
+  let m;
+  while ((m = re.exec(h)) !== null) {
+    let url = m[1];
+    if (url.startsWith('/')) url = HOST + url;
+    url = url.replace(/^http:\/\//, 'https://');
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const tag = m[0];
+    const win = h.slice(m.index, m.index + 1800);
+    let name = '';
+    const tm = tag.match(/title\s*=\s*"([^"]+)"/) || tag.match(/title\s*=\s*'([^']+)'/);
+    if (tm) name = clean(tm[1]);
+    if (!name) {
+      const altM = win.match(/<img[^>]+alt="([^"]{4,})"/);
+      if (altM) name = clean(altM[1]);
+    }
+    if (!name) {
+      const txtM = win.match(/<header class="entry-header">\s*<span>([^<]{4,})<\/span>/);
+      if (txtM) name = clean(txtM[1]);
+    }
+    if (!name) name = url.split('/video/')[1].replace(/\//g, '');
+    const img = win.match(/data-lazy-src="(https:[^"]+)"/) || win.match(/data-wpsrc="(https:[^"]+)"/);
+    const dur = win.match(/<span class="duration">[\s\S]*?([\d]{1,2}:[\d]{2}(?::[\d]{2})?)\s*<\/span>/);
+    const views = win.match(/<span class="views">[\s\S]*?([\d,]+)\s*<\/span>/);
+    const remarks = [dur ? dur[1] : '', views ? views[1] + ' views' : ''].filter(Boolean).join(' · ');
+    out.push({ vod_id: url, vod_name: name, vod_pic: img ? img[1] : '', vod_remarks: remarks });
+  }
+  return out;
+}
+
+function parseCardsEx(html) {
+  const strict = parseCardsStrict(html);
+  const byUrl = new Map(strict.map(c => [c.vod_id, c]));
+  let looseOnly = 0;
+  for (const c of parseCardsLoose(html)) {
+    if (!byUrl.has(c.vod_id)) { byUrl.set(c.vod_id, c); looseOnly++; }
+  }
+  return { list: [...byUrl.values()], strict: strict.length, looseOnly };
+}
+function parseCards(html) {
+  return parseCardsEx(html).list;
+}
+
 function pagecountOf(html) {
   // 只看分页块内的页码 (页面别处也有 /page/N/ 链接, 会报出假总页数)
   const block = (String(html).match(/<div class="pagination">([\s\S]*?)<\/div>/) || [])[1] || '';
@@ -2389,7 +2071,408 @@ function pagecountOf(html) {
   return max;
 }
 
-// ---------- 纯 JS 密码件 (与站方 cast.js / video main.js 同构) ----------
+// ---------------- 抓取层 (分层竞速 + 逐通道归因) ----------------
+const BROWSER_HEADERS = {
+  'User-Agent': UA,
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+  'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Upgrade-Insecure-Requests': '1',
+};
+
+function isShellPage(s) {
+  return /Attention Required|Just a moment|cf-challenge|Checking your browser/i.test(s || '');
+}
+function validListPage(html) {
+  return !!html && !isShellPage(html) && parseCards(html).length > 0;
+}
+function validDetailPage(html) {
+  return !!html && !isShellPage(html) && html.length > 4000 &&
+    (html.includes('data-mpu') || html.includes('video-id=') || /property="og:title"/.test(html));
+}
+function validEmbedPage(html) {
+  return !!html && !isShellPage(html) && html.length > 200 && html.includes('data-config');
+}
+function validFor(kind, html) {
+  if (kind === 'detail') return validDetailPage(html);
+  if (kind === 'embed') return validEmbedPage(html);
+  return validListPage(html);
+}
+
+async function fetchRaw2(url, headers, timeoutMs, method, body) {
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), timeoutMs || 10000);
+  try {
+    const r = await fetch(url, { headers, signal: ctl.signal, redirect: 'follow', method: method || 'GET', body });
+    const text = await r.text();
+    return { status: r.status, body: r.ok ? text : '', rawBytes: text.length };
+  } catch (e) {
+    return { status: 0, body: '', err: (e && e.name === 'AbortError') ? 'timeout' : String((e && e.message) || e) };
+  } finally { clearTimeout(to); }
+}
+
+const OWN_HOST_RE = /(^|\.)(javhdporn\.net|bestjavporn\.com|pornfhd\.com)$/i;
+async function chOwn(url, timeoutMs, referer) {
+  try {
+    if (!OWN_HOST_RE.test(new URL(url).hostname)) return { status: 0, body: '', note: '白名单外跳过' };
+  } catch (e) { return { status: 0, body: '', note: 'URL非法' }; }
+  const w = OWN_FETCH + '/get?u=' + encodeURIComponent(url) + '&ref=' + encodeURIComponent(referer || REFERER);
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), timeoutMs || 10000);
+  try {
+    const r = await fetch(w, { headers: { 'User-Agent': UA }, signal: ctl.signal, redirect: 'follow' });
+    const text = await r.text();
+    return { status: r.status, body: r.ok ? text : '', rawBytes: text.length, upst: r.headers.get('x-pornfhd-upst') || '' };
+  } catch (e) {
+    return { status: 0, body: '', err: (e && e.name === 'AbortError') ? 'timeout' : String((e && e.message) || e) };
+  } finally { clearTimeout(to); }
+}
+
+async function chFetch(url, timeoutMs, referer) {
+  return fetchRaw2(url, { ...BROWSER_HEADERS, Referer: referer || REFERER }, timeoutMs);
+}
+
+async function chReq(url, timeoutMs, referer) {
+  try {
+    const r = await req.get(url, {
+      headers: { ...BROWSER_HEADERS, Referer: referer || REFERER },
+      timeout: timeoutMs || 10000,
+    });
+    const status = (r && typeof r.status === 'number') ? r.status : 200;
+    const d = typeof r === 'string' ? r : (r && r.data !== undefined ? r.data : r);
+    return { status, body: typeof d === 'string' ? d : '' };
+  } catch (e) {
+    const st = e && e.response && typeof e.response.status === 'number' ? e.response.status : 0;
+    return { status: st, body: '', err: String((e && e.message) || e) };
+  }
+}
+
+function chHttps(url, timeoutMs, referer, depth = 0) {
+  return new Promise((resolve) => {
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const u = new URL(url);
+      const rq = https.request({
+        hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
+        headers: { ...BROWSER_HEADERS, Referer: referer || REFERER, 'Accept-Encoding': 'gzip, deflate, br' },
+        timeout: timeoutMs || 10000,
+      }, (res) => {
+        const loc = res.headers.location;
+        if (res.statusCode >= 300 && res.statusCode < 400 && loc && depth < 3) {
+          res.resume();
+          fin(chHttps(new URL(loc, url).toString(), timeoutMs, referer, depth + 1));
+          return;
+        }
+        if (res.statusCode !== 200) { res.resume(); fin({ status: res.statusCode || 0, body: '' }); return; }
+        let stream = res;
+        const enc = String(res.headers['content-encoding'] || '');
+        try {
+          if (enc.includes('gzip')) stream = res.pipe(zlib.createGunzip());
+          else if (enc.includes('deflate')) stream = res.pipe(zlib.createInflate());
+          else if (enc.includes('br')) stream = res.pipe(zlib.createBrotliDecompress());
+        } catch (e) { /* 按原文读 */ }
+        const chunks = [];
+        stream.on('data', (c) => chunks.push(c));
+        stream.on('end', () => fin({ status: 200, body: Buffer.concat(chunks).toString('utf8') }));
+        stream.on('error', () => fin({ status: 200, body: '', err: 'stream error' }));
+      });
+      rq.on('timeout', () => { rq.destroy(); fin({ status: 0, body: '', err: 'timeout' }); });
+      rq.on('error', (e) => fin({ status: 0, body: '', err: String((e && e.message) || e) }));
+      rq.end();
+    } catch (e) { fin({ status: 0, body: '', err: String((e && e.message) || e) }); }
+  });
+}
+
+// workers.dev 公共 demo: /search/ 需规范前缀 (从成功页学习; 分类
+// type_id 本就带前缀、详情本就规范, 均不改写)
+let learnedPrefix = '';
+function notePrefix(html) {
+  const m = String(html || '').match(/bestjavporn\.com(\/v\d+)\/search\//);
+  if (m) { learnedPrefix = m[1]; return; }
+  if (!learnedPrefix) {
+    const m2 = String(html || '').match(/bestjavporn\.com(\/v\d+)\//);
+    if (m2) learnedPrefix = m2[1];
+  }
+}
+function wdTarget(url) {
+  try {
+    const u = new URL(url);
+    if (u.pathname.startsWith('/search/') && learnedPrefix) u.pathname = learnedPrefix + u.pathname;
+    return u.toString();
+  } catch (e) { return url; }
+}
+const WD_HEADERS = { 'User-Agent': UA, 'X-Requested-With': 'XMLHttpRequest', Origin: HOST };
+async function chDemo(url, timeoutMs) {
+  return fetchRaw2('https://test.cors.workers.dev/?' + wdTarget(url), WD_HEADERS, timeoutMs);
+}
+
+async function chJina(url, timeoutMs) {
+  return fetchRaw2('https://r.jina.ai/' + url, {
+    'User-Agent': UA,
+    'x-respond-with': 'html',
+  }, timeoutMs);
+}
+
+async function chAoGet(url, timeoutMs) {
+  const r = await fetchRaw2('https://api.allorigins.win/get?url=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, timeoutMs);
+  if (!r.body) return r;
+  try {
+    const j = JSON.parse(r.body);
+    return { status: r.status, body: typeof j.contents === 'string' ? j.contents : '' };
+  } catch (e) { return { status: r.status, body: '' }; }
+}
+
+async function chAoRaw(url, timeoutMs) {
+  return fetchRaw2('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, timeoutMs);
+}
+
+async function chCodetabs(url, timeoutMs) {
+  return fetchRaw2('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), {
+    'User-Agent': UA,
+  }, timeoutMs);
+}
+
+// 分层竞速 + 归因。opts: {kind, referer, profile: 'full'|'embed', deadlineMs}
+async function fetchPage(url, opts = {}) {
+  const t0 = Date.now();
+  const budget = opts.deadlineMs || 24000; // 全局总截止 (两波共享)
+  const kind = opts.kind || 'list';
+  const referer = opts.referer;
+  const outcomes = [];
+  let winner = null;
+  let resolveWin;
+  const winP = new Promise((r) => { resolveWin = r; });
+  const judge = (name, res, ms) => {
+    const body = (res && res.body) || '';
+    const oc = {
+      name,
+      status: (res && res.status) || 0,
+      upst: (res && res.upst) || '',
+      bytes: body.length || (res && res.rawBytes) || 0,
+      ms,
+      ok: false,
+      note: (res && res.note) || '',
+      err: (res && res.err) || '',
+    };
+    if (kind === 'list') oc.cards = body ? parseCards(body).length : 0;
+    oc.ok = validFor(kind, body);
+    outcomes.push(oc);
+    if (oc.ok && !winner) { winner = { html: body, oc }; resolveWin(winner); }
+    return oc;
+  };
+  const runWave = async (wave) => {
+    const jobs = wave.map(([name, fn, to]) => (async () => {
+      const t0 = Date.now();
+      let res;
+      try { res = await fn(url, to, referer); } catch (e) { res = { status: 0, body: '', err: String((e && e.message) || e) }; }
+      return judge(name, res, Date.now() - t0);
+    })());
+    const all = Promise.allSettled(jobs);
+    const remain = Math.max(3000, budget - (Date.now() - t0));
+    const deadline = new Promise((r) => setTimeout(r, remain));
+    await Promise.race([winP, all, deadline]);
+  };
+  if (opts.profile === 'embed') {
+    // embed 页小而多: 精简通道组, 避免每条 embed 拉满通道造成连接风暴
+    await runWave([
+      ['own', chOwn, 10000],
+      ['fetch', chFetch, 10000],
+      ['demo', chDemo, 10000],
+      ['req', chReq, 10000],
+    ]);
+    if (!winner) {
+      await runWave([
+        ['jina', chJina, 10000],
+        ['aoGet', chAoGet, 12000],
+      ]);
+    }
+  } else {
+    await runWave([
+      ['own', chOwn, 10000],
+      ['fetch', chFetch, 10000],
+      ['req', chReq, 10000],
+      ['https', chHttps, 10000],
+      ['demo', chDemo, 10000],
+      ['jina', chJina, 12000],
+      ['aoGet', chAoGet, 12000],
+    ]);
+    if (!winner) {
+      await runWave([
+        ['aoRaw', chAoRaw, 12000],
+        ['codetabs', chCodetabs, 10000],
+        ['jina2', chJina, 8000],
+        ['demo2', chDemo, 8000],
+      ]);
+    }
+  }
+  if (winner) {
+    notePrefix(winner.html);
+    const ex = kind === 'list' ? parseCardsEx(winner.html) : null;
+    return { html: winner.html, win: winner.oc, outcomes, looseOnly: ex ? ex.looseOnly : 0 };
+  }
+  return { html: '', win: null, outcomes, looseOnly: 0 };
+}
+
+// 兼容旧签名: 只要正文 (详情/播放/embed 内部用)
+async function httpGet(url, opts = {}) {
+  const r = await fetchPage(url, { kind: opts.kind, referer: opts.referer, profile: opts.kind === 'embed' ? 'embed' : 'full' });
+  return r.html;
+}
+
+// ---------------- POST /api/play/ (铸造, 带通道归因) ----------------
+function validPlayResp(text) {
+  // 必须 status === true 才算铸造成功 (旧轮已坐实: allorigins 转发
+  // POST 会丢 body, 站方回 {"status":false,...} 假成功)。
+  if (!text) return false;
+  try {
+    const j = JSON.parse(text);
+    return !!j && typeof j === 'object' && j.status === true;
+  } catch (e) { return false; }
+}
+
+async function httpPostForm(url, bodyStr, opts = {}) {
+  const referer = opts.referer || REFERER;
+  const formHeaders = {
+    'User-Agent': UA,
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Referer': referer,
+    'Origin': HOST,
+  };
+  const t0 = Date.now();
+  const budget = 22000; // POST 铸造全局总截止 (两波共享)
+  const outcomes = [];
+  let winner = null;
+  let resolveWin;
+  const winP = new Promise((r) => { resolveWin = r; });
+  const judge = (name, res) => {
+    const text = (res && res.body) || '';
+    const oc = { name, status: (res && res.status) || 0, bytes: text.length, ok: validPlayResp(text), sawJson: false };
+    if (text) {
+      try { const j = JSON.parse(text); if (j && typeof j === 'object' && 'status' in j) oc.sawJson = true; } catch (e) { /* 非 JSON */ }
+    }
+    outcomes.push(oc);
+    if (oc.ok && !winner) { winner = { text, via: name }; resolveWin(winner); }
+    return oc;
+  };
+  const runWave = async (wave) => {
+    const jobs = wave.map(([name, fn]) => (async () => {
+      let res;
+      try { res = await fn(); } catch (e) { res = { status: 0, body: '' }; }
+      return judge(name, res);
+    })());
+    const all = Promise.allSettled(jobs);
+    const remain = Math.max(3000, budget - (Date.now() - t0));
+    const deadline = new Promise((r) => setTimeout(r, remain));
+    await Promise.race([winP, all, deadline]);
+  };
+  const ownPost = async () => {
+    const w = OWN_FETCH + '/post?u=' + encodeURIComponent(url) + '&ref=' + encodeURIComponent(referer);
+    return fetchRaw2(w, { 'User-Agent': UA, 'Content-Type': 'application/x-www-form-urlencoded' }, 12000, 'POST', bodyStr);
+  };
+  const fetchPost = async () => fetchRaw2(url, formHeaders, 12000, 'POST', bodyStr);
+  const reqPost = async () => {
+    try {
+      const r = await req.post(url, bodyStr, { headers: formHeaders, timeout: 12000 });
+      const status = (r && typeof r.status === 'number') ? r.status : 200;
+      const d = typeof r === 'string' ? r : (r && r.data !== undefined ? r.data : r);
+      return { status, body: typeof d === 'string' ? d : JSON.stringify(d || '') };
+    } catch (e) {
+      const st = e && e.response && typeof e.response.status === 'number' ? e.response.status : 0;
+      return { status: st, body: '' };
+    }
+  };
+  const demoPost = async () => fetchRaw2('https://test.cors.workers.dev/?' + url, {
+    ...WD_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded',
+  }, 12000, 'POST', bodyStr);
+  const aoPost = async () => fetchRaw2('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
+    'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA,
+  }, 10000, 'POST', bodyStr);
+  await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost]]);
+  if (!winner) await runWave([['aoRaw', aoPost]]);
+  if (winner) return { text: winner.text, via: winner.via, outcomes };
+  // 全灭归因: 有通道拿到带 status 字段的 JSON (站方明确回 false) ->
+  // post-bad; 连 JSON 都没拿到 -> post-none。
+  const sawJson = outcomes.some((o) => o.sawJson);
+  return { text: '', via: '', outcomes, stage: sawJson ? 'post-bad' : 'post-none' };
+}
+
+// ---------------- 诊断卡 ----------------
+function diagCardName(res, cardCount, suffix) {
+  if (res && res.win) {
+    let s = `诊断 ${res.win.name} ${res.win.status} · ${cardCount}卡`;
+    if (res.win.upst) s += `·上游${res.win.upst}`;
+    if (res.looseOnly) s += '·含宽松解析';
+    if (suffix) s += suffix;
+    return s;
+  }
+  const parts = (res ? res.outcomes : []).map((o) => {
+    const st = o.status ? String(o.status) : (o.err ? 'ERR' : '0');
+    return o.cards !== undefined ? `${o.name}:${st}/${o.cards}卡` : `${o.name}:${st}`;
+  });
+  return ('诊断 全通道失败 ' + parts.join(' ') + (suffix || '')).slice(0, 190);
+}
+function diagCard(res, cardCount, suffix) {
+  return {
+    vod_id: DIAG_ID,
+    vod_name: diagCardName(res, cardCount, suffix),
+    vod_pic: '',
+    vod_remarks: '诊断卡·点开看通道明细',
+  };
+}
+function diagText(url, res) {
+  const lines = [];
+  lines.push('取数通道明细');
+  lines.push('目标: ' + url);
+  lines.push('时间: ' + new Date().toISOString());
+  if (res.win) lines.push(`胜出: ${res.win.name} 状态${res.win.status} ${res.win.ms}ms`);
+  else lines.push('胜出: 无 (全通道失败)');
+  for (const o of res.outcomes) {
+    lines.push(`${o.name}: 状态${o.status || 'ERR'} ${o.bytes}B ${o.ms}ms` +
+      (o.cards !== undefined ? ` 解卡${o.cards}` : '') +
+      (o.upst ? ` 上游${o.upst}` : '') +
+      (o.ok ? ' ✓合格' : '') +
+      (o.note ? ' ' + o.note : '') +
+      (o.err ? ' ' + o.err : ''));
+  }
+  const missing = ['own', 'fetch', 'req', 'https', 'demo', 'jina', 'aoGet', 'aoRaw', 'codetabs']
+    .filter((n) => !res.outcomes.some((o) => o.name === n || o.name === n + '2'));
+  if (missing.length) lines.push('未及返回 (竞速已胜出或总截止): ' + missing.join(' '));
+  lines.push('判读: 200/0卡=通道通但解析为零; 403/5xx=通道被拒; ERR/timeout=通道不通; own=自有Worker, demo=公共cors演示, jina/ao/codetabs=公共中转, fetch/req/https=直连三栈。');
+  return lines.join('\n');
+}
+
+// ---------------- 页面缓存 (详情供 play 复用, 省一次整链) ----------------
+const pageCache = new Map();
+function cacheGet(url, ttl) {
+  const e = pageCache.get(url);
+  if (e && Date.now() - e.t < ttl) return e.s;
+  return '';
+}
+function cacheSet(url, s) {
+  pageCache.set(url, { t: Date.now(), s });
+  if (pageCache.size > 60) pageCache.delete(pageCache.keys().next().value);
+}
+async function getDetailHtml(durl) {
+  const hit = cacheGet(durl, 300000);
+  if (hit) return hit;
+  const html = await httpGet(durl, { kind: 'detail' });
+  if (html) cacheSet(durl, html);
+  return html;
+}
+
+// ---------------- 纯 JS 密码件 (与站方 cast.js / video main.js 同构, 沿用旧版) ----------------
 const B64CH = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 const B64REV = (() => {
   const o = {};
@@ -2482,35 +2565,35 @@ function decryptConfig(cfgB64, pathname, search) {
   return { json, sources };
 }
 
-// ---------- 播放解析 ----------
+// ---------------- 播放解析 ----------------
 function extractPlaySeed(html) {
   const postId = (html.match(/id="video-player-area"[^>]*video-id="(\d+)"/) || html.match(/video-id="(\d+)"/) || [])[1] || '';
   const mpu = (html.match(/data-mpu="([^"]+)"/) || [])[1] || '';
   return { postId, mpu };
 }
 
-// 调 /api/play/ 并解出全部线路的 embed 路径: [{lo, path}]
+// 调 /api/play/ 并解出全部线路的 embed 路径: {paths, stage, via}
 async function fetchEmbedPaths(postId, mpu, referer) {
   const token = dex(postId, mpu);
   const body = 'sources=' + encodeURIComponent(token) + '&ver=2';
-  const text = await httpPostForm(HOST + '/api/play/', body, { referer, timeout: 18000 });
-  if (!text) return [];
+  const r = await httpPostForm(HOST + '/api/play/', body, { referer, timeout: 18000 });
+  if (!r.text) return { paths: [], stage: r.stage || 'post-none', via: '' };
   let resp;
-  try { resp = JSON.parse(text); } catch (e) { return []; }
-  if (!resp || resp.status !== true || !resp.data) return [];
+  try { resp = JSON.parse(r.text); } catch (e) { return { paths: [], stage: 'post-bad', via: r.via }; }
+  if (!resp || resp.status !== true || !resp.data) return { paths: [], stage: 'post-bad', via: r.via };
   const paths = [];
   try { paths.push({ lo: t(resp.lo) || 'main', path: dex(postId, resp.data) }); } catch (e) { /* 主线解码失败 */ }
   if (resp.reserve) {
     try {
       const arr = JSON.parse(dexUtf8(postId, resp.reserve));
-      for (const r of arr) {
-        if (r && r.data) {
-          try { paths.push({ lo: t(r.lo) || 'bak', path: dex(postId, r.data) }); } catch (e) { /* 跳过坏备线 */ }
+      for (const x of arr) {
+        if (x && x.data) {
+          try { paths.push({ lo: t(x.lo) || 'bak', path: dex(postId, x.data) }); } catch (e) { /* 跳过坏备线 */ }
         }
       }
     } catch (e) { /* reserve 整体解码失败: 只用主线 */ }
   }
-  return paths.filter(p => p.path && p.path.startsWith('//'));
+  return { paths: paths.filter(p => p.path && p.path.startsWith('//')), stage: 'ok', via: r.via };
 }
 
 const HOST_PRETTY = [
@@ -2519,6 +2602,9 @@ const HOST_PRETTY = [
   [/cloudatacdn|clouddata/i, 'CloudCDN'],
   [/streamhls/i, 'StreamHLS'],
   [/pianopic/i, 'PianoPic'],
+  [/acek-cdn/i, 'AcekCDN'],
+  [/hugstream/i, 'HugStream'],
+  [/turbovid|turbo/i, 'TurboVid'],
   [/dood|ds2play|d0o0d/i, 'Dood'],
   [/filemoon|filemoonu/i, 'FileMoon'],
   [/vidhide|earnvid|vidhideplus/i, 'VidHide'],
@@ -2529,22 +2615,20 @@ function prettyHost(fileUrl) {
   for (const [re, name] of HOST_PRETTY) if (re.test(fileUrl)) return name;
   try { return new URL(fileUrl).hostname.replace(/^www\./, ''); } catch (e) { return '线路'; }
 }
-// VM 实测可靠性排序 (越小越靠前): CloudCDN 直链 / MaxStream 已验 > StreamTape > 其他 > StreamHLS/PianoPic (VM 403)
+// VM 实测可靠性排序 (越小越靠前): CloudCDN 直链 / MaxStream 已验 > StreamTape / AcekCDN > 其他 > StreamHLS/PianoPic (VM 403)
 function hostRank(name) {
   if (name === 'CloudCDN') return 0;
   if (name === 'MaxStream') return 1;
   if (name === 'StreamTape') return 2;
+  if (name === 'AcekCDN') return 3;
   if (name === 'StreamHLS' || name === 'PianoPic') return 9;
   return 5;
 }
 
-// embed 页 -> 配置里的源数组 (含宿主标注)
-// 单条 embed 硬顶 15s: detail 要并行解最多 8 条, 不能让某一条的
-// 慢通道把整个详情拖过 App 耐心 (第五轮 harness 实测个别 embed
-// 宿主会让全波次跑满, 详情总耗时冲到 26s)。
+// embed 页 -> 配置里的源数组 (单条硬顶 15s, 防慢 embed 拖死详情)
 async function resolveEmbed(embedUrl, referer) {
   const html = await Promise.race([
-    httpGet(embedUrl, { referer, timeout: 15000, kind: 'embed' }),
+    httpGet(embedUrl, { referer, kind: 'embed' }),
     new Promise((res) => setTimeout(() => res(''), 15000)),
   ]);
   if (!html) return null;
@@ -2573,13 +2657,16 @@ function pickSource(sources) {
   return best;
 }
 
-// 全链解析: 详情页 -> 全部线路 [{lo, embedUrl, file, type, host}]
+// 全链解析: {html, lines, stage, via}
+// stage: ok / page(详情未取到) / seed(无种子) / post-none(铸造通道
+// 不通) / post-bad(铸造被站方拒) / embed(铸出路径但 embed 未解出)
 async function resolveLines(durl) {
   const html = await getDetailHtml(durl);
-  if (!html) return { html: '', lines: [] };
+  if (!html) return { html: '', lines: [], stage: 'page', via: '' };
   const { postId, mpu } = extractPlaySeed(html);
-  if (!postId || !mpu) return { html, lines: [] };
-  const paths = await fetchEmbedPaths(postId, mpu, durl);
+  if (!postId || !mpu) return { html, lines: [], stage: 'seed', via: '' };
+  const { paths, stage, via } = await fetchEmbedPaths(postId, mpu, durl);
+  if (!paths.length) return { html, lines: [], stage, via };
   const lines = [];
   await Promise.all(paths.slice(0, 8).map(async (p, idx) => {
     const embedUrl = 'https:' + p.path;
@@ -2590,18 +2677,23 @@ async function resolveLines(durl) {
     }
   }));
   lines.sort((a, b) => (hostRank(a.host) - hostRank(b.host)) || (a.idx - b.idx));
-  return { html, lines };
+  if (!lines.length) return { html, lines: [], stage: 'embed', via };
+  return { html, lines, stage: 'ok', via };
 }
 
-// ---------- 接口 ----------
+// ---------------- 接口 ----------------
 async function init() {
   return {};
 }
 
 async function home() {
-  const html = await httpGet(HOST + '/', { timeout: 18000 });
-  const list = html ? parseCards(html).slice(0, 30) : [];
-  return { class: CATS.map(c => ({ type_id: c.type_id, type_name: c.type_name })), list };
+  const url = HOST + '/';
+  const res = await fetchPage(url, { kind: 'list' });
+  const list = res.html ? parseCards(res.html).slice(0, 30) : [];
+  return {
+    class: CATS.map(c => ({ type_id: c.type_id, type_name: c.type_name })),
+    list: [diagCard(res, list.length), ...list],
+  };
 }
 
 function listUrl(tid, page) {
@@ -2615,12 +2707,23 @@ async function category(reqIn) {
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const cat = CATS.find(c => c.type_id === tid);
   if (!cat) return { page, pagecount: page, limit: 24, total: 0, list: [] };
-  const html = await httpGet(listUrl(cat.type_id, page), { timeout: 18000 });
-  if (!html) return { page, pagecount: page, limit: 24, total: 0, list: [] };
-  const list = parseCards(html);
-  let pc = pagecountOf(html);
+  let res = await fetchPage(listUrl(cat.type_id, page), { kind: 'list' });
+  let list = res.html ? parseCards(res.html) : [];
+  let drift = '';
+  if (!list.length && /\/v\d+\//.test(cat.type_id)) {
+    // 前缀漂移兜底: 表内 /v{n}/ 若被站方废弃, 无前缀路径会 301 到
+    // 当前前缀 —— 出 0 卡时自动重试一次, 诊断卡标注。
+    const stripped = cat.type_id.replace(/\/v\d+(?=\/)/, '');
+    const res2 = await fetchPage(listUrl(stripped, page), { kind: 'list' });
+    const list2 = res2.html ? parseCards(res2.html) : [];
+    if (list2.length) { res = res2; list = list2; drift = '·无前缀重试'; }
+  }
+  if (!list.length) {
+    return { page, pagecount: page, limit: 24, total: 0, list: [diagCard(res, 0, drift)] };
+  }
+  let pc = pagecountOf(res.html);
   if (list.length >= 24) pc = Math.max(pc, page + 1);
-  return { page, pagecount: Math.max(pc, page), limit: 24, total: list.length, list };
+  return { page, pagecount: Math.max(pc, page), limit: 24, total: list.length, list: [diagCard(res, list.length, drift), ...list] };
 }
 
 function og(html, prop) {
@@ -2628,12 +2731,36 @@ function og(html, prop) {
   return m ? clean(m[1]) : '';
 }
 
+const STAGE_TEXT = {
+  page: '详情未取到',
+  seed: '无播放种子',
+  'post-none': '铸造通道不通',
+  'post-bad': '铸造被站方拒',
+  embed: 'embed未解出',
+};
+
 async function detail(reqIn) {
   const body = reqIn?.body || {};
   const id = t(body.id);
   if (!id) return { list: [] };
+  if (id === DIAG_ID) {
+    const url = HOST + '/';
+    const res = await fetchPage(url, { kind: 'list' });
+    const cards = res.html ? parseCards(res.html).length : 0;
+    return {
+      list: [{
+        vod_id: DIAG_ID,
+        vod_name: diagCardName(res, cards),
+        vod_pic: '',
+        vod_remarks: '通道诊断',
+        vod_content: diagText(url, res),
+        vod_play_from: '诊断',
+        vod_play_url: '状态$' + DIAG_ID,
+      }],
+    };
+  }
   const durl = absUrl(id);
-  const { html, lines } = await resolveLines(durl);
+  const { html, lines, stage, via } = await resolveLines(durl);
   if (!html) return { list: [] };
   let name = og(html, 'title').replace(/\s*-\s*BestJavPorn\s*$/i, '');
   const pic = og(html, 'image') || (html.match(/<meta name="twitter:image" content="([^"]*)"/) || [])[1] || '';
@@ -2659,14 +2786,17 @@ async function detail(reqIn) {
   const fromNames = [];
   const playUrls = [];
   lines.forEach((ln) => {
-    fromNames.push(ln.host);
+    // 线路名标注来源家族: 最终文件宿主 + 区域线 lo (如 CloudCDN·nl3)
+    fromNames.push(ln.lo && ln.lo !== 'main' ? `${ln.host}·${ln.lo}` : ln.host);
     playUrls.push('播放$' + durl + '@@' + ln.idx);
   });
   if (!lines.length) {
-    // 铸造链没拿到线路 (多为抓取层被站方挡): 至少给一条嗅探线,
-    // 真机 WebView 是真实浏览器, 站方 cast 链可在详情页内原生跑通。
-    fromNames.push('网页嗅探');
+    // 铸造链没拿到线路: 给一条嗅探线, 线名带失败阶段便于真机归因
+    // (真机 WebView 是真实浏览器, 站方 cast 链可在详情页内原生跑通)。
+    fromNames.push('网页嗅探·' + (STAGE_TEXT[stage] || '铸造失败'));
     playUrls.push('播放$' + durl + '@@sniff');
+  } else if (via) {
+    contentParts.push('铸造通道: ' + via);
   }
   return {
     list: [{
@@ -2692,8 +2822,9 @@ async function play(reqIn) {
   let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
   if (id.includes('$')) id = id.split('$').pop().trim();
+  if (id.includes(DIAG_ID)) return { parse: 0, url: '' };
   // @@sniff 伪线 (detail 时铸造链没拿到线路才生成): 点播时先再试一次
-  // 完整铸造链 (中转有偶发性, 第二次常能成), 实在不行才落嗅探。
+  // 完整铸造链 (通道有偶发性, 第二次常能成), 实在不行才落嗅探。
   const sniffOnly = id.endsWith('@@sniff');
   if (sniffOnly) id = id.slice(0, -'@@sniff'.length);
   const mm = id.match(/^(https?:\/\/\S+?)@@(\d+)$/);
@@ -2703,7 +2834,7 @@ async function play(reqIn) {
   if (!html) return sniffResult(durl);
   const { postId, mpu } = extractPlaySeed(html);
   if (!postId || !mpu) return sniffResult(durl);
-  const paths = await fetchEmbedPaths(postId, mpu, durl);
+  const { paths } = await fetchEmbedPaths(postId, mpu, durl);
   if (!paths.length) return sniffResult(durl);
   const order = paths.map((p, idx) => idx);
   // 与 detail 相同的排序口径: 先按 detail 时的 idx 顺序尝试想要的那条,
@@ -2728,10 +2859,10 @@ async function search(reqIn) {
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!wd) return { page, pagecount: page, limit: 24, total: 0, list: [] };
   const url = HOST + '/search/' + encodeURIComponent(wd) + '/' + (page > 1 ? 'page/' + page + '/' : '');
-  const html = await httpGet(url, { timeout: 18000 });
-  if (!html) return { page, pagecount: page, limit: 24, total: 0, list: [] };
-  const list = parseCards(html);
-  let pc = pagecountOf(html);
+  const res = await fetchPage(url, { kind: 'list' });
+  if (!res.html) return { page, pagecount: page, limit: 24, total: 0, list: [] };
+  const list = parseCards(res.html);
+  let pc = pagecountOf(res.html);
   if (list.length >= 24) pc = Math.max(pc, page + 1);
   return { page, pagecount: Math.max(pc, page), limit: 24, total: list.length, list };
 }
