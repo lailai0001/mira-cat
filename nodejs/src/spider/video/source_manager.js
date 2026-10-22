@@ -27,7 +27,7 @@ const SOURCES = [
   ['py_kanav', 'KanAV'],
   ['py_madou', '麻豆社'],
   ['py_missav', 'MissAV'],
-  ['py_missav_xptv', 'MissAV(XPTV版)'],
+  ['py_missav_xptv', 'MissAV'],
   ['py_pornhub', 'Pornhub'],
   ['py_ppp', 'PPPHub'],
   ['py_rou', '肉视频'],
