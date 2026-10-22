@@ -10,9 +10,9 @@ const PROXY_BASE = 'https://py.fzcrym.link:1314';
 const FS_PAGE_API = PROXY_BASE + '/fs?u=';
 const PAGE_API = PROXY_BASE + '/page?u=';
 
-// supjav-fetch Worker（列表/详情不经它；播放解析里只作 lk1 的备用出口，
-// 且仅在直连失败时才试——v1 在岗时对 lk1 回 "host not allowed" 自动判败，
-// v2 在岗时可手工跟跳转并提供 /wrap 包装页。部署状态不影响主通道）
+// supjav-fetch Worker（取页机会通道之一；播放解析里另作 lk1 的备用出口——
+// v1 在岗时对 lk1 回 "host not allowed" 自动判败，v2 在岗时可手工跟跳转
+// 并提供 /wrap 包装页。部署状态不影响其余通道）
 const FETCH_WORKER = 'https://supjav-fetch.li768435813.workers.dev';
 const LK_BASE = 'https://lk1.supremejav.com/supjav.php';
 
@@ -44,16 +44,43 @@ async function getText(url, timeout = 60000) {
   }
 }
 
-async function fetchPage(url, retries = 2) {
-  const api = FS_PAGE_API + encodeURIComponent(url);
-  for (let i = 0; i < Math.max(1, retries); i++) {
-    const html = await getText(api, 220000);
-    if (html && !html.includes('Just a moment') && html.length > 3000) return html;
+// ---------------- 取页通道（2026-10-22 晚重构） ----------------
+// 旧版只有 fzcrym 一条路（/fs 220s×2 → /page 90s），2026-10-22 晚实测
+// py.fzcrym.link 主机级死亡（根路径亦无响应、请求挂到超时 0 字节），
+// 每个列表/详情请求要烧最长 530 秒、分类/搜索再整轮重试 2 次（最长
+// ~26 分钟）才回空——即用户所报「特别特别慢、加载不出来」。
+// 改法：多通道机会集 + 单通道熔断 + 总预算封顶。任一通道拿到真页面
+// 即返回；失败通道 5 分钟内跳过（蜘蛛进程常驻，模块级状态跨请求有效），
+// 通道复活后由后续请求自动探活恢复。校验沿用旧口径（非拦截页且
+// >3000B），并补挡 "Attention Required" 硬封页（4.8KB 会漏过旧校验）。
+const PAGE_CHANNELS = [
+  { name: 'direct', timeout: 20000, build: (u) => u },
+  { name: 'jina', timeout: 20000, build: (u) => 'https://r.jina.ai/' + u },
+  { name: 'worker', timeout: 25000, build: (u) => FETCH_WORKER + '/?u=' + encodeURIComponent(u) },
+  { name: 'fs', timeout: 30000, build: (u) => FS_PAGE_API + encodeURIComponent(u) },
+  { name: 'page', timeout: 45000, build: (u) => PAGE_API + encodeURIComponent(u) },
+];
+const PAGE_BUDGET_MS = 75000;
+const CHAN_COOLDOWN_MS = 5 * 60 * 1000;
+const chanDeadUntil = {};
+
+function goodPage(html) {
+  return !!html && html.length > 3000 &&
+    !html.includes('Just a moment') && !html.includes('Attention Required');
+}
+
+async function fetchPage(url) {
+  const t0 = Date.now();
+  for (const ch of PAGE_CHANNELS) {
+    if (Date.now() - t0 > PAGE_BUDGET_MS) break;
+    if ((chanDeadUntil[ch.name] || 0) > Date.now()) continue;
+    const html = await getText(ch.build(url), ch.timeout);
+    if (goodPage(html)) {
+      delete chanDeadUntil[ch.name];
+      return html;
+    }
+    chanDeadUntil[ch.name] = Date.now() + CHAN_COOLDOWN_MS;
   }
-  // 兜底 Playwright 通道
-  const api2 = PAGE_API + encodeURIComponent(url);
-  const html = await getText(api2, 90000);
-  if (html && !html.includes('Just a moment') && html.length > 3000) return html;
   return '';
 }
 
@@ -135,10 +162,9 @@ async function category(reqIn) {
   let html = await fetchPage(url);
   let items = parseCards(html);
   if (!items.length) {
-    for (let i = 0; i < 2 && !items.length; i++) {
-      html = await fetchPage(url, 2);
-      items = parseCards(html);
-    }
+    // 空结果整轮重试最多 1 次（旧版 2 次×530 秒级联是慢的主因之一）
+    html = await fetchPage(url);
+    items = parseCards(html);
   }
   return { page, pagecount: pagecount(html, page), limit: items.length || 24, total: items.length, list: items };
 }
@@ -759,10 +785,8 @@ async function search(reqIn) {
   let html = await fetchPage(url);
   let items = parseCards(html);
   if (!items.length) {
-    for (let i = 0; i < 2 && !items.length; i++) {
-      html = await fetchPage(url, 2);
-      items = parseCards(html);
-    }
+    html = await fetchPage(url);
+    items = parseCards(html);
   }
   return { page, pagecount: pagecount(html, page), limit: items.length || 24, total: items.length, list: items };
 }
