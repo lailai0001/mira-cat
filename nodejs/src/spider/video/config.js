@@ -36,7 +36,7 @@ const DEFAULT_SOURCES = [
     { key: 'py_kanav', name: 'KanAV' },
     { key: 'py_madou', name: '麻豆社' },
     { key: 'py_missav', name: 'MissAV' },
-    { key: 'py_missav_xptv', name: 'MissAV(XPTV版)' },
+    { key: 'py_missav_xptv', name: 'MissAV' },
     { key: 'py_pornhub', name: 'Pornhub' },
     { key: 'py_ppp', name: 'PPPHub' },
     { key: 'py_rou', name: '肉视频' },
