@@ -84,6 +84,14 @@
 // header 不变; 非 Worker 路 (旧链路/嗅探) 逐字不动。判定口径与后续
 // /put 回存评估见报告 catfix_javsb_r11.md。
 //
+// 详情 (2026-10-22 第十二轮): 第十一轮真机反馈 —— MiraPlayer 播放
+// 界面根本不显示 play 返回的线路名, 探针结论读不出来。改把结论同时
+// 放到详情页分集名上 (分集名在 App 里必显示): detail 对第一集的
+// hash 跑同款直取探针 (与 play 共用 120s 结论缓存), 结论拼到第一集
+// 名后 (正片·探针200/1679 等); 只短等 3s, 等不到标探针未回, 绝不
+// 拖垮详情; 无 hash 时 detail 与第十一轮逐字一致。play 线路名后缀
+// 保留不删。见报告 catfix_javsb_r13.md。
+//
 // 抓取通道 (2026-10-20 第六版): 真机双状态 (VPN 开/关) 直连全灭、第三轮的
 // jina 单中转也全灭。复核结论: 第三轮实现无 URL/编码类低级错误, 但有三个结构
 // 问题 —— (1) jina 只走了原生 fetch 一条传输, 而本仓已真机通过的 SexTB 是走
@@ -595,15 +603,19 @@ async function detail(reqIn) {
   const name = og(html, 'title');
   const pic = og(html, 'image');
   const desc = og(html, 'description');
+  const ph = extractPlayer(html).hash;
   // 第七轮: 详情预热 —— 拿到 hash 立即在后台启动 Worker 取数 (不 await,
   // 不拖慢详情返回), 用户停留详情页的时间用于消化中转取列表的慢启动。
-  if (JAVSB_WORKER) {
-    const ph = extractPlayer(html).hash;
-    if (ph) {
-      rememberDetailHash(durl, ph);
-      try { warmWorker(ph); } catch (e) { /* 预热失败不影响详情 */ }
-    }
+  if (JAVSB_WORKER && ph) {
+    rememberDetailHash(durl, ph);
+    try { warmWorker(ph); } catch (e) { /* 预热失败不影响详情 */ }
   }
+  // 第十二轮: 探针结论上分集名 —— detail 对第一集 hash 跑一次直取
+  // 探针 (复用第十一轮 play 探针, 结论同缓存), 只短等
+  // DETAIL_PROBE_GRACE_MS, 等不到标探针未回; 探针慢/失败不拖垮详情,
+  // 无 hash 时分集名与现行逐字一致 (下方仍是裸「正片」)。
+  const epSuffix = ph ? await probeSuffixForDetail(ph) : '';
+  const ep1Name = epSuffix ? `正片·${epSuffix}` : '正片';
   return {
     list: [{
       vod_id: durl,
@@ -615,7 +627,7 @@ async function detail(reqIn) {
       // 直链) 两条线, id 尾部 @proxy/@direct 供 play 区分。每条线一
       // 次点播都是一次新的 /v 取数竞速, 一条没掷中可换另一条再掷。
       vod_play_from: '全链$$$直链',
-      vod_play_url: `正片$${durl}@proxy$$$正片$${durl}@direct`,
+      vod_play_url: `${ep1Name}$${durl}@proxy$$$正片$${durl}@direct`,
     }],
   };
 }
@@ -945,6 +957,22 @@ function probeDirectRawFresh(hash) {
     probeAttemptReq(url, PROBE_CAP_MS).then(onRes, () => onRes(null));
   });
   return p;
+}
+
+// detail 用探针后缀 (第十二轮): 与 withProbeName 同法 —— 结论 (或
+// 120s 缓存里的上一发结论) 在 DETAIL_PROBE_GRACE_MS 内落点才用,
+// 等不到回探针未回 (探针在后台走完会把结论入缓存, 重开详情即显示);
+// 永不 reject, 绝不因探针拖垮或打挂 detail。
+const DETAIL_PROBE_GRACE_MS = 3000;
+async function probeSuffixForDetail(hash) {
+  try {
+    const p = probeDirectRaw(hash).catch(() => '探针超时');
+    const got = await Promise.race([
+      p.then((s) => ({ s })),
+      new Promise((r) => setTimeout(() => r(null), DETAIL_PROBE_GRACE_MS)),
+    ]).catch(() => null);
+    return got && got.s ? got.s : '探针未回';
+  } catch (e) { return '探针未回'; }
 }
 
 // 主线出参包装: 字符串 url -> [线路名·探针后缀, url]。主线先算完时
