@@ -2,7 +2,7 @@ import req from '../../util/req.js';
 import * as cheerio from 'cheerio';
 
 const KEY = 'py_missav_xptv';
-const NAME = 'MissAV(XPTV版)';
+const NAME = 'MissAV';
 // 源文件(XPTV)里的 site 是 https://missav.ai，但实测该域名不通(超时)，
 // 用户此前已确认可用域名为 missav.fans，此处使用可用域名
 const HOST = 'https://missav.fans';
