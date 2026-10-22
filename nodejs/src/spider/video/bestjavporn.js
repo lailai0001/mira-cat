@@ -58,6 +58,13 @@
 //   POST /api/play/ 走 直连 req -> 直连 fetch -> allorigins 转发。
 //   铸造链若最终仍拿不到线路, play 落 parse:1 嗅探详情页兜底
 //   (真机 WebView 是真实浏览器, 站方 cast 链可在页内原生跑通)。
+// 2026-10-22 第四轮 (与 javhdporn 同步): 第三轮的串行逐层试错在
+//   真机上仍被拖死 (用户复报: 分类能出、内容加载不出)。VM 复测
+//   坐实 allorigins / codetabs 抽风时各回 522 且各烧 20~30s, 串行
+//   叠加 (直连两败 + 两中转) 轻松超过 App 等待耐心。本轮 GET 与
+//   POST 全部改并行竞速、首个合格响应胜出 (jina 实测 0.3~2s 全
+//   覆盖), 中转只作 B 组/末位兜底并封顶; validPlayResp 收紧为
+//   status===true, 防 allorigins 丢 body 的假成功抢答。
 import req from '../../util/req.js';
 
 const KEY = 'py_bestjavporn';
@@ -2039,11 +2046,28 @@ async function getViaJina(url, headers, timeout) {
     const html = await fetchRaw('https://r.jina.ai/' + url, {
       'User-Agent': headers['User-Agent'] || UA,
       'x-respond-with': 'html',
-    }, 22000);
+    }, 15000);
     if (validFor(url, html)) return html;
     if (i === 0) await new Promise((res) => setTimeout(res, 1200));
   }
   return '';
+}
+
+// 第四轮 (与 javhdporn 同步): 串行逐层试错改并行竞速。真机上
+// 直连两层带被拉黑的客户端特征注定先败, 串行再叠上 allorigins /
+// codetabs 抽风时 20~30s 的 522, 总耗时超过 App 耐心 -> 分类页
+// 永远等不到胜出。竞速后总耗时 = 最快存活通道 (jina 实测
+// 0.3~2s 全覆盖); A 组 (直连 req / 直连 fetch / jina) 全灭才进
+// B 组 (allorigins / codetabs 并行兜底, 各自封顶)。
+async function raceLayers(url, fns, track) {
+  const jobs = fns.map((fn) => (async () => {
+    let html = '';
+    try { html = await fn(); } catch (e) { html = ''; }
+    if (html && html.length > track.best.length) track.best = html;
+    if (validFor(url, html)) return html;
+    throw new Error('invalid page');
+  })());
+  return Promise.any(jobs);
 }
 
 async function httpGet(url, opts = {}) {
@@ -2054,53 +2078,46 @@ async function httpGet(url, opts = {}) {
     'Referer': opts.referer || REFERER,
   };
   const timeout = opts.timeout || 15000;
-  const layers = [
+  const track = { best: '' };
+  const layerA = [
     async () => { // 直连 req (axios)
       try {
         const { data, status } = await req.get(url, { headers, timeout });
         if ((!status || status === 200) && data != null && data !== '') {
           return typeof data === 'string' ? data : JSON.stringify(data);
         }
-      } catch (e) { /* 落下一层 */ }
+      } catch (e) { /* 落空, 竞速里不阻塞 */ }
       return '';
     },
     async () => fetchRaw(url, headers, timeout), // 直连 fetch
     async () => getViaJina(url, headers), // jina 读页 (原始 HTML)
-    async () => fetchRaw('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), { 'User-Agent': UA }, 30000),
-    async () => fetchRaw('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), { 'User-Agent': UA }, 22000),
   ];
-  const deadline = Date.now() + 70000;
-  const order = [];
-  if (httpGet._good >= 0) order.push(httpGet._good);
-  for (let i = 0; i < layers.length; i++) if (i !== httpGet._good) order.push(i);
-  let best = '';
-  for (const idx of order) {
-    if (Date.now() > deadline) break;
-    let html = '';
-    try { html = await layers[idx](); } catch (e) { html = ''; }
-    if (validFor(url, html)) {
-      httpGet._good = idx;
-      return html;
-    }
-    if (html && html.length > best.length) best = html;
-  }
-  return best;
+  try { return await raceLayers(url, layerA, track); } catch (e) { /* A 组全灭, 进 B 组 */ }
+  const layerB = [
+    async () => fetchRaw('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), { 'User-Agent': UA }, 20000),
+    async () => fetchRaw('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), { 'User-Agent': UA }, 15000),
+  ];
+  try { return await raceLayers(url, layerB, track); } catch (e) { /* 全灭 */ }
+  return track.best;
 }
-httpGet._good = -1;
 
 function validPlayResp(text) {
+  // 第四轮收紧: 必须 status === true 才算铸造成功。allorigins 转发
+  // POST 时会丢 body, 站方回 {"status":false,"msg":"no sources"} ——
+  // 旧校验 ('status' in j) 会把这种假成功当胜出, 竞速里更会挡住
+  // 较慢但真实的直连结果, 故此处与 fetchEmbedPaths 的口径对齐。
   if (!text) return false;
   try {
     const j = JSON.parse(text);
-    return j && typeof j === 'object' && 'status' in j;
+    return !!j && typeof j === 'object' && j.status === true;
   } catch (e) { return false; }
 }
 
 async function postViaAllorigins(url, bodyStr, headers, timeout) {
   const relay = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url);
-  for (let i = 0; i < 3; i++) { // allorigins 偶发 502/522, 给三次机会
+  for (let i = 0; i < 2; i++) { // allorigins 偶发 502/522, 给两次机会
     const ctl = new AbortController();
-    const to = setTimeout(() => ctl.abort(), Math.max(timeout, 25000));
+    const to = setTimeout(() => ctl.abort(), Math.max(timeout, 20000));
     try {
       const r = await fetch(relay, {
         method: 'POST',
@@ -2113,7 +2130,7 @@ async function postViaAllorigins(url, bodyStr, headers, timeout) {
         if (validPlayResp(text)) return text;
       }
     } catch (e) { /* 再试/落空 */ } finally { clearTimeout(to); }
-    if (i < 2) await new Promise((res) => setTimeout(res, 2000));
+    if (i < 1) await new Promise((res) => setTimeout(res, 2000));
   }
   return '';
 }
@@ -2128,25 +2145,39 @@ async function httpPostForm(url, bodyStr, opts = {}) {
     'Origin': HOST,
   };
   const timeout = opts.timeout || 15000;
-  try {
-    const { data, status } = await req.post(url, bodyStr, { headers, timeout });
-    if ((!status || status === 200) && data != null && data !== '') {
-      const text = typeof data === 'string' ? data : JSON.stringify(data);
-      if (validPlayResp(text)) return text;
-    }
-  } catch (e) { /* 落 fetch */ }
-  try {
-    const ctl = new AbortController();
-    const to = setTimeout(() => ctl.abort(), timeout);
-    try {
-      const r = await fetch(url, { method: 'POST', headers, body: bodyStr, signal: ctl.signal, redirect: 'follow' });
-      if (r.ok) {
-        const text = await r.text();
-        if (validPlayResp(text)) return text;
-      }
-    } finally { clearTimeout(to); }
-  } catch (e) { /* 落中转 */ }
-  return postViaAllorigins(url, bodyStr, headers, timeout);
+  // 三通道并行竞速, 首个 status===true 的响应胜出 (理由同 httpGet)
+  const attempts = [
+    async () => { // 直连 req (axios)
+      try {
+        const { data, status } = await req.post(url, bodyStr, { headers, timeout });
+        if ((!status || status === 200) && data != null && data !== '') {
+          return typeof data === 'string' ? data : JSON.stringify(data);
+        }
+      } catch (e) { /* 落空 */ }
+      return '';
+    },
+    async () => { // 直连 fetch
+      const ctl = new AbortController();
+      const to = setTimeout(() => ctl.abort(), timeout);
+      try {
+        const r = await fetch(url, { method: 'POST', headers, body: bodyStr, signal: ctl.signal, redirect: 'follow' });
+        if (r.ok) return await r.text();
+      } catch (e) { /* 落空 */ } finally { clearTimeout(to); }
+      return '';
+    },
+    async () => postViaAllorigins(url, bodyStr, headers, timeout), // 中转转发
+  ];
+  const jobs = attempts.map((fn) => (async () => {
+    const text = await fn().catch(() => '');
+    if (validPlayResp(text)) return text;
+    throw new Error('invalid play resp');
+  })());
+  // 总截止 12s: 铸造全灭时别让详情/播放陪着慢通道一起等到天荒地老
+  const capped = Promise.race([
+    Promise.any(jobs),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('post race deadline')), 12000)),
+  ]);
+  try { return await capped; } catch (e) { return ''; }
 }
 
 // ---------- 页面缓存 (详情供 play 复用, 省一次整链) ----------
