@@ -70,7 +70,7 @@ function clean(s) {
     .replace(/&#\d+;/g, ''));
 }
 
-// ---------------- 抓取 (多层兜底 + 内容校验 + 胜出层记忆) ----------------
+// ---------------- 抓取 (多层兜底 + 内容校验; 第四轮改并行竞速, 见下方) ----------------
 // 2026-10-21 第三轮修复 (与 bestjavporn 同病同方):
 // 真机故障根因 (VM 实测坐实): 本站 (与 bestjavporn 同运营网络) 的
 // Cloudflare 按 User-Agent 拉黑 HTTP 库特征 UA —— okhttp / Java /
@@ -129,7 +129,7 @@ async function viaJina(url) {
     const html = await fetchText('https://r.jina.ai/' + url, {
       'User-Agent': UA,
       'x-respond-with': 'html',
-    }, 22000);
+    }, 15000);
     if (isRealPage(html)) return html;
     if (i === 0) await new Promise((res) => setTimeout(res, 1200));
   }
@@ -139,41 +139,60 @@ async function viaJina(url) {
 async function viaAllorigins(url) {
   return fetchText('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
     'User-Agent': UA,
-  }, 30000);
+  }, 20000);
 }
 
 async function viaCodetabs(url) {
   return fetchText('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), {
     'User-Agent': UA,
-  }, 22000);
+  }, 15000);
 }
 
-const PAGE_LAYERS = [
+// ---------------- 第四轮: 并行竞速 (首个真页面胜出) ----------------
+// 第三轮的串行逐层试错在真机上仍被拖死 (2026-10-22 用户复报:
+// 分类能出、分类下内容加载不出)。复盘 (VM 实测): 直连两层在
+// App 运行时里带被站方拉黑的客户端特征, 注定先吃两记失败; 其后
+// allorigins / codetabs 抽风时各回 522 且各烧 20~30s, 串行叠加
+// 轻松超过 App 的等待耐心 —— 分类页永远等不到能用的通道胜出。
+// 本轮改并行竞速: A 组 (直连 req / 直连 fetch / jina 读页) 同时
+// 发车, 谁先回真页面谁赢, 总耗时 = 最快存活通道 (jina 实测
+// 0.3~2s 全覆盖 home/分类/详情/搜索); A 组全灭才进 B 组
+// (allorigins / codetabs 并行兜底, 各自封顶)。内容校验不变。
+const PAGE_LAYERS_A = [
   (url, ms) => viaReq(url, ms),
   (url, ms) => viaFetch(url, ms),
   (url) => viaJina(url),
+];
+const PAGE_LAYERS_B = [
   (url) => viaAllorigins(url),
   (url) => viaCodetabs(url),
 ];
-let goodLayer = -1; // 上次胜出的层下标, -1 = 未知
+let goodLayer = ''; // 上次胜出通道 (仅记录, 不再决定顺序)
+
+async function firstValid(fns, url, timeoutMs, track) {
+  const jobs = fns.map((fn, i) => (async () => {
+    let html = '';
+    try { html = await fn(url, timeoutMs); } catch (e) { html = ''; }
+    if (html && html.length > track.best.length) track.best = html;
+    if (isRealPage(html)) return { i, html };
+    throw new Error('invalid page');
+  })());
+  return Promise.any(jobs);
+}
 
 async function getPage(url, timeoutMs) {
-  const deadline = Date.now() + 70000;
-  const order = [];
-  if (goodLayer >= 0) order.push(goodLayer);
-  for (let i = 0; i < PAGE_LAYERS.length; i++) if (i !== goodLayer) order.push(i);
-  let best = '';
-  for (const idx of order) {
-    if (Date.now() > deadline) break;
-    let html = '';
-    try { html = await PAGE_LAYERS[idx](url, timeoutMs); } catch (e) { html = ''; }
-    if (isRealPage(html)) {
-      goodLayer = idx;
-      return html;
-    }
-    if (html && html.length > best.length) best = html;
-  }
-  return best;
+  const track = { best: '' };
+  try {
+    const win = await firstValid(PAGE_LAYERS_A, url, timeoutMs, track);
+    goodLayer = 'A' + win.i;
+    return win.html;
+  } catch (e) { /* A 组全灭, 进 B 组 */ }
+  try {
+    const win = await firstValid(PAGE_LAYERS_B, url, timeoutMs, track);
+    goodLayer = 'B' + win.i;
+    return win.html;
+  } catch (e) { /* 全灭: 回最长的残页 (与旧版兜底口径一致) */ }
+  return track.best;
 }
 
 // ---------------- 解析 ----------------
