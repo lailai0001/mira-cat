@@ -31,6 +31,14 @@
 //      (属性顺序无关、相对/绝对 href 通吃、标题多路兜底), 页面
 //      变体导致严格层解 0 卡时宽松层接住, 诊断卡会标注;
 //   ④ 分类/播放/源名/key 与旧版一致, 播放沿用 RELAY->嗅探设计。
+//
+// 2026-10-22 真机归因修复: 诊断卡回传坐实 App 蜘蛛运行时里没有
+// 全局 fetch ("fetch is not a function"), 旧版全部 fetch 通道在
+// 设备上 0ms 秒死, 只剩 req/https 两栈真发出请求 (且直连被 CF
+// 403)。本地 harness 跑在有 fetch 的 Node 里, 四轮全被掩盖。本次
+// 只换 HTTP 层: 全部通道底层改走框架 req (axios), 全局 fetch 仅
+// 在 typeof 守卫成立时作 'fetch' 直连通道的附加实现, 缺失时该
+// 通道自动退化为 req —— 任何通道不得再依赖 fetch 存在。
 import req from '../../util/req.js';
 import https from 'https';
 import zlib from 'zlib';
@@ -223,16 +231,57 @@ function validFor(kind, html) {
   return kind === 'detail' ? validDetailPage(html) : validListPage(html);
 }
 
-async function fetchRaw2(url, headers, timeoutMs, method, body) {
+// ---- 传输层: 全部走框架 req (axios); fetch 仅守卫内附加 ----
+// 设备运行时无全局 fetch (见文件头归因), 故所有通道的底层统一走
+// req。HAS_FETCH 只决定 'fetch' 直连通道用不用原生 fetch 多一栈。
+const HAS_FETCH = typeof fetch === 'function';
+
+// reqRaw: 统一回 {status, body, rawBytes, headers, err}。状态码不
+// 抛错 (validateStatus 全放行), body 仅 2xx 时给正文 (对齐 fetch
+// 的 r.ok 口径); axios 默认跟随重定向 (maxRedirects 5, 对齐旧
+// redirect:'follow'); 网络错误/超时回 status 0。transformResponse
+// 设恒等: 防 axios 按 Content-Type 自动 JSON 解析污染正文
+// (aoGet 等通道的正文由上层自行 JSON.parse)。
+async function reqRaw(url, headers, timeoutMs, method, body) {
+  try {
+    const cfg = {
+      method: method || 'GET',
+      url,
+      headers: headers || {},
+      timeout: timeoutMs || 10000,
+      responseType: 'text',
+      transformResponse: [(d) => d],
+      validateStatus: () => true,
+      maxRedirects: 5,
+    };
+    if (body !== undefined && body !== null) cfg.data = body;
+    const r = await req.request(cfg);
+    const text = typeof r.data === 'string' ? r.data : (r.data === null || r.data === undefined ? '' : String(r.data));
+    const ok = r.status >= 200 && r.status < 300;
+    return { status: r.status || 0, body: ok ? text : '', rawBytes: text.length, headers: r.headers || {} };
+  } catch (e) {
+    const isTimeout = !!(e && (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT' || /timeout/i.test(String(e.message || ''))));
+    return { status: 0, body: '', rawBytes: 0, headers: {}, err: isTimeout ? 'timeout' : String((e && e.message) || e) };
+  }
+}
+
+// 全局 fetch 实现 (仅 HAS_FETCH 时被 chFetch 调用): 与 reqRaw 同
+// 返回形态; headers 归一为空对象 (调用方不依赖)。
+async function fetchViaGlobal(url, headers, timeoutMs, method, body) {
   const ctl = new AbortController();
   const to = setTimeout(() => ctl.abort(), timeoutMs || 10000);
   try {
     const r = await fetch(url, { headers, signal: ctl.signal, redirect: 'follow', method: method || 'GET', body });
     const text = await r.text();
-    return { status: r.status, body: r.ok ? text : '', rawBytes: text.length };
+    return { status: r.status, body: r.ok ? text : '', rawBytes: text.length, headers: {} };
   } catch (e) {
-    return { status: 0, body: '', err: (e && e.name === 'AbortError') ? 'timeout' : String((e && e.message) || e) };
+    return { status: 0, body: '', rawBytes: 0, headers: {}, err: (e && e.name === 'AbortError') ? 'timeout' : String((e && e.message) || e) };
   } finally { clearTimeout(to); }
+}
+
+// 通用取数原语 (全部通道经此; 底层 = reqRaw, 不再是全局 fetch)
+async function fetchRaw2(url, headers, timeoutMs, method, body) {
+  return reqRaw(url, headers, timeoutMs, method, body);
 }
 
 // 第一通道: 自有 Worker 跳板 pornfhd-fetch (蜘蛛 -> 用户 Worker -> 站点)
@@ -242,19 +291,16 @@ async function chOwn(url, timeoutMs) {
     if (!OWN_HOST_RE.test(new URL(url).hostname)) return { status: 0, body: '', note: '白名单外跳过' };
   } catch (e) { return { status: 0, body: '', note: 'URL非法' }; }
   const w = OWN_FETCH + '/get?u=' + encodeURIComponent(url) + '&ref=' + encodeURIComponent(REFERER);
-  const ctl = new AbortController();
-  const to = setTimeout(() => ctl.abort(), timeoutMs || 10000);
-  try {
-    const r = await fetch(w, { headers: { 'User-Agent': UA }, signal: ctl.signal, redirect: 'follow' });
-    const text = await r.text();
-    return { status: r.status, body: r.ok ? text : '', rawBytes: text.length, upst: r.headers.get('x-pornfhd-upst') || '' };
-  } catch (e) {
-    return { status: 0, body: '', err: (e && e.name === 'AbortError') ? 'timeout' : String((e && e.message) || e) };
-  } finally { clearTimeout(to); }
+  const r = await reqRaw(w, { 'User-Agent': UA }, timeoutMs || 10000);
+  return { ...r, upst: (r.headers && r.headers['x-pornfhd-upst']) || '' };
 }
 
+// 'fetch' 直连通道: 有全局 fetch 时用它多一栈; 设备上无 fetch 时
+// 退化为 req 直连 (同为 BROWSER_HEADERS 全套头), 通道不许死。
 async function chFetch(url, timeoutMs) {
-  return fetchRaw2(url, { ...BROWSER_HEADERS, Referer: REFERER }, timeoutMs);
+  const headers = { ...BROWSER_HEADERS, Referer: REFERER };
+  if (HAS_FETCH) return fetchViaGlobal(url, headers, timeoutMs);
+  return reqRaw(url, headers, timeoutMs);
 }
 
 async function chReq(url, timeoutMs) {
@@ -478,7 +524,7 @@ function diagText(url, res) {
   const missing = ['own', 'fetch', 'req', 'https', 'demo', 'jina', 'aoGet', 'aoRaw', 'codetabs']
     .filter((n) => !res.outcomes.some((o) => o.name === n || o.name === n + '2'));
   if (missing.length) lines.push('未及返回 (竞速已胜出或总截止): ' + missing.join(' '));
-  lines.push('判读: 200/0卡=通道通但解析为零; 403/5xx=通道被拒; ERR/timeout=通道不通; own=自有Worker, demo=公共cors演示, jina/ao/codetabs=公共中转, fetch/req/https=直连三栈。');
+  lines.push('判读: 200/0卡=通道通但解析为零; 403/5xx=通道被拒; ERR/timeout=通道不通; own=自有Worker, demo=公共cors演示, jina/ao/codetabs=公共中转, fetch/req/https=直连三栈(全走req, fetch仅运行时有时多一栈)。');
   return lines.join('\n');
 }
 
@@ -572,15 +618,12 @@ async function play(reqIn) {
   if (!id) return { parse: 0, url: '' };
   if (id.includes(DIAG_ID)) return { parse: 0, url: '' };
   const durl = /^https?:\/\//.test(id) ? id.split('$').pop() : HOST + id;
-  // 1) 自建中转 (部署后生效): 中转铸造 + 解出直链
+  // 1) 自建中转 (部署后生效): 中转铸造 + 解出直链 (走 req, 不用 fetch)
   if (RELAY) {
     try {
-      const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), 90000);
-      const r = await fetch(`${RELAY}/play?url=${encodeURIComponent(durl)}`, { signal: ctl.signal });
-      clearTimeout(timer);
-      if (r.ok) {
-        const j = await r.json();
+      const r = await reqRaw(`${RELAY}/play?url=${encodeURIComponent(durl)}`, { 'User-Agent': UA }, 90000);
+      if (r.status === 200 && r.body) {
+        const j = JSON.parse(r.body);
         if (j && j.ok && j.url) {
           return { parse: 0, url: j.url, header: { 'User-Agent': UA, Referer: REFERER } };
         }
