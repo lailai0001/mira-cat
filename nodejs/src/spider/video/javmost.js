@@ -551,18 +551,29 @@ async function subAttach(res, subsP) {
   return res;
 }
 
-// ---------------- 字幕聚合 (Layer A 试点, 2026-10-22) ----------------
-// 点播时按片名多源搜字幕, 候选以 TVBox 标准 subs 数组挂到 play
-// 返回对象上 (播放器是否渲染由播放器决定, 蜘蛛只负责挂载)。
-// 来源优先级 (用户钦定): 迅雷 > 迅雷看看 > SubtitleCat > SubHD
-// > 射手。实探结论 (报告 castbank/REPORT_subtitle_pilot.md):
-// 「迅雷」与「迅雷看看」是同一个 oracle 接口 (api-shoulei-ssl.
-// xunlei.com, 按名搜、结果即 .srt 直链), 实现合并为一源占首档;
-// SubHD 搜索与 prepare 通但 /down/ 被站方门控 (VM 出口实测 403
-// 「下载页面已失效」)、射手 assrt.net 源站经 CF 522 不可达 —
-// 两源本轮不接入 (不挂未验证链路)。全程 req 主栈 (subHttp),
-// 每源独立超时、总预算 6s、与 resolveLines 并行, 失败全静默;
-// 无结果时 play 返回对象不带 subs 键, 与未接入前逐字段一致。
+// ---------------- 字幕聚合 (Layer A 重写, 2026-10-23) ----------------
+// 按用户自有迅雷看看 REX 组件 (xunlei.subtitle) 的方法重写: 旧版把
+// [番号, 全标题, 番号+标题] 多个键的召回合并成一池只排序不过滤,
+// 全标题键的模糊召回灌进大量别片字幕 (实测 JUR-887 全标题键池
+// 前排即 JUX-021 等别片), 且迅雷档位恒占满上限 10, SubtitleCat
+// 永远挤不进来。新版三招 (与组件一致):
+// (a) 键序逐个查、首个有结果的键即停 — 番号键命中的池小而准;
+// (b) 命中后严过滤: 条目 name/langs/ext 须含番号 (宽松形亦可)
+//     或片名全文, 不含的全扔, 无回退 (组件原法的回退宽松名单
+//     在冷门番号上会把邻近番号的模糊池整池放行, 实测有害已删;
+//     乱码单字键亦实测能召回无关字幕, 同样靠严过滤挡下);
+// (c) 组件打分: cid_match 100000、含番号 +25000, 再加 oracle 自
+//     带 score / fingerprintScore / 下载量, 按名+址去重取 top。
+// 槽位 (用户钦定): 迅雷 (键序 [番号, 紧凑番号]) > 迅雷看看
+// (组件完整键序 [番号, 紧凑番号, 番号+标题, 紧凑番号+标题,
+// 全标题]) > SubtitleCat; 两迅雷槽同走同一 oracle 接口、不管
+// 重不重复, 合并按 URL 去重、同条归高档位。合并序 = 档位 ->
+// 语言 (简中>繁中>双语>英文>日文>其他, 沿用 subLangOf 口径)
+// -> 分数; 全局上限 10、单槽软上限 8 (SubtitleCat 留位)。
+// 全程 subHttp (框架 req 主栈), 迅雷系逐请求超时 3s、键序串行
+// 首中即停; 总预算 6s、失败全静默; 无结果时 play 返回对象不带
+// subs 键, 与未接入前逐字段一致。SubHD (下载被站方门控) 与
+// 射手 (源站 522) 仍不接入。
 const SUB_TTL = 10 * 60 * 1000;
 const subNameCache = new Map();   // durl -> 片名 (detail 时 best-effort 写入)
 const subResultCache = new Map(); // durl -> {ts, subs}
@@ -596,17 +607,57 @@ function subExtractCode(text) {
   return '';
 }
 
-function subKeys(durl) {
+// 搜索上下文: 片名、番号、紧凑番号、标题部分 (去番号与噪声词)
+function subCtx(durl) {
   const title = (subNameCache.get(durl) || subSlugTitle(durl) || '').trim();
   const code = subExtractCode(title) || subExtractCode(String(durl || ''));
-  const keys = [];
-  if (code) keys.push(code);
-  if (title && title !== code) keys.push(title);
+  const compact = code ? code.replace(/[-_ ]/g, '') : '';
+  let titlePart = '';
   if (code && title) {
-    const tp = title.replace(new RegExp(code.replace(/-/g, '[- ]?'), 'i'), '').replace(/^[\s\-_:]+|[\s\-_:]+$/g, '').trim();
-    if (tp && tp.length >= 3) keys.push(code + ' ' + tp);
+    titlePart = title
+      .replace(new RegExp(code.replace(/[-_]/g, '[-_ ]?'), 'i'), ' ')
+      .replace(/\b(UNCENSORED|LEAK|OTHER|COMPLETE|FULL|HDR|WEB|BLURAY|BDRIP|WEBDL|REMUX|X264|X265|10BIT|8BIT|HEVC|AVC)\b/gi, ' ')
+      .replace(/\b(?:EP|E|S|SEASON)\s*\d{1,3}\b/gi, ' ')
+      .replace(/^[\s\-_:]+|[\s\-_:]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (titlePart === code || titlePart === compact) titlePart = '';
   }
-  return [...new Set(keys)].filter((k) => k.length >= 2).slice(0, 3);
+  return { title, code, compact, titlePart };
+}
+
+// 迅雷槽键序: 只番号两键 (锚定)
+function subKeysX(ctx) {
+  const keys = [];
+  if (ctx.code) {
+    keys.push(ctx.code);
+    if (ctx.compact && ctx.compact !== ctx.code) keys.push(ctx.compact);
+  }
+  return keys;
+}
+
+// 迅雷看看槽键序: 组件完整键序 (番号、紧凑番号、番号+标题、
+// 紧凑番号+标题、全标题), 逐个查、首中即停。
+function subKeysXL(ctx) {
+  const keys = subKeysX(ctx);
+  if (ctx.code && ctx.titlePart) {
+    keys.push(ctx.code + ' ' + ctx.titlePart);
+    keys.push(ctx.compact + ' ' + ctx.titlePart);
+  }
+  if (ctx.title && ctx.title !== ctx.code) keys.push(ctx.title);
+  return [...new Set(keys)].filter((k) => k.length >= 2);
+}
+
+// 严过滤的匹配文本 (组件口径: 片名 + 上下文, 全小写与去分隔符两形)
+function subMatchOf(durl, ctx) {
+  const text = ((ctx.title || '') + ' ' + String(durl || '')).trim().toLowerCase();
+  const title = (ctx.title || '').toLowerCase();
+  return {
+    text,
+    loose: text.replace(/[-_\s.]/g, ''),
+    title,
+    titleLoose: title.replace(/[-_\s.]/g, ''),
+  };
 }
 
 // 语言判定: rank 越小越优先 (简中 > 繁中 > 双语 > 英文 > 其他)
@@ -622,40 +673,130 @@ function subLangOf(name, langs) {
 
 const SUB_TEXT_RE = /\.(srt|vtt|ass|ssa)(\?|#|$)/i;
 
-// 迅雷看看 (兼「迅雷」位, 同一 oracle 接口): 按名搜, 结果即直链。
-// 前 2 个键并行查, 每键返回即入 bag (不互相等候 — 慢键不能扣住
-// 快键的结果), 最终由 subMerge 按档位/语言/番号命中/热度排序。
-async function subFromXunlei(keys, code, bag) {
-  await Promise.all(keys.slice(0, 2).map(async (key) => {
-    const r = await subHttp('https://api-shoulei-ssl.xunlei.com/oracle/subtitle?name=' + encodeURIComponent(key),
-      { 'User-Agent': 'ForwardWidgets/1.0.2', Accept: '*/*' }, 5000);
-    if (r.status !== 200 || !r.body) return;
-    let j;
-    try { j = JSON.parse(r.body); } catch (e) { return; }
-    if (!j || Number(j.code) !== 0 || !Array.isArray(j.data)) return;
-    for (const it of j.data) {
-      if (!it) continue;
-      const url = String(it.url || it.Url || '');
-      if (!SUB_TEXT_RE.test(url)) continue; // 压缩包/非文本字幕剔除
-      const nm = String(it.name || it.Name || '字幕');
-      const langs = Array.isArray(it.languages) ? it.languages.join(',') : String(it.langs || it.Langs || '');
-      const lang = subLangOf(nm, langs);
-      const pop = (Number(it.down_count || it.DownCount || it.downloads || 0) || 0)
-        + (Number(it.score || 0) || 0) + (Number(it.fingerprintf_score || it.fingerprint_score || 0) || 0);
-      // 个别条目名是裸哈希 (不可读): 显示名换成番号字幕, 匹配/
-      // 语言判定仍用原名
-      const dispName = /^[0-9a-f]{24,}$/i.test(nm.trim()) ? (code ? code + ' 迅雷字幕' : '迅雷字幕') : nm;
-      bag.push({
-        src: '迅雷看看', tier: 0, name: dispName, url, lang: lang.tag, langRank: lang.rank,
-        codeHit: code && nm.toUpperCase().replace(/[._]/g, ' ').includes(code.replace(/-/g, ' ')) ? 1 : 0, pop,
-      });
-    }
-  }));
+// 文本字幕格式判定: 文件名扩展名 > 条目 ext 字段 > url 后缀;
+// 压缩包一律剔除 (与组件 getExt 口径一致, 只认 srt/vtt/ass/ssa)。
+function subFmtOf(name, ext, url) {
+  const hay = (String(name || '') + ' ' + String(url || '')).toLowerCase();
+  if (/\.(zip|rar|7z)(\?|#|$)/.test(hay)) return '';
+  const fromName = String(name || '').toLowerCase().match(/\.(srt|vtt|ass|ssa)$/);
+  if (fromName) return fromName[1];
+  const e = String(ext || '').toLowerCase().replace(/^\./, '');
+  if (/^(srt|vtt|ass|ssa)$/.test(e)) return e;
+  const fromUrl = String(url || '').match(SUB_TEXT_RE);
+  if (fromUrl) return fromUrl[1].toLowerCase();
+  return '';
 }
 
-// SubtitleCat: 搜索页 -> 字幕页 -> 按语言分的 .srt 直链 (逐页入 bag)
-async function subFromSubtitleCat(keys, code, bag) {
-  const key = keys[0];
+// 裸哈希名不可读: 显示名换成番号字幕 (匹配/过滤仍用原名)
+function subDispName(nm, code) {
+  const base = String(nm || '').replace(/\.(srt|vtt|ass|ssa)$/i, '');
+  if (/^[0-9a-f]{24,}$/i.test(base.trim())) return code ? code + ' 字幕' : '字幕';
+  return nm;
+}
+
+// oracle 单键查询 (同趟搜索内按键缓存, 两槽共用, 不重复发请求)
+async function subOracle(key, ocache) {
+  if (ocache.has(key)) return ocache.get(key);
+  const p = (async () => {
+    const r = await subHttp('https://api-shoulei-ssl.xunlei.com/oracle/subtitle?name=' + encodeURIComponent(key),
+      { 'User-Agent': 'ForwardWidgets/1.0.2', Accept: '*/*' }, 3000);
+    if (r.status !== 200 || !r.body) return [];
+    let j;
+    try { j = JSON.parse(r.body); } catch (e) { return []; }
+    if (!j || Number(j.code) !== 0 || !Array.isArray(j.data)) return [];
+    return j.data;
+  })();
+  ocache.set(key, p);
+  return p;
+}
+
+// oracle 条目归一 (组件 normalizeResult 的字段口径)
+function subNormItem(it) {
+  const name = String(it.name || it.Name || it.title || it.Title || it.filename || it.FileName || '字幕');
+  const langs = Array.isArray(it.languages) ? it.languages.join(',')
+    : (Array.isArray(it.Languages) ? it.Languages.join(',') : String(it.langs || it.Langs || it.language || ''));
+  return {
+    name,
+    langs,
+    ext: String(it.ext || it.Ext || it.format || it.Format || ''),
+    url: String(it.url || it.Url || ''),
+    cid: Boolean(it.cid_match ?? it.CidMatch),
+    down: Number(it.down_count || it.DownCount || it.downloads || it.Downloads || 0) || 0,
+    score: Number(it.score || it.Score || 0) || 0,
+    fp: Number(it.fingerprintf_score || it.fingerprint_score || it.FingerprintScore || it.fingerprintfScore || 0) || 0,
+    duration: Number(it.duration || it.Duration || 0) || 0,
+    size: Number(it.file_size || it.FileSize || it.size || it.Size || 0) || 0,
+  };
+}
+
+// 严过滤 (组件口径): 条目 name/langs/ext 须含番号 (原形或宽松
+// 形) 或片名全文, 否则扔掉。片名分支必须守非空: 个别蜘蛛的
+// 播放 id 与 detail 登记键对不上时片名缓存会落空 (title=''),
+// 空串是任何字符串的子串, 不守就会全池放行 (bigbuttshub 实测
+// 教训: 假番号 EMPTY-24 搜出的 Sherlock 剧集字幕整页漏入)。
+function subRelevant(it, ctx, match) {
+  const text = (it.name + ' ' + it.langs + ' ' + it.ext).toLowerCase();
+  const loose = text.replace(/[-_\s.]/g, '');
+  if (ctx.code) {
+    if (text.includes(ctx.code.toLowerCase())) return true;
+    if (ctx.compact && loose.includes(ctx.compact.toLowerCase())) return true;
+  }
+  if (!match.text) return false;
+  return text.includes(match.text) || loose.includes(match.loose)
+    || (match.title ? (text.includes(match.title) || loose.includes(match.titleLoose)) : false)
+    || match.text.includes(text);
+}
+
+// 组件打分 (scoreItem 的电影路径): cid_match 100000、含番号
+// +25000、oracle 自带 score/fingerprintScore、下载量、时长/大小。
+function subScoreItem(it, ctx, match) {
+  const text = (it.name + ' ' + it.langs + ' ' + it.ext).toLowerCase();
+  const loose = text.replace(/[-_\s.]/g, '');
+  let s = (it.cid ? 100000 : 0) + it.down / 10000;
+  if (ctx.code && (text.includes(ctx.code.toLowerCase()) || (ctx.compact && loose.includes(ctx.compact.toLowerCase())))) s += 25000;
+  s += Math.max(0, it.score) + Math.max(0, it.fp);
+  if (it.duration > 0) s += 50;
+  if (it.size > 0) s += Math.min(it.size / 1024 / 1024, 20);
+  if (match.title && (text.includes(match.title) || loose.includes(match.titleLoose))) s += 1000;
+  if (ctx.code) s += 500;
+  if (text.includes('sub') || text.includes('subtitle') || text.includes('字幕')) s += 300;
+  return s;
+}
+
+// 迅雷系槽位 (迅雷 tier 0 / 迅雷看看 tier 1): 键序逐个查、首个
+// 有结果的键即停; 命中池只过严过滤、无任何回退 — 组件原法的
+// 「过滤到空回退宽松名单」在冷门番号上实测有害 (oracle 对无精
+// 确字幕的番号返回邻近番号的模糊池, 回退等于整池垃圾放行:
+// MOGK-006 挂上 MOGK-004/002、FC2-PPV-4991508 挂上他人番号),
+// 与「宁缺毋滥」冲突, 故删除 (与 REX 版相关性闸门口径一致)。
+async function subSlotOracle(keys, src, tier, ctx, match, ocache, bag) {
+  let pool = null;
+  for (const k of keys) {
+    const list = await subOracle(k, ocache);
+    if (list && list.length) { pool = list; break; }
+  }
+  if (!pool) return;
+  const items = [];
+  for (const raw of pool) {
+    if (!raw) continue;
+    const it = subNormItem(raw);
+    if (!it.url) continue;
+    const fmt = subFmtOf(it.name, it.ext, it.url);
+    if (!fmt) continue;
+    items.push({ name: it.name, langs: it.langs, ext: it.ext, url: it.url, fmt, norm: it });
+  }
+  if (!items.length) return;
+  const finalItems = items.filter((it) => subRelevant(it, ctx, match));
+  for (const it of finalItems) {
+    const lang = subLangOf(it.name, it.langs);
+    bag.push({ src, tier, name: subDispName(it.name, ctx.code), url: it.url, fmt: it.fmt, lang: lang.tag, langRank: lang.rank, score: subScoreItem(it.norm, ctx, match) });
+  }
+}
+
+// SubtitleCat 槽 (tier 2): 沿用旧芯搜索/解析 (按番号键搜、逐页
+// 取按语言分的直链), 同样过严过滤 (无回退)。
+async function subFromSubtitleCat(ctx, match, bag) {
+  const key = ctx.code || ctx.title;
   if (!key) return;
   const r = await subHttp('https://subtitlecat.com/index.php?search=' + encodeURIComponent(key),
     { 'User-Agent': SUB_UA, Referer: 'https://subtitlecat.com/' }, 5000);
@@ -674,34 +815,30 @@ async function subFromSubtitleCat(keys, code, bag) {
     for (const m of pr.body.matchAll(/href="(\/subs\/\d+\/[^"]+\.(?:srt|vtt|ass))"/gi)) {
       let nm = m[1].split('/').pop() || '字幕';
       try { nm = decodeURIComponent(nm); } catch (e) { /* 保持原样 */ }
+      if (!subRelevant({ name: nm, langs: '', ext: '' }, ctx, match)) continue;
       const lang = subLangOf(nm, '');
-      bag.push({
-        src: 'SubtitleCat', tier: 2, name: nm, url: 'https://subtitlecat.com' + m[1], lang: lang.tag, langRank: lang.rank,
-        codeHit: code && nm.toUpperCase().replace(/[._]/g, ' ').includes(code.replace(/-/g, ' ')) ? 1 : 0, pop: 0,
-      });
+      const fmt = (nm.match(/\.(srt|vtt|ass)$/i) || [])[1].toLowerCase();
+      bag.push({ src: 'SubtitleCat', tier: 2, name: nm, url: 'https://subtitlecat.com' + m[1], fmt, lang: lang.tag, langRank: lang.rank, score: 0 });
     }
   }));
 }
 
-// 合并排序: 来源档位 -> 语言 -> 番号命中 -> 热度; 按 url 与
-// (语言|去扩展名文件名) 双键去重 (迅雷与 SubtitleCat 常有同源
-// 同名文件、不同直链); 上限 10 条。
+// 合并: 档位 -> 语言 -> 分数; 按 URL 去重 (同条归先到高档位);
+// 全局上限 10、单槽软上限 8 (给 SubtitleCat 留位)。
 function subMerge(items) {
   const sorted = items.slice().sort((a, b) =>
-    (a.tier - b.tier) || (a.langRank - b.langRank) || (b.codeHit - a.codeHit) || (b.pop - a.pop) || String(a.name).localeCompare(String(b.name)));
+    (a.tier - b.tier) || (a.langRank - b.langRank) || (b.score - a.score) || String(a.name).localeCompare(String(b.name)));
   const seenUrl = new Set();
-  const seenName = new Set();
+  const perTier = {};
   const out = [];
   for (const it of sorted) {
-    if (seenUrl.has(it.url)) continue;
-    const nameKey = it.lang + '|' + it.name.toLowerCase().replace(/\.(srt|vtt|ass|ssa)$/i, '');
-    if (seenName.has(nameKey)) continue;
-    seenUrl.add(it.url);
-    seenName.add(nameKey);
-    const ext = (it.url.match(SUB_TEXT_RE) || [])[1].toLowerCase();
-    const cleanName = it.name.replace(/\.(srt|vtt|ass|ssa)$/i, '').slice(0, 60);
-    out.push({ name: it.src + '·' + (it.lang ? it.lang + '·' : '') + cleanName, url: it.url, format: ext });
     if (out.length >= 10) break;
+    if (seenUrl.has(it.url)) continue;
+    if ((perTier[it.tier] || 0) >= 8) continue;
+    seenUrl.add(it.url);
+    perTier[it.tier] = (perTier[it.tier] || 0) + 1;
+    const cleanName = it.name.replace(/\.(srt|vtt|ass|ssa)$/i, '').slice(0, 60);
+    out.push({ name: it.src + '·' + (it.lang ? it.lang + '·' : '') + cleanName, url: it.url, format: it.fmt });
   }
   return out;
 }
@@ -713,14 +850,16 @@ async function subSearchAll(durl) {
   if (hit && Date.now() - hit.ts < SUB_TTL) return hit.subs;
   if (subInflight.has(durl)) return subInflight.get(durl);
   const p = (async () => {
-    const keys = subKeys(durl);
+    const ctx = subCtx(durl);
     let subs = [];
-    if (keys.length) {
-      const code = subExtractCode(subNameCache.get(durl) || '') || subExtractCode(String(durl || ''));
+    if (ctx.code || ctx.title) {
+      const match = subMatchOf(durl, ctx);
       const bag = [];
+      const ocache = new Map();
       const jobs = [
-        subFromXunlei(keys, code, bag),
-        subFromSubtitleCat(keys, code, bag),
+        subSlotOracle(subKeysX(ctx), '迅雷', 0, ctx, match, ocache, bag),
+        subSlotOracle(subKeysXL(ctx), '迅雷看看', 1, ctx, match, ocache, bag),
+        subFromSubtitleCat(ctx, match, bag),
       ].map((jp) => Promise.resolve(jp).catch(() => {}));
       const all = Promise.allSettled(jobs);
       // 总预算 6s: 到点先用已入 bag 的部分合并返回; 后台源跑完
