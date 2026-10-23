@@ -50,6 +50,105 @@ const M3U8_PREFIXES = [
 ];
 const M3U8_SUFFIX = '/playlist.m3u8';
 
+// ---------- m3u8 本地代理 (修复分片 .jpeg 伪装导致的不可拖动) ----------
+// 病因 (2026-10-23 实证): surrit 的分片是 TS 内容却用 videoN.jpeg
+// 文件名 + image/jpeg 类型下发。严格 HLS 内核 (ffmpeg 系, 本地
+// ffprobe 实测) 按分片扩展名白名单直接拒绝 .jpeg 分片 ("not in
+// allowed_segment_extensions"), 建不起 VOD 时间轴: 播放器退化为
+// 不可拖动的流式播放、还可能从中间分片起播 (用户真机反馈: 不从
+// 头播 + 没办法快进后退)。实测给分片 URL 尾加 ?x=.ts 后 ffmpeg
+// 立刻能解析时长/拖动, 而 CDN 忽略查询串、字节不变。
+// 修法 (同 avhub /proxy/m3u8 先例): detail 的播放地址改为本地
+// 代理地址, 代理实时拉清单并改写——媒体清单的分片行改成 CDN
+// 绝对地址 + ?x=.ts 后缀 (分片仍直连 CDN, 不经代理); 主清单的
+// variant 行改指回代理 (让 variant 清单也被改写)。代理拉取失败
+// 时 302 回源清单, 不比旧行为更差。
+function b64url(s) {
+  try {
+    return Buffer.from(String(s), 'utf8').toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) { return ''; }
+}
+
+function unb64url(s) {
+  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+}
+
+// 构造本地代理地址 (js2p://_WEB_ 为 App 动态地址 scheme, 同 avhub 先例)
+function proxyUrl(reqIn, path, targetUrl, referer) {
+  try {
+    const server = reqIn?.server;
+    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
+    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
+    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
+  } catch (e) { return ''; }
+}
+
+async function fetchPlaylistText(url, referer) {
+  try {
+    const { data, status } = await req.get(url, {
+      headers: headers(referer),
+      timeout: 20000,
+      responseType: 'text',
+      transformResponse: [(d) => d],
+      validateStatus: () => true,
+    });
+    if (status >= 200 && status < 300 && data) return String(data);
+  } catch (e) { /* 落空走 302 降级 */ }
+  return '';
+}
+
+// 改写清单正文: selfBase 为代理自身地址 (由进来的请求 Host 拼出,
+// 清单正文里必须是真实 http 地址, 不能嵌 js2p)。
+// - 主清单 (含 EXT-X-STREAM-INF): variant 行 -> 指回代理;
+// - 媒体清单: 分片行 -> CDN 绝对地址 + ?x=.ts 后缀;
+// - # 行 URI="..." 属性 absolutize (surrit 无密钥, 仅兜底)。
+function rewriteMissavM3u8(raw, playlistUrl, selfBase, referer) {
+  const isMaster = raw.includes('#EXT-X-STREAM-INF');
+  const lines = String(raw).split(/\r?\n/);
+  const out = lines.map((line) => {
+    const s = line.trim();
+    if (!s) return line;
+    if (s.startsWith('#')) {
+      if (s.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
+          try { return `URI="${new URL(uri, playlistUrl).toString()}"`; } catch (e) { return all; }
+        });
+      }
+      return line;
+    }
+    let abs;
+    try { abs = new URL(s, playlistUrl).toString(); } catch (e) { return line; }
+    if (isMaster) {
+      return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}`;
+    }
+    return abs + (abs.includes('?') ? '&' : '?') + 'x=.ts';
+  });
+  return out.join('\n');
+}
+
+// GET /proxy/m3u8?u={b64url 清单地址}&r={b64url referer}
+async function m3u8Proxy(request, reply) {
+  const q = request?.query || {};
+  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  let referer = HOST + '/';
+  try {
+    target = unb64url(q.u);
+    if (q.r) referer = unb64url(q.r) || referer;
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  const raw = await fetchPlaylistText(target, referer);
+  if (!raw || !raw.includes('#EXTM3U')) { reply.redirect(target); return; }
+  const host = request.headers && request.headers.host;
+  const selfBase = host
+    ? `http://${host}/spider/${KEY}/3`
+    : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
+  reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+  reply.header('Cache-Control', 'no-cache');
+  reply.send(rewriteMissavM3u8(raw, target, selfBase, referer));
+}
+
 function headers(referer) {
   const h = { 'User-Agent': UA };
   if (referer) h['Referer'] = referer;
@@ -220,7 +319,9 @@ async function detail(reqIn) {
     vod_remarks: info.vod_remarks,
     vod_content: info.vod_content,
     vod_play_from: NAME,
-    vod_play_url: tracks.map((t) => `${t.name}$${t.url}`).join('#'),
+    // 播放地址改走本地 /proxy/m3u8 代理 (改写 .jpeg 分片后缀, 见文件头
+    // 代理段注释); 代理地址构造失败时降级回原始直链 (旧行为)。
+    vod_play_url: tracks.map((t) => `${t.name}$${proxyUrl(reqIn, '/proxy/m3u8', t.url, detailUrl) || t.url}`).join('#'),
   };
   if (vod.vod_name && vod.vod_play_url) subRegister(ids, vod);
   return { list: [vod] };
@@ -691,6 +792,8 @@ export default function spider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
+      // m3u8 代理 (GET): 播放时实时改写 surrit 清单的分片后缀
+      fastify.get('/proxy/m3u8', m3u8Proxy);
     },
   };
 }
