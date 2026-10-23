@@ -1,5 +1,4 @@
 import req from '../../util/req.js';
-import crypto from 'crypto';
 
 const KEY = 'py_huangguo';
 const NAME = '黄果短剧';
@@ -13,7 +12,7 @@ const HTML_HEADERS = {
   'Referer': HOST + '/',
 };
 
-// 分类: 源自 XPTV huangguo.js 的 appConfig.tabs
+// 分类: 站点导航实测 (2026-10-23) — 四个 AI 分类走 /api/videos/category/<slug>, 排行榜走 HTML 页
 const CLASSES = [
   { type_id: 'home', type_name: '首页' },
   { type_id: 'ai-duanju', type_name: 'AI成人短剧' },
@@ -23,75 +22,17 @@ const CLASSES = [
   { type_id: 'ranks/hot', type_name: '排行榜' },
 ];
 
-// 封面为 AES-128-CBC 加密(与 bagua/51吃瓜同密钥), 代理解密出图
-const IMG_KEY = Buffer.from('f5d965df75336270', 'utf8');
-const IMG_IV = Buffer.from('97b60394abc2fbe1', 'utf8');
+// 封面: pic.*.cn 上的图是 AES-128-CBC 加密存储 (与 bagua/51吃瓜同口径), 走用户已部署的
+// bagua-img-proxy Worker 解密出图。旧版用的 huangguo.wulii.de5.net 已失效 (HTTP 500) 是没封面的根源;
+// App 的图片加载拿不到蜘蛛本地 /proxy 地址 (avhub 第一轮教训), 故不用站内代理出图。
+const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
 
-function tryDecryptImage(buf) {
-  if (!buf || !buf.length || buf.length % 16 !== 0) return buf;
-  try {
-    const decipher = crypto.createDecipheriv('aes-128-cbc', IMG_KEY, IMG_IV);
-    decipher.setAutoPadding(false);
-    let t = Buffer.concat([decipher.update(buf), decipher.final()]);
-    const isJpeg = t.length >= 2 && t[0] === 0xff && t[1] === 0xd8;
-    const isPng = t.length >= 8 && t[0] === 0x89 && t[1] === 0x50 && t[2] === 0x4e && t[3] === 0x47
-      && t[4] === 0x0d && t[5] === 0x0a && t[6] === 0x1a && t[7] === 0x0a;
-    const isWebp = t.length >= 12 && t[0] === 0x52 && t[1] === 0x49 && t[2] === 0x46 && t[3] === 0x46
-      && t[8] === 0x57 && t[9] === 0x45 && t[10] === 0x42 && t[11] === 0x50;
-    const isGif = t.length >= 6 && t[0] === 0x47 && t[1] === 0x49 && t[2] === 0x46 && t[3] === 0x38;
-    if (!(isJpeg || isPng || isWebp || isGif)) return buf;
-    const s = t[t.length - 1];
-    if (s > 0 && s <= 16) {
-      let ok = true;
-      for (let n = t.length - s; n < t.length; n++) {
-        if (t[n] !== s) { ok = false; break; }
-      }
-      if (ok) t = t.slice(0, t.length - s);
-    }
-    const eoi = t.lastIndexOf(Buffer.from([0xff, 0xd9]));
-    if (eoi !== -1) {
-      t = t.slice(0, eoi + 2);
-    } else {
-      const iend = t.lastIndexOf(Buffer.from([0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]));
-      if (iend !== -1) t = t.slice(0, iend + 8);
-    }
-    return t;
-  } catch (e) {
-    return buf;
-  }
-}
-
-function proxyImgUrl(request, imgUrl) {
-  if (!imgUrl || !/^https?:\/\//i.test(imgUrl)) return imgUrl;
-  const proto = String(request?.headers?.['x-forwarded-proto'] || 'https').split(',')[0].trim();
-  let host = String(request?.headers?.['x-forwarded-host'] || request?.headers?.host || '').split(',')[0].trim();
-  if (!host) host = 'localhost';
-  const prefix = request?.server?.prefix || `/spider/${KEY}/3`;
-  return `${proto}://${host}${prefix}/proxy/img?url=${encodeURIComponent(imgUrl)}`;
-}
-
-async function proxyImg(request, reply) {
-  const imgUrl = String(request?.query?.url || '');
-  if (!imgUrl) {
-    reply.code(400).send('missing url');
-    return;
-  }
-  try {
-    const { data } = await req.get(imgUrl, {
-      headers: HTML_HEADERS,
-      timeout: 15000,
-      responseType: 'arraybuffer',
-    });
-    const buf = tryDecryptImage(Buffer.from(data));
-    let ctype = 'image/jpeg';
-    if (buf[0] === 0x89 && buf[1] === 0x50) ctype = 'image/png';
-    else if (buf[0] === 0x47 && buf[1] === 0x49) ctype = 'image/gif';
-    else if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) ctype = 'image/webp';
-    reply.header('Content-Type', ctype);
-    reply.send(buf);
-  } catch (e) {
-    reply.code(500).send('proxy error');
-  }
+function proxyCover(u) {
+  const abs = absUrl(u);
+  if (!abs) return '';
+  if (/workers\.dev/i.test(abs)) return abs;
+  if (/pic\.[a-z0-9]+\.cn/i.test(abs)) return IMG_PROXY + encodeURIComponent(abs);
+  return abs;
 }
 
 // 带重试的请求: 4xx(除429)不重试, 其余最多3次
@@ -154,26 +95,24 @@ function absUrl(u) {
   return u;
 }
 
-// 封面URL清洗: 补全域名 + 去掉 query 参数
-// 封面解密走外部代理（参考 REX 版：https://huangguo.wulii.de5.net）
-const COVER_PROXY = 'https://huangguo.wulii.de5.net';
-
-function proxyCoverUrl(imgUrl) {
-  if (!imgUrl || !/^https?:\/\//i.test(imgUrl)) return imgUrl;
-  return `${COVER_PROXY}/?url=${encodeURIComponent(imgUrl)}`;
-}
-
-function cleanPicUrl(u) {
-  // 注意：封面 URL 带时效 auth_key 参数，必须保留，否则 403
-  return absUrl(u);
-}
-
 function metaContent(html, name) {
   if (!html) return '';
   let m = html.match(new RegExp('<meta[^>]+(?:property|name)=["\']' + name + '["\'][^>]*content=["\']([^"\']*)["\']', 'i'));
   if (m) return decodeEntities(m[1]).trim();
-  m = html.match(new RegExp('<meta[^>]+content=["\']([^"\']*)["\'][^>]*(?:property|name)=["\']' + name + '["\']', 'i'));
+  m = html.match(new RegExp('<meta[^>]+content=["\']([^"\']*)["\'][^>]*(?:property|name)=["\']', 'i'));
   return m ? decodeEntities(m[1]).trim() : '';
+}
+
+// 详情页/播放页的 videoInitialData JSON (标题/封面/简介/各集播放源都在里面)
+function parseInitialData(html) {
+  if (!html) return null;
+  const m = html.match(/id="videoInitialData"[^>]*>([\s\S]*?)<\/script>/);
+  if (!m) return null;
+  try {
+    return JSON.parse(m[1]);
+  } catch (e) {
+    return null;
+  }
 }
 
 function extractTrackId(block) {
@@ -199,8 +138,8 @@ function extractCardTitle(block) {
   return m ? cleanTitle(m[1]) : '';
 }
 
-// 单个剧卡解析
-function parseCardBlock(block, request) {
+// 单个剧卡解析 (首页/分类 HTML/搜索页共用)
+function parseCardBlock(block) {
   const id = extractTrackId(block);
   if (!id) return null;
   const imgM = block.match(/data-src="([^"]+)"/) || block.match(/src="([^"]+)"/);
@@ -215,13 +154,13 @@ function parseCardBlock(block, request) {
   return {
     vod_id: id,
     vod_name: title,
-    vod_pic: proxyCoverUrl(cleanPicUrl(imgM ? imgM[1] : '')),
+    vod_pic: proxyCover(imgM ? imgM[1] : ''),
     vod_remarks: remarks,
   };
 }
 
 // 剧卡网格列表解析(parseAll=true 解析全部网格, 否则只取第一格)
-function parseCards(html, parseAll, request) {
+function parseCards(html, parseAll) {
   const out = [];
   const seen = new Set();
   if (!html) return out;
@@ -241,7 +180,7 @@ function parseCards(html, parseAll, request) {
     for (let j = 0; j < cstarts.length; j++) {
       const cEnd = j + 1 < cstarts.length ? cstarts[j + 1] : seg.length;
       try {
-        const card = parseCardBlock(seg.slice(cstarts[j], cEnd), request);
+        const card = parseCardBlock(seg.slice(cstarts[j], cEnd));
         if (!card || seen.has(card.vod_id)) continue;
         seen.add(card.vod_id);
         out.push(card);
@@ -252,7 +191,7 @@ function parseCards(html, parseAll, request) {
 }
 
 // 排行榜列表解析
-function parseRankList(html, request) {
+function parseRankList(html) {
   const out = [];
   const seen = new Set();
   if (!html) return out;
@@ -275,7 +214,7 @@ function parseRankList(html, request) {
       out.push({
         vod_id: id,
         vod_name: title,
-        vod_pic: proxyCoverUrl(cleanPicUrl(imgM ? imgM[1] : '')),
+        vod_pic: proxyCover(imgM ? imgM[1] : ''),
         vod_remarks: tagsM ? stripTags(tagsM[1]) : '',
       });
     } catch (e) {}
@@ -284,53 +223,19 @@ function parseRankList(html, request) {
 }
 
 // /api/videos/category JSON 条目解析
-function parseApiItem(item, request) {
+function parseApiItem(item) {
   if (!item || !item.id) return null;
   const parts = [];
-  const epCount = parseInt(item.episode_count, 10) || 0;
+  const epCount = parseInt(item.episode_count, 10) || parseInt(item.total_episodes, 10) || 0;
   if (epCount > 0) parts.push((item.is_finished ? '全' : '更新至') + epCount + '集');
   if (item.score) parts.push(String(item.score) + '分');
   if (Array.isArray(item.tags) && item.tags.length) parts.push(item.tags.join('·'));
   return {
     vod_id: String(item.id),
     vod_name: String(item.title || ''),
-    vod_pic: proxyCoverUrl(cleanPicUrl(item.cover || '')),
+    vod_pic: proxyCover(item.cover || ''),
     vod_remarks: parts.join(' · '),
   };
-}
-
-// 详情页头部: 标题/封面/简介
-function parseDetailHead(html) {
-  let title = metaContent(html, 'og:title');
-  if (title) title = title.replace(/\s*-\s*黄果短剧\s*$/, '');
-  if (!title) {
-    const m = html.match(/<title>([\s\S]*?)<\/title>/i);
-    if (m) title = stripTags(decodeEntities(m[1]));
-  }
-  let pic = '';
-  const posterDiv = html.match(/<div\s+class="[^"]*\bhg-web-play__poster\b[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-  if (posterDiv) {
-    const m = posterDiv[1].match(/data-src="([^"]+)"/) || posterDiv[1].match(/src="([^"]+)"/);
-    if (m && m[1].indexOf('data:image') !== 0) pic = m[1];
-  }
-  if (!pic) {
-    const m = html.match(/id="videoInitialData"[^>]*>([\s\S]*?)<\/script>/);
-    if (m) {
-      try {
-        const j = JSON.parse(m[1]);
-        pic = (j && (j.posterSrc || j.coverSrc)) || '';
-      } catch (e) {}
-    }
-  }
-  if (!pic) {
-    const m = html.match(/<img\b[^>]*\bdata-src="([^"]+)"[^>]*\bfetchpriority="high"[^>]*>/i)
-      || html.match(/<img\b[^>]*\bfetchpriority="high"[^>]*\bdata-src="([^"]+)"[^>]*>/i)
-      || html.match(/<img\b[^>]*\bdata-src="(https?:\/\/[^"]+?\.(?:jpe?g|png|webp|gif)(?:\?[^"]*)?)"[^>]*>/i);
-    if (m) pic = m[1];
-  }
-  if (!pic) pic = metaContent(html, 'og:image');
-  const content = metaContent(html, 'og:description');
-  return { title, pic, content };
 }
 
 async function init() {
@@ -344,7 +249,7 @@ async function home() {
 async function homeVod() {
   try {
     const html = await getHtml(HOST + '/');
-    return { list: parseCards(html, true, null).slice(0, 20) };
+    return { list: parseCards(html, true).slice(0, 24) };
   } catch (e) {
     return { list: [] };
   }
@@ -358,26 +263,26 @@ async function category(reqIn) {
   try {
     if (tid === 'home') {
       const html = await getHtml(HOST + '/');
-      const list = parseCards(html, true, reqIn);
-      // 首页用固定 pagecount 保证"加载更多"可点（实际只有一页数据，点更多返回空）
-      return { page, pagecount: 999, limit: 30, total: 99999, list };
+      const list = parseCards(html, true);
+      return { page: 1, pagecount: 1, limit: list.length || 30, total: list.length, list };
     }
     if (tid.indexOf('rank') !== -1) {
       const html = await getHtml(`${HOST}/${tid}/`);
-      return { page, pagecount: 1, limit: 30, total: 99999, list: parseRankList(html, reqIn) };
+      const list = parseRankList(html);
+      return { page: 1, pagecount: 1, limit: list.length || 30, total: list.length, list };
     }
-    // JSON 分类接口优先
+    // JSON 分类接口优先 (实测 items/pagination 齐全)
     const json = await getJson(`${HOST}/api/videos/category/${tid}?page=${page}`);
     if (json && json.data && Array.isArray(json.data.items)) {
-      const list = json.data.items.map(d => parseApiItem(d, reqIn)).filter(Boolean);
+      const list = json.data.items.map(d => parseApiItem(d)).filter(Boolean);
       const pages = parseInt(json.data.pagination && json.data.pagination.pages, 10);
-      const pagecount = pages > 0 ? pages : (list.length ? page + 1 : 1);
+      const pagecount = pages > 0 ? pages : (list.length ? page + 1 : page);
       return { page, pagecount, limit: list.length || 30, total: 99999, list };
     }
     // 兜底: 分类 HTML 页
     const url = `${HOST}/${tid}/${page > 1 ? page + '/' : ''}`;
     const html = await getHtml(url);
-    const list = parseCards(html, false, reqIn);
+    const list = parseCards(html, false);
     return {
       page,
       pagecount: list.length < 30 ? page : page + 1,
@@ -396,34 +301,54 @@ async function detail(reqIn) {
   vid = String(vid || '').trim();
   if (!vid) return { list: [] };
   try {
-    const html = await getHtml(`${HOST}/video/${vid}/`);
-    const { title, pic, content } = parseDetailHead(html);
-    const eps = [];
-    const gridM = html.match(/<div\s+class="[^"]*\bhg-(?:web-play|web-detail)__ep-grid\b[^"]*"[^>]*>([\s\S]*?)<\/div>/);
-    if (gridM) {
-      const aRe = /<a\b[^>]*>[\s\S]*?<\/a>/g;
-      let am;
-      while ((am = aRe.exec(gridM[1])) !== null) {
-        const hrefM = am[0].match(/href="([^"]+)"/);
-        if (!hrefM) continue;
-        const epIdM = am[0].match(/data-ep-id="([^"]*)"/);
-        const ep = epIdM ? epIdM[1] : '';
-        eps.push({ name: ep ? `第${ep}集` : stripTags(am[0]), url: absUrl(hrefM[1]), ep });
-      }
+    const pageUrl = `${HOST}/video/${vid}/`;
+    const html = await getHtml(pageUrl);
+    const j = parseInitialData(html);
+
+    let title = j && j.title ? String(j.title).trim() : '';
+    if (!title) title = metaContent(html, 'og:title').replace(/\s*-\s*黄果短剧\s*$/, '');
+    let pic = (j && (j.coverSrc || j.posterSrc)) || '';
+    if (!pic) pic = metaContent(html, 'og:image');
+    const content = (j && j.description) || metaContent(html, 'og:description');
+
+    // 分集: 以详情页分集锚点为据 (class hg-web-play__ep, 带 data-ep-id 与 /ep-N/ 链接),
+    // 再用 initialData 的集数信息补齐缺号 (集页 URL 规律: 第1集=/video/<id>/, 其余=/video/<id>/ep-<n>/)
+    const epMap = new Map();
+    const aRe = /<a\b[^>]*class="[^"]*\bhg-web-play__ep\b[^"]*"[^>]*>/g;
+    let am;
+    while ((am = aRe.exec(html)) !== null) {
+      const tag = am[0];
+      const hrefM = tag.match(/href="([^"]+)"/);
+      const epM = tag.match(/data-ep-id="(\d+)"/);
+      if (!hrefM || !epM) continue;
+      epMap.set(parseInt(epM[1], 10), absUrl(hrefM[1]));
     }
-    if (!eps.length) {
-      const pm = html.match(/<a\b[^>]*class="[^"]*\bhg-web-detail__play\b[^"]*"[^>]*href="([^"]+)"/);
-      if (pm) eps.push({ name: '第1集', url: absUrl(pm[1]), ep: '' });
+    let maxEp = 0;
+    for (const n of epMap.keys()) if (n > maxEp) maxEp = n;
+    const srcKeys = j && j.epPlaySrcs ? Object.keys(j.epPlaySrcs) : [];
+    for (const k of srcKeys) {
+      const n = parseInt(k, 10);
+      if (n > maxEp) maxEp = n;
     }
-    if (!eps.length) return { list: [] };
+    const trackKeys = j && j.trackingEpisodes ? Object.keys(j.trackingEpisodes) : [];
+    for (const k of trackKeys) {
+      const n = parseInt(k, 10);
+      if (n > maxEp) maxEp = n;
+    }
+    if (maxEp < 1) maxEp = 1;
+    if (!epMap.has(1)) epMap.set(1, pageUrl);
+    for (let n = 2; n <= maxEp; n++) {
+      if (!epMap.has(n)) epMap.set(n, `${HOST}/video/${vid}/ep-${n}/`);
+    }
+    const eps = [...epMap.entries()].sort((a, b) => a[0] - b[0]);
     return {
       list: [{
         vod_id: vid,
         vod_name: title || `黄果短剧 ${vid}`,
-        vod_pic: proxyCoverUrl(cleanPicUrl(pic)),
+        vod_pic: proxyCover(pic),
         vod_content: content,
         vod_play_from: NAME,
-        vod_play_url: eps.map(e => `${e.name}$${e.url}$$$${e.ep}`).join('#'),
+        vod_play_url: eps.map(([n, u]) => `第${n}集$${u}`).join('#'),
       }],
     };
   } catch (e) {
@@ -432,29 +357,24 @@ async function detail(reqIn) {
 }
 
 async function play(reqIn) {
-  const raw = String(reqIn?.body?.id || '');
-  const sep = raw.indexOf('$$');
-  const pageUrl = sep !== -1 ? raw.slice(0, sep) : raw;
-  const ep = sep !== -1 ? raw.slice(sep + 2) : '';
+  // play id = 分集页 URL 本身 (详情 vod_play_url 里 $ 后即是)。旧版在 id 里塞 $$$集号 再拆,
+  // 会被 App 按 $$$ 分隔线路时拆坏, 是不能播放的主因之一 —— 新版 id 不含任何分隔符。
+  const pageUrl = absUrl(String(reqIn?.body?.id || '').trim());
   if (!pageUrl) return { parse: 0, url: '', header: {} };
   try {
     const html = await getHtml(pageUrl, HOST + '/');
+    const j = parseInitialData(html);
     let url = '';
-    const m = html.match(/id="videoInitialData"[^>]*>([\s\S]*?)<\/script>/);
-    if (m) {
-      try {
-        const j = JSON.parse(m[1]);
-        url = ((j && j.epPlaySrcs) || {})[ep] || (j && j.videoSrc) || '';
-      } catch (e) {}
+    if (j) {
+      // 分集页的 videoSrc 即本集正片; epPlaySrcs[本集] 兜底; previewSrc 最后兜底
+      url = j.videoSrc || (j.epPlaySrcs && j.ep ? j.epPlaySrcs[String(j.ep)] : '') || j.previewSrc || '';
     }
-    if (url) {
-      url = String(url).replace(/\\u0026/g, '&');
-      if (!/^https?:\/\//i.test(url)) {
-        const um = url.match(/(https?:\/\/[^\s"']+)/);
-        url = um ? um[1] : '';
-      }
+    if (!url) {
+      const m = html.match(/"videoSrc"\s*:\s*"([^"]+)"/);
+      if (m) url = m[1];
     }
-    if (!url) return { parse: 0, url: '', header: {} };
+    url = String(url || '').replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&').trim();
+    if (!/^https?:\/\//i.test(url)) return { parse: 0, url: '', header: {} };
     return { parse: 0, url, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
   } catch (e) {
     return { parse: 0, url: '', header: {} };
@@ -468,7 +388,7 @@ async function search(reqIn) {
   if (!wd) return { page, pagecount: 1, limit: 30, total: 0, list: [] };
   try {
     const html = await getHtml(`${HOST}/search/video/${encodeURIComponent(wd)}/`);
-    const list = parseCards(html, false, reqIn);
+    const list = parseCards(html, false);
     return {
       page,
       pagecount: list.length < 30 ? page : page + 1,
@@ -492,7 +412,6 @@ export default function spider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
-      fastify.get('/proxy/img', proxyImg);
     },
   };
 }
