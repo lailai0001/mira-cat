@@ -1,10 +1,18 @@
-// 51吃瓜 (https://bus.qkvsednb.cc) -> CatPawOpen spider
+// 51吃瓜 (https://bus.yueshrxet.cc) -> CatPawOpen spider
 // 重写版：干净实现，封面走 Cloudflare Worker 解密代理
+// 2026-10-23 修复：站点 bus 线路域名轮换（bus.qkvsednb.cc 整站 301 跳 bus.yueshrxet.cc，
+// 设备端取不到旧域内容导致全分类空白）。改为多主机自愈：依次探测下列主机，
+// 某个主机取不到内容时自动切换到下一个（品牌域 51cg1.com 与旧 bus 域作后备）。
 import req from '../../util/req.js';
 
 const KEY = 'py_51chigua';
 const NAME = '51吃瓜';
-const HOST = 'https://bus.qkvsednb.cc';
+const HOSTS = [
+  'https://bus.yueshrxet.cc',
+  'https://51cg1.com',
+  'https://bus.qkvsednb.cc',
+];
+let ACTIVE_HOST = HOSTS[0];
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 // 真实分类（2026-10-14 从站点导航抓取）
@@ -36,6 +44,7 @@ const CLASSES = [
   { type_id: 'mrds', type_name: '每日大赛' },
   { type_id: 'yczq', type_name: '原创博主' },
   { type_id: 'cgxw', type_name: '吃瓜新闻' },
+  { type_id: 'qghj', type_name: '瓜友点播' },
 ];
 
 // 封面解密 Worker（用户已部署）
@@ -57,17 +66,32 @@ function headers() {
     'User-Agent': UA,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'zh-CN,zh;q=0.9',
-    'Referer': HOST + '/',
+    'Referer': ACTIVE_HOST + '/',
   };
 }
 
-async function getHtml(url) {
+async function fetchFrom(base, path) {
   try {
-    const { data } = await req.get(url, { headers: headers(), timeout: 20000 });
+    const { data } = await req.get(base + path, { headers: headers(), timeout: 20000 });
     return String(data || '');
   } catch (e) {
     return '';
   }
+}
+
+/** 按路径取页面：先用当前主机，取不到内容时依次切换后备主机并记住可用主机 */
+async function getHtml(path) {
+  let html = await fetchFrom(ACTIVE_HOST, path);
+  if (html) return html;
+  for (const h of HOSTS) {
+    if (h === ACTIVE_HOST) continue;
+    html = await fetchFrom(h, path);
+    if (html) {
+      ACTIVE_HOST = h;
+      return html;
+    }
+  }
+  return '';
 }
 
 function t(v) {
@@ -88,14 +112,14 @@ function absUrl(u) {
   if (!u) return '';
   if (/^https?:\/\//i.test(u)) return u;
   if (u.indexOf('//') === 0) return 'https:' + u;
-  if (u.charAt(0) === '/') return HOST + u;
-  return HOST + '/' + u;
+  if (u.charAt(0) === '/') return ACTIVE_HOST + u;
+  return ACTIVE_HOST + '/' + u;
 }
 
-function listUrl(cat, page) {
+function listPath(cat, page) {
   page = Math.max(1, parseInt(page, 10) || 1);
   cat = t(cat) || 'wpcz';
-  const base = `${HOST}/category/${cat}/`;
+  const base = `/category/${cat}/`;
   return page > 1 ? `${base}${page}/` : base;
 }
 
@@ -185,7 +209,7 @@ async function home() {
 }
 
 async function homeVod() {
-  const html = await getHtml(HOST + '/');
+  const html = await getHtml('/');
   return { list: parseList(html) };
 }
 
@@ -193,7 +217,7 @@ async function category(reqIn) {
   const body = reqIn?.body || {};
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const id = String(body.id || 'wpcz').replace(/^\/category\//, '').replace(/\/$/, '');
-  const html = await getHtml(listUrl(id, page));
+  const html = await getHtml(listPath(id, page));
   const list = parseList(html);
   return {
     page,
@@ -211,8 +235,7 @@ async function detail(reqIn) {
   const vid = m ? m[1] : String(raw || '').trim();
   if (!vid) return { list: [] };
 
-  const pageUrl = `${HOST}/archives/${vid}/`;
-  const html = await getHtml(pageUrl);
+  const html = await getHtml(`/archives/${vid}/`);
   if (!html) return { list: [] };
 
   // 标题
@@ -266,7 +289,7 @@ async function play(reqIn) {
   return {
     parse: 0,
     url,
-    header: { 'User-Agent': UA, 'Referer': HOST + '/' },
+    header: { 'User-Agent': UA, 'Referer': ACTIVE_HOST + '/' },
   };
 }
 
@@ -275,8 +298,8 @@ async function search(reqIn) {
   const wd = String(body.wd || '').trim();
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!wd) return { page, pagecount: page, limit: 0, total: 0, list: [] };
-  const url = `${HOST}/search/${encodeURIComponent(wd)}/${page > 1 ? `page/${page}/` : ''}`;
-  const html = await getHtml(url);
+  const path = `/search/${encodeURIComponent(wd)}/${page > 1 ? `page/${page}/` : ''}`;
+  const html = await getHtml(path);
   const list = parseList(html);
   return {
     page,
