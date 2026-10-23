@@ -7,7 +7,6 @@ const KEY = 'py_yeguo';
 const NAME = '野果短剧';
 const API_BASE = 'https://www.yeguodj.com/api.php';
 const SITE = 'https://yeguodj.com';
-const COVER_PROXY = 'https://huangguo.wulii.de5.net';
 const IMG_WORKER = 'https://bagua-img-proxy.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
@@ -78,13 +77,13 @@ function unwrap(d) {
 function proxiedCover(url) {
   url = t(url);
   if (!url) return '';
-  // pic.jtzatly.cn 的图是 AES-128-CBC 加密存储（与 818/91 同手法），走解密 Worker
-  if (/^https?:\/\/pic\.jtzatly\.cn\//i.test(url)) {
+  // pic.sugfew.cn（现行主力封面主机）与 pic.jtzatly.cn 的图是 AES-128-CBC 加密存储
+  // （与 818/91 同手法）：直连拿到的是密文、App 解不出图，必须走解密 Worker 出图。
+  if (/pic\.sugfew\.cn|pic\.jtzatly\.cn/i.test(url)) {
     return IMG_WORKER + '/img?url=' + encodeURIComponent(url);
   }
-  if (/pic\.wlwvch\.cn|pic\.zdmhyg\.cn|pic\.wirqed\.cn|imgpublic\.ycomesc\.live/i.test(url)) {
-    return COVER_PROXY + '/?url=' + encodeURIComponent(url);
-  }
+  // 其余主机（如 imgpublic.ycomesc.live）是明文图，直连即可；
+  // 原 wulii 出图代理已失效（实测 500），不再走它。
   return url;
 }
 
