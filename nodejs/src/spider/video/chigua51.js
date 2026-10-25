@@ -1,13 +1,18 @@
-// 51吃瓜 (https://bus.yueshrxet.cc) -> CatPawOpen spider
+// 51吃瓜 (https://bus.egyjtzsa.cc) -> CatPawOpen spider
 // 重写版：干净实现，封面走 Cloudflare Worker 解密代理
 // 2026-10-23 修复：站点 bus 线路域名轮换（bus.qkvsednb.cc 整站 301 跳 bus.yueshrxet.cc，
 // 设备端取不到旧域内容导致全分类空白）。改为多主机自愈：依次探测下列主机，
 // 某个主机取不到内容时自动切换到下一个（品牌域 51cg1.com 与旧 bus 域作后备）。
+// 2026-10-25 修复：bus 域再次轮换——分类页在旧域上 301（空体）跳新域
+// bus.egyjtzsa.cc，设备端 req 不跟随 301 导致全分类空白（首页仍 200，故
+// 首页有内容、分类全空）。新域置顶直连；另加 301 Location 跟随（若运行
+// 时暴露响应头），下次轮换可自愈，不再全空。
 import req from '../../util/req.js';
 
 const KEY = 'py_51chigua';
 const NAME = '51吃瓜';
 const HOSTS = [
+  'https://bus.egyjtzsa.cc',
   'https://bus.yueshrxet.cc',
   'https://51cg1.com',
   'https://bus.qkvsednb.cc',
@@ -71,12 +76,28 @@ function headers() {
 }
 
 async function fetchFrom(base, path) {
-  try {
-    const { data } = await req.get(base + path, { headers: headers(), timeout: 20000 });
-    return String(data || '');
-  } catch (e) {
-    return '';
+  let url = base + path;
+  for (let hop = 0; hop < 4; hop++) {
+    try {
+      const r = await req.get(url, { headers: headers(), timeout: 20000 });
+      const html = String((r && r.data) || '');
+      if (html) return html;
+      // 空体 + 301 Location：跟随到最终域并记住它（下次直连，不再绕 301）；
+      // 运行时不暴露响应头时 loc 为空，走外层多主机兜底。
+      const loc = r && r.headers && (r.headers.location || r.headers.Location);
+      if (!loc) return '';
+      try {
+        const next = /^https?:\/\//i.test(loc) ? loc : new URL(loc, url).href;
+        try { ACTIVE_HOST = new URL(next).origin; } catch (e) { /* 忽略 */ }
+        url = next;
+      } catch (e) {
+        return '';
+      }
+    } catch (e) {
+      return '';
+    }
   }
+  return '';
 }
 
 /** 按路径取页面：先用当前主机，取不到内容时依次切换后备主机并记住可用主机 */
@@ -132,9 +153,12 @@ function parseList(html) {
   const blocks = html.split('<div class="post-card"');
   for (let i = 1; i < blocks.length; i++) {
     const b = blocks[i];
-    // 文章 ID：只从当前块取，避免与标题错位
+    // 文章 ID：只从当前块取，避免与标题错位。新版卡片把 id 放在 div
+    // 自身（id="post-card-280128"），卡内已无 /archives/ 链接（旧版才有）；
+    // 两者都取，取不到跳过——否则新版全块被跳过、分类全空。
+    const im = b.match(/id="post-card-(\d+)"/);
     const am = b.match(/\/archives\/(\d+)\//);
-    let vid = am ? am[1] : '';
+    let vid = im ? im[1] : (am ? am[1] : '');
     if (!vid || seen.has(vid)) continue;
 
     // 标题
