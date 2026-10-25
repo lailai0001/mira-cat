@@ -2996,13 +2996,9 @@ function displayHost(file, embedUrl) {
 // 全链解析: {html, lines, stage, via, postDiag, pageDiag, pathsN}
 // stage: ok / page(详情未取到) / seed(无种子) / post-none(铸造通道
 // 不通) / post-bad(铸造被站方拒) / embed(铸出路径但 embed 未解出)
-async function resolveLines(durl) {
-  const { html, res } = await getDetailRes(durl);
-  if (!html) return { html: '', lines: [], stage: 'page', via: '', pageDiag: pageDiagOf(res ? res.outcomes : []) };
-  const { postId, mpu } = extractPlaySeed(html);
-  if (!postId || !mpu) return { html, lines: [], stage: 'seed', via: '' };
-  const { paths, stage, via, postDiag, bank } = await fetchEmbedPaths(postId, mpu, durl);
-  if (!paths.length) return { html, lines: [], stage, via, postDiag, bank };
+// 路径集 -> 线路表 (embed 解出 + 清晰度展开 + 全局排序), 供库直出
+// 与常规流程共用。
+async function linesFromPaths(paths, durl) {
   const lines = [];
   await Promise.all(paths.slice(0, 8).map(async (p, idx) => {
     const embedUrl = 'https:' + p.path;
@@ -3018,6 +3014,25 @@ async function resolveLines(durl) {
   // 借线解出的绑定型宿主 (令牌绑代理出口, 设备必 403) 末位。组内
   // 先比清晰度 (高清在前), 再比宿主可靠性与原序。
   lines.sort((a, b) => (lineGroup(a) - lineGroup(b)) || ((b.q || 0) - (a.q || 0)) || (hostRank(a.host) - hostRank(b.host)) || (a.idx - b.idx) || ((a.v || 0) - (b.v || 0)));
+  return lines;
+}
+
+async function resolveLines(durl) {
+  // 库直出 (2026-10-25, 同 javhdporn): 详情取页常被站方墙挡, 但库
+  // 内路径只凭 watch URL 即可查 —— 先查库, 命中且 embed 解出线则
+  // 直接用, 不必等详情页。未命中或 embed 全灭才走原流程。
+  const bank0 = await castBankLookup(durl);
+  if (bank0.hit) {
+    const lines0 = await linesFromPaths(bank0.paths, durl);
+    if (lines0.length) return { html: '', lines: lines0, stage: 'ok', via: 'cast-bank', postDiag: '', bank: 'hit' };
+  }
+  const { html, res } = await getDetailRes(durl);
+  if (!html) return { html: '', lines: [], stage: 'page', via: '', pageDiag: pageDiagOf(res ? res.outcomes : []) };
+  const { postId, mpu } = extractPlaySeed(html);
+  if (!postId || !mpu) return { html, lines: [], stage: 'seed', via: '' };
+  const { paths, stage, via, postDiag, bank } = await fetchEmbedPaths(postId, mpu, durl);
+  if (!paths.length) return { html, lines: [], stage, via, postDiag, bank };
+  const lines = await linesFromPaths(paths, durl);
   if (!lines.length) return { html, lines: [], stage: 'embed', via, postDiag, pathsN: paths.length, bank };
   return { html, lines, stage: 'ok', via, postDiag, bank };
 }
@@ -3448,9 +3463,8 @@ async function detail(reqIn) {
   catch (e) { rl = { html: '', lines: [], stage: 'error', via: '', pageDiag: '', postDiag: '' }; }
   const { html, lines, stage, via } = rl;
   if (lines.length) cacheLines(durl, lines); // 供 play 复用 (见详情线路缓存节)
-  if (!html) {
-    // 取页全灭保底 (第九轮): 旧版在此直接 {list: []}, 兜底嗅探线被
-    // 短路, 真机详情全空。改为永不返回空 —— 名字从 URL slug 派生,
+  if (!html && !lines.length) {
+    // 取页全灭且无库直出线: 永不返回空 —— 名字从 URL slug 派生,
     // 分集名带取页通道逐个结论, 点播落 watch 页嗅探 (重开详情或
     // 点这一集都会整链重试)。
     const slug = (durl.match(/\/video\/([^/]+)\//) || [])[1] || '';
@@ -3470,7 +3484,15 @@ async function detail(reqIn) {
       }],
     };
   }
-  let name = og(html, 'title').replace(/\s*-\s*BestJavPorn\s*$/i, '');
+  // 库直出 (详情页被墙、但库内有线): 片名从 slug 派生, 封面空缺,
+  // 线路照常出 —— 有线可播远胜取页全灭仅嗅探。
+  let name = '';
+  if (!html) {
+    const slug = (durl.match(/\/video\/([^/]+)\//) || [])[1] || '';
+    name = slug ? clean(slug.replace(/[-_]+/g, ' ')) : 'BestJavPorn';
+  } else {
+    name = og(html, 'title').replace(/\s*-\s*BestJavPorn\s*$/i, '');
+  }
   if (name) subCacheName(durl, name); // 字幕搜索键优先用真片名 (见字幕聚合节)
   const pic = og(html, 'image') || (html.match(/<meta name="twitter:image" content="([^"]*)"/) || [])[1] || '';
   const code = (html.match(/<h4 class="entry-title">([^<]*)<\/h4>/) || [])[1] || '';
