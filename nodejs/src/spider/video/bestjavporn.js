@@ -2865,6 +2865,44 @@ function lineGroup(ln) {
   return 2;
 }
 
+// ---------------- 详情线路缓存 (2026-10-25 能解析不能播修复) ----------------
+// 真机症结: detail 时解出的线 (用户眼前所见) 与 play 时现场重解的线
+// 常不是同一批 —— play 时直连 embed 偶发超时/抖动, 重解结果丢直连
+// 线、甚至全空落嗅探, 用户点的线根本没被播。令牌 12h 有效、同机
+// IP 不变, 详情 10 分钟内的线直接复用最稳: play 先用缓存 (含所点
+// 的线才算命中), 缓存过期或无所点的线才重解, 重解有线则刷新缓存。
+const LINE_CACHE_TTL = 10 * 60 * 1000;
+const lineCache = new Map(); // durl -> {lines, ts}
+function cacheLines(durl, lines) {
+  if (!durl || !lines || !lines.length) return;
+  lineCache.set(durl, { lines, ts: Date.now() });
+  if (lineCache.size > 100) lineCache.delete(lineCache.keys().next().value);
+}
+function cachedLines(durl, wantIdx, wantV) {
+  const hit = lineCache.get(durl);
+  if (!hit || (Date.now() - hit.ts) > LINE_CACHE_TTL) return null;
+  if (wantIdx >= 0 && !hit.lines.some((l) => l.idx === wantIdx && (l.v || 0) === (wantV || 0)) && !hit.lines.some((l) => l.idx === wantIdx)) return null;
+  return hit.lines;
+}
+// MP4 判定: 非 HLS (type 非 hls 且文件非 m3u8/txt)。播放器不把 play
+// header 转给 HLS 分片, 分片缺 Referer 会 302/403 (CloudCDN MP4
+// 实测: 有 Referer 206、无 Referer 302); MP4 单请求、header 直达,
+// 同组内优先 MP4 最稳 (CloudCDN MP4 本就是 1080p, 不降清晰度)。
+function isMp4Line(l) {
+  if (!l) return false;
+  if (/hls/i.test(l.type || '')) return false;
+  if (/\.m3u8(\?|$)/i.test(l.file || '') || /\.txt(\?|$)/i.test(l.file || '')) return false;
+  return true;
+}
+function pickPlayLine(lines, tapped) {
+  const best = lines[0];
+  const playable = lines.filter((l) => lineGroup(l) <= lineGroup(best));
+  if (tapped && lineGroup(tapped) <= lineGroup(best) && isMp4Line(tapped)) return tapped;
+  const mp4s = playable.filter(isMp4Line).sort((a, b) => ((b.q || 0) - (a.q || 0)) || (hostRank(a.host) - hostRank(b.host)) || (a.idx - b.idx) || ((a.v || 0) - (b.v || 0)));
+  if (mp4s.length) return mp4s[0];
+  return (tapped && lineGroup(tapped) <= lineGroup(best)) ? tapped : best;
+}
+
 // ---------------- 清晰度展开 (2026-10-22 高清修复) ----------------
 // 普查坐实 (两站各 4 部样本, castbank/REPORT_hires.md): 每个 embed
 // 的 data-config 只给 1 个 source, "低清"不在选源层 —— (1) 旧排序
@@ -3409,6 +3447,7 @@ async function detail(reqIn) {
   try { rl = await resolveLines(durl); }
   catch (e) { rl = { html: '', lines: [], stage: 'error', via: '', pageDiag: '', postDiag: '' }; }
   const { html, lines, stage, via } = rl;
+  if (lines.length) cacheLines(durl, lines); // 供 play 复用 (见详情线路缓存节)
   if (!html) {
     // 取页全灭保底 (第九轮): 旧版在此直接 {list: []}, 兜底嗅探线被
     // 短路, 真机详情全空。改为永不返回空 —— 名字从 URL slug 派生,
@@ -3540,18 +3579,20 @@ async function play(reqIn) {
   const durl = mm ? mm[1] : absUrl(id);
   const wantIdx = mm ? parseInt(mm[2], 10) : -1;
   const wantV = mm && mm[3] !== undefined ? parseInt(mm[3], 10) : 0;
-  // 现场重铸整链 (令牌时效 + IP 绑定的双重要求), 线路已按出口一致
-  // 性排序 (见 resolveLines): 用户点的线若与最优线同组则尊重其选
-  // 择, 否则回最优线 —— 借线解出的绑定型令牌在设备上必 403, 点了
-  // 也播不了, 不如直接给能播的那条。
+  // 详情缓存优先 (见详情线路缓存节): 10 分钟内且含所点的线, 直接
+  // 用详情时那批线, 不重解; 否则现场重解 (令牌时效 + IP 绑定的要
+  // 求仍在, 重解有线则刷新缓存)。选线: 可播组内优先 MP4 (见
+  // pickPlayLine), 否则沿用旧规则 (同组尊重所点、异组回最优线)。
   // 字幕搜索与铸造链并行发起 (不串行叠加延迟; 见字幕聚合节)
   const subsP = subSearchAll(durl).catch(() => []);
-  let lines = [];
-  try { ({ lines } = await resolveLines(durl)); } catch (e) { lines = []; }
+  let lines = cachedLines(durl, wantIdx, wantV);
+  if (!lines) {
+    try { ({ lines } = await resolveLines(durl)); } catch (e) { lines = []; }
+    if (lines.length) cacheLines(durl, lines);
+  }
   if (!lines.length) return sniffResult(durl);
   const tapped = lines.find((l) => l.idx === wantIdx && (l.v || 0) === wantV) || lines.find((l) => l.idx === wantIdx);
-  const best = lines[0];
-  const pick = (tapped && lineGroup(tapped) <= lineGroup(best)) ? tapped : best;
+  const pick = pickPlayLine(lines, tapped);
   const result = { parse: 0, url: pick.file, header: { 'User-Agent': UA, 'Referer': pick.embedUrl } };
   const subs = await subsP;
   if (subs && subs.length) result.subs = subs; // 无字幕命中时不带此键, 返回与接入前逐字段一致
