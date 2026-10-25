@@ -41,16 +41,19 @@ const cover=p=>p?._embedded?.['wp:featuredmedia']?.[0]?.source_url||'';
 const card=p=>({vod_id:String(p.id),vod_name:text(p.title?.rendered||p.title),vod_pic:cover(p),vod_remarks:text(p.excerpt?.rendered||'')});
 async function categories(){let a=await json(API+'/categories?per_page=100');return (Array.isArray(a)?a:[]).map(x=>({type_id:String(x.id),type_name:x.name}))}
 async function page(b,extra={}){let n=pg(b),j=await json(API+'/posts?'+new URLSearchParams({per_page:20,page:n,_embed:1,...extra}));return list(Array.isArray(j)?j.map(card):[],n)}
+// 2026-10-25 兜底：iframe 里带的 cid 若已漂移（playurl 取不到流），
+// 用 view 接口取当前 cid 重试一次。仅在首发失败时触发，正常路径零额外
+// 请求；B站已删稿（稿件不可见）无当前 cid，仍返回空，无法复活。
 async function biliUrl(u){
  u=String(u||'').replace(/&amp;/g,'&');
  const bvid=m(u,/(BV[0-9A-Za-z]+)/); if(!bvid)return '';
  let cid=m(u,/[?&]cid=(\d+)/);
  const headers={'User-Agent':UA,'Referer':'https://www.bilibili.com/video/'+bvid+'/'};
+ const playurl=async c=>{const j=await json('https://api.bilibili.com/x/player/playurl?'+new URLSearchParams({bvid,cid:c,qn:'64',fnval:'0',platform:'html5'}),{headers});let d=j?.data||{},du=d.durl?.[0]?.url||'';if(!du&&d.dash){du=d.dash.audio?.[0]?.baseUrl||d.dash.video?.[0]?.baseUrl||''}return du};
  if(!cid){const v=await json('https://api.bilibili.com/x/web-interface/view?bvid='+bvid,{headers});cid=String(v?.data?.cid||'')}
  if(!cid)return '';
- const j=await json('https://api.bilibili.com/x/player/playurl?'+new URLSearchParams({bvid,cid,qn:'64',fnval:'0',platform:'html5'}),{headers});
- let d=j?.data||{},du=d.durl?.[0]?.url||'';
- if(!du&&d.dash){du=d.dash.audio?.[0]?.baseUrl||d.dash.video?.[0]?.baseUrl||''}
+ let du=await playurl(cid);
+ if(!du){const v=await json('https://api.bilibili.com/x/web-interface/view?bvid='+bvid,{headers});const fresh=String(v?.data?.cid||'');if(fresh&&fresh!==cid)du=await playurl(fresh)}
  return du;
 }
 export default function createSpider() {
