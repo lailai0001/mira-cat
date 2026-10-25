@@ -972,6 +972,42 @@ function lineGroup(ln) {
   return 2;
 }
 
+// ---------------- 详情线路缓存 (2026-10-25 能解析不能播修复, 同 bestjavporn) ----------------
+// 真机症结: detail 时解出的线与 play 时现场重解的线常不是同一批 ——
+// play 时直连 embed 偶发超时/抖动, 重解丢直连线、甚至全空落嗅探。
+// 令牌 12h 有效、同机 IP 不变, 详情 10 分钟内的线直接复用最稳:
+// play 先用缓存 (含所点的线才算命中), 过期或无所点的线才重解。
+const LINE_CACHE_TTL = 10 * 60 * 1000;
+const lineCache = new Map(); // durl -> {lines, ts}
+function cacheLines(durl, lines) {
+  if (!durl || !lines || !lines.length) return;
+  lineCache.set(durl, { lines, ts: Date.now() });
+  if (lineCache.size > 100) lineCache.delete(lineCache.keys().next().value);
+}
+function cachedLines(durl, wantIdx, wantV) {
+  const hit = lineCache.get(durl);
+  if (!hit || (Date.now() - hit.ts) > LINE_CACHE_TTL) return null;
+  if (wantIdx >= 0 && !hit.lines.some((l) => l.idx === wantIdx && (l.v || 0) === (wantV || 0)) && !hit.lines.some((l) => l.idx === wantIdx)) return null;
+  return hit.lines;
+}
+// MP4 判定: 非 HLS (type 非 hls 且文件非 m3u8/txt)。播放器不把 play
+// header 转给 HLS 分片, 分片缺 Referer 会 302/403; MP4 单请求、
+// header 直达, 同组内优先 MP4 最稳。
+function isMp4Line(l) {
+  if (!l) return false;
+  if (/hls/i.test(l.type || '')) return false;
+  if (/\.m3u8(\?|$)/i.test(l.file || '') || /\.txt(\?|$)/i.test(l.file || '')) return false;
+  return true;
+}
+function pickPlayLine(lines, tapped) {
+  const best = lines[0];
+  const playable = lines.filter((l) => lineGroup(l) <= lineGroup(best));
+  if (tapped && lineGroup(tapped) <= lineGroup(best) && isMp4Line(tapped)) return tapped;
+  const mp4s = playable.filter(isMp4Line).sort((a, b) => ((b.q || 0) - (a.q || 0)) || (hostRank(a.host) - hostRank(b.host)) || (a.idx - b.idx) || ((a.v || 0) - (b.v || 0)));
+  if (mp4s.length) return mp4s[0];
+  return (tapped && lineGroup(tapped) <= lineGroup(best)) ? tapped : best;
+}
+
 // ---------------- 清晰度展开 (2026-10-22 高清修复) ----------------
 // 普查坐实 (两站各 4 部样本, castbank/REPORT_hires.md): 每个 embed
 // 的 data-config 只给 1 个 source, "低清"不在选源层 —— (1) 旧排序
@@ -1154,6 +1190,7 @@ async function detail(reqIn) {
   try { rl = await resolveLines(durl); }
   catch (e) { rl = { html: '', lines: [], stage: 'error', via: '', pageDiag: '', postDiag: '' }; }
   const { html, lines, stage, via } = rl;
+  if (lines.length) cacheLines(durl, lines); // 供 play 复用 (见详情线路缓存节)
   if (!html) {
     // 取页全灭保底: 永不返回空 —— 名字从 URL slug 派生, 分集名带
     // 取页通道逐个结论, 点播落嗅探 (重开详情即整链重试)。
@@ -1273,15 +1310,17 @@ async function play(reqIn) {
   const wantV = mm && mm[3] !== undefined ? parseInt(mm[3], 10) : 0;
   // 字幕搜索与铸造链并行发起 (不串行叠加延迟; 见字幕聚合节)
   const subsP = subSearchAll(durl).catch(() => []);
-  // 现场重铸整链 (令牌时效 + IP 绑定的双重要求), 线路已按出口
-  // 一致性排序: 用户点的线若与最优线同组则尊重其选择, 否则回
-  // 最优线 —— 借线解出的绑定型令牌在设备上必 403, 点了也是白点。
-  let lines = [];
-  try { ({ lines } = await resolveLines(durl)); } catch (e) { lines = []; }
+  // 详情缓存优先 (见详情线路缓存节): 10 分钟内且含所点的线, 直接
+  // 用详情时那批线, 不重解; 否则现场重解, 有线则刷新缓存。选线:
+  // 可播组内优先 MP4 (见 pickPlayLine), 否则沿用旧规则。
+  let lines = cachedLines(durl, wantIdx, wantV);
+  if (!lines) {
+    try { ({ lines } = await resolveLines(durl)); } catch (e) { lines = []; }
+    if (lines.length) cacheLines(durl, lines);
+  }
   if (!lines.length) return sniffResult(durl);
   const tapped = lines.find((l) => l.idx === wantIdx && (l.v || 0) === wantV) || lines.find((l) => l.idx === wantIdx);
-  const best = lines[0];
-  const pick = (tapped && lineGroup(tapped) <= lineGroup(best)) ? tapped : best;
+  const pick = pickPlayLine(lines, tapped);
   return subAttach({ parse: 0, url: pick.file, header: { 'User-Agent': UA, 'Referer': pick.embedUrl } }, subsP);
 }
 
