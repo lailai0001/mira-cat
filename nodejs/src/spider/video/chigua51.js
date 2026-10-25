@@ -7,14 +7,19 @@
 // bus.egyjtzsa.cc，设备端 req 不跟随 301 导致全分类空白（首页仍 200，故
 // 首页有内容、分类全空）。新域置顶直连；另加 301 Location 跟随（若运行
 // 时暴露响应头），下次轮换可自愈，不再全空。
+// 2026-10-25 彻底化：同站多 bus 域并存直连（egyjtzsa、51cg1.com、
+// okzdnjeu 均直连 200；qkvsednb 现 301 到 okzdnjeu）。直连域置顶，
+// 301 域垫底——设备不跟随 301 时仍有 3 个直连镜域可命中，不再因
+// 单域轮换全灭；解析已兼容新旧两种卡片 id 写法。
 import req from '../../util/req.js';
 
 const KEY = 'py_51chigua';
 const NAME = '51吃瓜';
 const HOSTS = [
   'https://bus.egyjtzsa.cc',
-  'https://bus.yueshrxet.cc',
   'https://51cg1.com',
+  'https://bus.okzdnjeu.cc',
+  'https://bus.yueshrxet.cc',
   'https://bus.qkvsednb.cc',
 ];
 let ACTIVE_HOST = HOSTS[0];
