@@ -18,6 +18,8 @@
 // 2026-10-28 封面修复：站点废弃 loadBannerDirect，封面改走 img 标签的
 // z-image-loader-url 属性（仍为 pic.*.cn 图床，走原 Worker 代理；代理已实测对
 // pic.gyezbp.cn 明文 .jpeg 可正常出图）。列表与详情均加该提取，旧写法保留作后备。
+// 2026-10-28 二轮：用户真机截图示列表标题日期正常、仅封面空白，列表解析无问题；
+// 封面再加 srcset、CSS 背景图（background-image / data-background）、noscript 三路提取。
 import req from '../../util/req.js';
 
 const KEY = 'py_51chigua';
@@ -194,6 +196,28 @@ function parseList(html) {
       const im = b.match(/<img[^>]+src="([^"]+)"/);
       if (im) pic = absUrl(im[1]);
     }
+    if (!pic) {
+      // 懒加载 srcset 首个地址
+      const ss = b.match(/(?:data-srcset|srcset)\s*=\s*"([^"]+)"/);
+      if (ss) {
+        const first = ss[1].split(',')[0].trim().split(/\s+/)[0];
+        if (/^https?:\/\//i.test(first)) pic = absUrl(first);
+      }
+    }
+    if (!pic) {
+      // CSS 背景图 / data-background（占位块式封面）
+      const bg = b.match(/background-image\s*:\s*url\(\s*['"]?(https?:[^'")]+)['"]?\s*\)/i)
+        || b.match(/data-background\s*=\s*"([^"]+)"/i);
+      if (bg) pic = absUrl(bg[1]);
+    }
+    if (!pic) {
+      const u = b.match(/url\(\s*['"]?(https?:[^'")]+)['"]?\s*\)/i);
+      if (u) pic = absUrl(u[1]);
+    }
+    if (!pic) {
+      const ns = b.match(/<noscript>[\s\S]{0,500}?<img[^>]+src="([^"]+)"/i);
+      if (ns) pic = absUrl(ns[1]);
+    }
 
     // 时间
     let remarks = '';
@@ -301,6 +325,22 @@ async function detail(reqIn) {
   if (!pic) {
     const zm = html.match(/z-image-loader-url=["']([^"']+)["']/);
     if (zm) pic = zm[1];
+  }
+  if (!pic) {
+    const ss = html.match(/(?:data-srcset|srcset)\s*=\s*"([^"]+)"/);
+    if (ss) {
+      const first = ss[1].split(',')[0].trim().split(/\s+/)[0];
+      if (/^https?:\/\//i.test(first)) pic = first;
+    }
+  }
+  if (!pic) {
+    const bg = html.match(/background-image\s*:\s*url\(\s*['"]?(https?:[^'")]+)['"]?\s*\)/i)
+      || html.match(/data-background\s*=\s*"([^"]+)"/i);
+    if (bg && /^https?:\/\//i.test(bg[1])) pic = bg[1];
+  }
+  if (!pic) {
+    const ns = html.match(/<noscript>[\s\S]{0,500}?<img[^>]+src="([^"]+)"/i);
+    if (ns && /^https?:\/\//i.test(ns[1])) pic = ns[1];
   }
 
   // 简介
