@@ -698,6 +698,9 @@ async function httpPostForm(url, bodyStr, opts = {}) {
     'Referer': referer,
     'Origin': HOST,
   };
+  // 2026-10-27 v6: 直连 POST 带上现铸前抓到的会话 cookie (仅直连
+  // 栈用 formHeaders; own/demo/aoRaw 各用自带头, 不受影响)。
+  if (opts.cookie) formHeaders.Cookie = opts.cookie;
   const t0 = Date.now();
   const budget = 30000; // POST 铸造全局总截止 (各波共享)
   const outcomes = [];
@@ -846,6 +849,36 @@ async function castBankLookup(watchUrl) {
 
 // 调 /api/play/ 并解出全部线路的 embed 路径: {paths, stage, via, postDiag}
 // 令牌盐按 data-ver 选; 站方回 status:false (post-bad) 时换下一盐重试。
+// 2026-10-27 v6 cookie 携带: 从 Set-Cookie 头抽出 name=value 对,
+// 拼成 Cookie 请求头。axios 的 set-cookie 多为数组 (每元一条);
+// 个别运行时拼成单串时用正则补抽, 并过滤属性名 (Expires/Path 等)。
+function cookiesFromHeaders(headers) {
+  if (!headers) return '';
+  const raw = headers['set-cookie'] || headers['Set-Cookie'] || '';
+  const entries = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+  const ATTR = { expires: 1, 'max-age': 1, path: 1, domain: 1, secure: 1, httponly: 1, samesite: 1, partitioned: 1 };
+  const map = {};
+  const takePair = (seg) => {
+    const s = String(seg || '').trim();
+    if (!s) return;
+    const i = s.indexOf('=');
+    if (i <= 0) return;
+    const name = s.slice(0, i).trim();
+    if (!name || ATTR[name.toLowerCase()]) return;
+    map[name] = s.slice(i + 1).trim();
+  };
+  for (const e of entries) {
+    const str = String(e);
+    takePair(str.split(';')[0]);
+    if (str.indexOf(',') >= 0) {
+      const re = /(?:^|,\s*)([A-Za-z0-9_\-]+)=([^;,\s][^;,]*)/g;
+      let m;
+      while ((m = re.exec(str)) !== null) takePair(m[1] + '=' + m[2]);
+    }
+  }
+  return Object.keys(map).map((k) => k + '=' + map[k]).join('; ');
+}
+
 async function fetchEmbedPaths(postId, mpu, ver, referer) {
   // 2026-10-27 详情巨慢+播不了修复: 库直出已由 resolveLines
   // 先做 (命中且有线直接返回); 走到这里说明库未命中或库内
@@ -854,11 +887,23 @@ async function fetchEmbedPaths(postId, mpu, ver, referer) {
   // 还白跑第二遍 embed 全波次, 是详情巨慢的主因之一。
   let lastDiag = '';
   let lastStage = 'post-none';
+  // 2026-10-27 v6: REX 的 Widget.http 自带原生 cookie 罐, 详情取页
+  // 攒下的站方/CF 会话 cookie 会随直连 POST 自动带上; 猫源 axios
+  // 默认无罐, 每发 POST 都是无会话裸发, 在被标记的出口 (VPN/
+  // Workers) 上被 CF 挡 403。现铸前先直连取一次详情页抓
+  // Set-Cookie, 只加到直连 POST (req/fetch) 上; own/demo/aoRaw
+  // 是中转出口, 带设备 cookie 反而 IP 失配, 不加。抓不到则裸发。
+  let cookieStr = '';
+  try {
+    const cr = await reqRaw(referer, { ...BROWSER_HEADERS, Referer: REFERER }, 6000);
+    cookieStr = cookiesFromHeaders(cr.headers || {});
+  } catch (e) { /* 抓不到则裸发 */ }
+  const ckNote = cookieStr ? ' ck' + cookieStr.split(';').length : ' ck0';
   for (const salt of tokenSalts(ver)) {
     const token = dexSalt(salt, postId, mpu);
     const body = 'sources=' + encodeURIComponent(token) + '&ver=' + encodeURIComponent(ver || '2');
-    const r = await httpPostForm(HOST + '/api/play/', body, { referer, timeout: 18000 });
-    lastDiag = r.diag || '';
+    const r = await httpPostForm(HOST + '/api/play/', body, { referer, timeout: 18000, cookie: cookieStr });
+    lastDiag = (r.diag || '') + ckNote;
     if (!r.text) { lastStage = r.stage || 'post-none'; continue; }
     let resp;
     try { resp = JSON.parse(r.text); } catch (e) { return { paths: [], stage: 'post-bad', via: r.via, postDiag: lastDiag, bank: 'miss' }; }
