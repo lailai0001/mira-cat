@@ -754,25 +754,23 @@ async function httpPostForm(url, bodyStr, opts = {}) {
   }, 10000, 'POST', bodyStr);
   // 注: codetabs POST 已实测挂掉 (VM 与真机均超时, 2026-10-27
   // 删), 仅 GET 波次保留 codetabs。
-  await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost]]);
-  if (!winner && !outcomes.some((o) => o.sawJson) && (Date.now() - t0) < 20000) {
-    // own 单次短重试 (2026-10-27 详情巨慢修复): own 的上游 403
-    // 是站方 CF 对 Workers 出口的时段/colo 间歇拒绝, 但实测自愈
-    // 在分钟级 (16:07 403、16:10 200), 秒级连打两发基本无益,
-    // 却各烧 12s 超时 —— 原 own2+own3 是详情超时的主因之一。
-    // 只留一发 8s 短重试, 20s 后不再重试; aoRaw 也只在 25s
-    // 内才打, 总 POST 封顶约 30s, 避免 App 详情超时直接报
-    // 获取失败。前提不变: 任何通道拿到过 JSON=false 说明令
-    // 牌本身被拒, 由上层换盐处理。
-    const tryOwn = async (name, target) => {
-      let res;
-      try { res = await ownPostTo(target, 8000); } catch (e) { res = { status: 0, body: '' }; }
-      judge(name, res);
-    };
-    await new Promise((r) => setTimeout(r, 1200));
-    await tryOwn('own2', url);
+    // 2026-10-27 v5 REX 对照移植: REX 两组件 (Widget.http) 现铸只走
+  // own-post -> direct-post 两路串行, 设备上可播; 猫源此前并行
+  // 四路 + own2 重试 + aoRaw 的打法在设备上全灭 (own403/直连403/
+  // demo429), 疑似并行突发 + 同令牌重复提交触发站方拦截。
+  // 改为串行: own -> req -> fetch -> demo -> aoRaw, 一家成即停,
+  // 单发 12/12/12/12/10s, 总 elapsed 满 30s 即停 (v2 封顶保留)。
+  // own2 已删 (REX 无 own 重试; v2 注释本身也承认秒级连打无益)。
+  // 注意: fetch 在设备无全局 fetch 时退化为 req (与 reqPost 同栈),
+  // 串行下第二发仅在第一发失败时才打, 不再是同毫秒重复提交。
+  const chain = [['own', ownPost], ['req', reqPost], ['fetch', fetchPost], ['demo', demoPost], ['aoRaw', aoPost]];
+  for (let ci = 0; ci < chain.length; ci++) {
+    if (winner) break;
+    if (Date.now() - t0 >= budget) break;
+    let res;
+    try { res = await chain[ci][1](); } catch (e) { res = { status: 0, body: '' }; }
+    judge(chain[ci][0], res);
   }
-  if (!winner && (Date.now() - t0) < 25000) await runWave([['aoRaw', aoPost]]);
   if (winner) return { text: winner.text, via: winner.via, outcomes, diag: postDiagOf(outcomes) };
   const sawJson = outcomes.some((o) => o.sawJson);
   return { text: '', via: '', outcomes, stage: sawJson ? 'post-bad' : 'post-none', diag: postDiagOf(outcomes) };
@@ -918,7 +916,10 @@ async function fetchEmbedPage(url, referer, directOnly) {
   const eFetch = async (u, to) => (HAS_FETCH ? fetchViaGlobal(u, hdrs, to) : reqRaw(u, hdrs, to));
   const eReq = async (u, to) => reqRaw(u, hdrs, to);
   const eDemo = async (u, to) => fetchRaw2('https://test.cors.workers.dev/?' + u, { ...WD_HEADERS }, to);
-  await runWave([['fetch', eFetch, 9000], ['req', eReq, 9000], ['https', chHttps, 9000]]);
+    // 2026-10-27 v5 REX 对照: embed 直连只发一发 req (REX 为单发
+  // Widget.http 直连), 不再三栈并行 (eFetch 与 eReq 设备上同栈,
+  // 同毫秒重复提交疑似触发拦截); 直连不成再走 own/demo 与代理波次。
+  await runWave([['req', eReq, 10000]]);
   if (!winner && !directOnly) await runWave([['own', chOwn, 10000], ['demo', eDemo, 10000]]);
   if (!winner && !directOnly) await runWave([['jina', chJina, 10000], ['aoGet', chAoGet, 10000], ['aoRaw', chAoRaw, 10000], ['codetabs', chCodetabs, 9000]]);
   if (winner) return { html: winner.html, win: winner.oc, outcomes };
