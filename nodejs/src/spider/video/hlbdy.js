@@ -4,7 +4,8 @@
 // 分类：导航栏 /category/{slug}/ 链接（裸 <a>，不用 <li> 包裹也能抓）。
 // 列表：<article> 块（链接 + h2 标题）；封面多路提取（z-image-loader-url、
 // img data-src/src、CSS background-image、块内首个图片地址），因卡片封面
-// 可能不是普通 <img> 标签。2026-10-28 三轮：真机列表正常、仅封面空白，列表页抓取无图片标记；
+// 可能不是普通 <img> 标签。2026-10-28 四轮：封面 URL 本就在网页里（z-image-loader-url），
+// 但 pic.hdhwqx.cn 直取是加密密文（非合法图片），故 App 显示空白；改走 51chigua 解密代理出图。
 // 封面在 imgOf 已有通用图片地址兜底外再加 data-cover 类属性。详情：/archives/{id}.html，视频在内联 JS 播放器
 // 配置里（DPlayer 风格 data-config 或直链），多路提取；配置具体形式待真机验收。
 import req from '../../util/req.js';
@@ -18,6 +19,16 @@ const HOSTS = [
   'https://di59h5e63i08h.cloudfront.net/',
 ];
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const IMG_PROXY = 'https://51chigua.li768435813.workers.dev/img?url=';
+// 2026-10-28 四轮：pic.*.cn 图床的图片是加密存储的密文（直取不是合法图片，
+// App 无法显示）；51chigua 代理实测可解密 pic.hdhwqx.cn（返回合法 JPEG），无需另部署。
+function proxyCover(url) {
+  url = String(url || '').trim();
+  if (!url) return '';
+  if (url.indexOf('51chigua.li768435813.workers.dev') >= 0) return url;
+  if (/pic\.[a-z0-9]+\.cn/i.test(url)) return IMG_PROXY + encodeURIComponent(url);
+  return url;
+}
 
 let ACTIVE_HOST = '';
 
@@ -104,7 +115,7 @@ function parseArticles(html, host) {
     const title = hm ? stripTags(hm[1]) : '';
     if (!title || title.length < 2) continue;
     const dm = blk.match(/(\d{4}\/\d{1,2}\/\d{1,2}|\d{4} 年 \d{1,2} 月 \d{1,2} 日)/);
-    push(url, title, imgOf(blk), dm ? dm[1] : '');
+    push(url, title, proxyCover(imgOf(blk)), dm ? dm[1] : '');
     if (items.length >= 60) break;
   }
   // 兜底：无 article 块时直接扫 /archives/*.html 链接
@@ -215,7 +226,7 @@ async function detail(reqIn) {
     list.push({
       vod_id: raw,
       vod_name: hm ? stripTags(hm[1]) : '黑料不打烊',
-      vod_pic: ogm ? ogm[1] : '',
+      vod_pic: ogm ? proxyCover(ogm[1]) : '',
       vod_play_from: '黑料不打烊',
       vod_play_url: vu ? ('视频$' + vu) : ('未找到视频源$' + url),
     });

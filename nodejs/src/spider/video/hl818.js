@@ -4,11 +4,12 @@ import req from '../../util/req.js';
 
 const KEY = 'py_818hl';
 const NAME = '818黑料网';
-const HOST = 'https://cell.lacdfsq.cc/';
+const HOST = 'https://818hlw1.com/';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 // 封面为 AES-128-CBC 加密存储（key f5d965df75336270 / iv 97b60394abc2fbe1），走解密代理出图
-// 2026-10-28 修复：站每次访问重定向到随机 jvtshrap.cc 子域（axios 默认跟随跳转，
-// 直接抓 cell.lacdfsq.cc 即可）；分类改取所有 /category/ 链接（不再依赖 <li> 包裹）；
+// 2026-10-28 四轮：cell 域每次 301 到随机 jvtshrap.cc 子域，设备端加载不出内容；
+// 改走站方自报永久地址 818hlw1.com（实测直出 30 篇、无跳转）；分类仍取所有 /category/ 链接；
+// sugfew 封面同样加密存储，bagua 代理实测可解密（返回合法 JPEG），封面仍走 bagua 代理。
 // /latest/ 与 /hot/ 已证实为站内 404 样式页，不再作 fallback；详情视频多路提取
 // （data-config、内联 JS url、全文 m3u8/mp4、og:video），因播放器配置形式未在
 // 原始 HTML 里验到。
