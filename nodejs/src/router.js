@@ -61,6 +61,7 @@ import javideo from './spider/video/javideo.js';
 import bestjavporn from './spider/video/bestjavporn.js';
 import chaturbate from './spider/video/chaturbate.js';
 import asmrba from './spider/video/asmrba.js';
+import hlbdy from './spider/video/hlbdy.js';
 
 const spiders = [
     missav_xptv,
@@ -118,7 +119,7 @@ const spiders = [
     youzidj,
     stripchat,
     hohoj,
-    rip17, brazz, bigbuttshub, mmtv, javideo, bestjavporn, chaturbate, asmrba,];
+    rip17, brazz, bigbuttshub, mmtv, javideo, bestjavporn, chaturbate, asmrba, hlbdy,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
