@@ -15,6 +15,9 @@
 // okzdnjeu 301 到 2h3uq.hszhzwngt.cc 同域变体）。品牌域 51cg1.com 置顶直连（不 301、
 // 不随 bus 轮换），新域次之，旧 bus 域全部作后备——设备不跟随 301 时仍有直连域可命中；
 // 51cg1.com 与新域实测分类/详情/播放标记齐全，解析与播放逻辑不动。
+// 2026-10-28 封面修复：站点废弃 loadBannerDirect，封面改走 img 标签的
+// z-image-loader-url 属性（仍为 pic.*.cn 图床，走原 Worker 代理；代理已实测对
+// pic.gyezbp.cn 明文 .jpeg 可正常出图）。列表与详情均加该提取，旧写法保留作后备。
 import req from '../../util/req.js';
 
 const KEY = 'py_51chigua';
@@ -182,6 +185,11 @@ function parseList(html) {
     let pic = '';
     const pm = b.match(/loadBannerDirect\('([^']+)'/);
     if (pm) pic = pm[1];
+    // 新版封面：z-image-loader-url 属性（2026-10-28 起 loadBannerDirect 已废弃）
+    if (!pic) {
+      const zm = b.match(/z-image-loader-url=["']([^"']+)["']/);
+      if (zm) pic = absUrl(zm[1]);
+    }
     if (!pic) {
       const im = b.match(/<img[^>]+src="([^"]+)"/);
       if (im) pic = absUrl(im[1]);
@@ -288,6 +296,11 @@ async function detail(reqIn) {
   if (!pic) {
     const bm = html.match(/loadBannerDirect\('([^']+)'/);
     if (bm) pic = bm[1];
+  }
+  // 新版封面：z-image-loader-url 属性
+  if (!pic) {
+    const zm = html.match(/z-image-loader-url=["']([^"']+)["']/);
+    if (zm) pic = zm[1];
   }
 
   // 简介
