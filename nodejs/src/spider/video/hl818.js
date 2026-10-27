@@ -7,6 +7,11 @@ const NAME = '818黑料网';
 const HOST = 'https://cell.lacdfsq.cc/';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 // 封面为 AES-128-CBC 加密存储（key f5d965df75336270 / iv 97b60394abc2fbe1），走解密代理出图
+// 2026-10-28 修复：站每次访问重定向到随机 jvtshrap.cc 子域（axios 默认跟随跳转，
+// 直接抓 cell.lacdfsq.cc 即可）；分类改取所有 /category/ 链接（不再依赖 <li> 包裹）；
+// /latest/ 与 /hot/ 已证实为站内 404 样式页，不再作 fallback；详情视频多路提取
+// （data-config、内联 JS url、全文 m3u8/mp4、og:video），因播放器配置形式未在
+// 原始 HTML 里验到。
 const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
 
 function proxyCover(url) {
@@ -56,20 +61,25 @@ function imgOf(html) {
 
 function parseArticles(html) {
   const items = [];
-  const re = /<article[\s\S]{0,3000}?<\/article>/gi;
+  const re = /<article[\s\S]{0,8000}?<\/article>/gi;
   let m;
   const seen = new Set();
   while ((m = re.exec(html)) !== null) {
     const blk = m[0];
-    const a = blk.match(/<a[^>]*href="([^"]+)"[^>]*>/i);
-    if (!a) continue;
-    const href = a[1].trim();
+    const links = [...blk.matchAll(/<a[^>]*href="([^"]+)"[^>]*>/gi)].map(x => x[1]);
+    const found = links.find(h => h.indexOf('/archives/') >= 0) || links[0];
+    if (!found) continue;
+    const href = found.trim();
     if (!href || href === '#' || seen.has(href)) continue;
     seen.add(href);
     const t = blk.match(/<h2[^>]*>([^<]{2,120})<\/h2>/i)
       || blk.match(/class="entry-title"[^>]*>([^<]{2,120})/i)
       || blk.match(/class="post-title"[^>]*>([^<]{2,120})/i);
-    const title = t ? t[1].trim() : '';
+    let title = t ? t[1].trim() : '';
+    if (!title) {
+      const at = blk.match(/<a[^>]*>([\s\S]{0,300}?)<\/a>/i);
+      if (at) title = at[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    }
     if (!title) continue;
     const tm = blk.match(/<time[^>]*>([^<]{2,40})<\/time>/i);
     items.push({
@@ -85,21 +95,34 @@ function parseArticles(html) {
 
 function parseCategories(html) {
   const items = [];
-  const sels = [
-    /<li[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([^<]{2,20})<\/a>\s*<\/li>/gi,
-  ];
   const seen = new Set();
-  for (const re of sels) {
-    let m;
-    while ((m = re.exec(html)) !== null) {
-      const href = m[1].trim(), name = m[2].trim();
-      if (!href || href === '#' || !name || seen.has(href)) continue;
-      seen.add(href);
-      items.push({ type_id: href, type_name: name });
-    }
-    if (items.length) break;
+  // 取所有 /category/ 链接：导航分类可能是裸 <a>，也可能被 <li> 包裹，两种都认
+  const re = /<a[^>]*href="(?:https?:\/\/[^"\/]+)?(\/category\/[^"]+)"[^>]*>([^<]{2,20})<\/a>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const href = m[1].trim(), name = m[2].trim();
+    if (!href || href === '#' || !name || seen.has(href)) continue;
+    seen.add(href);
+    items.push({ type_id: href, type_name: name });
   }
   return items;
+}
+
+function extractVideo(html) {
+  const clean = html.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+  let m = clean.match(/<video[^>]+src=["']([^"']+)["']/i);
+  if (m) return m[1];
+  m = clean.match(/<source[^>]+src=["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/i);
+  if (m) return m[1];
+  m = clean.match(/["']?url["']?\s*:\s*["'](https?:[^"']+\.(?:m3u8|mp4)[^"']*)["']/i);
+  if (m) return m[1];
+  const urls = [...clean.matchAll(/https?:\/\/[^"'\s<>]+\.(?:m3u8|mp4)(?:\?[^"'\s<>]*)?/gi)].map(x => x[0]);
+  const m3 = urls.find(u => /\.m3u8/i.test(u));
+  if (m3) return m3;
+  if (urls.length) return urls[0];
+  m = clean.match(/<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i);
+  if (m) return m[1];
+  return '';
 }
 
 async function init() { return {}; }
@@ -108,9 +131,12 @@ async function home() {
   const html = await getText(HOST);
   let classes = parseCategories(html);
   if (!classes.length) {
+    // /latest/ 与 /hot/ 已证实为站内 404 样式页，不可用；用实测导航分类兜底
     classes = [
-      { type_id: '/latest/', type_name: '最新' },
-      { type_id: '/hot/', type_name: '热门' },
+      { type_id: '/category/jrcg/', type_name: '今日吃瓜' },
+      { type_id: '/category/rmdg/', type_name: '热门大瓜' },
+      { type_id: '/category/aidj/', type_name: 'AI短剧' },
+      { type_id: '/category/mrds/', type_name: '每日大赛' },
     ];
   }
   return { class: classes, filters: {}, list: parseArticles(html) };
@@ -178,6 +204,11 @@ async function detail(reqIn) {
         }
         plist.push(name + '$' + href);
       }
+    }
+    // 3) 通用直链兜底：播放器配置多为内联 JS，扫全文 m3u8/mp4 与 og:video
+    if (!plist.length) {
+      const vu = extractVideo(html);
+      if (vu) plist.push('视频$' + vu);
     }
     const hm = html.match(/<h1[^>]*>([^<]{2,120})<\/h1>/i);
     list.push({
