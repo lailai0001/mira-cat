@@ -2368,10 +2368,12 @@ async function fetchPage(url, opts = {}) {
     // 与 embed 查看者 IP 绑定, 故第一波只用直连三栈 (设备自身出口,
     // 与播放器同 IP); 直连全灭才借代理通道 —— 借线解出的令牌绑的
     // 是代理出口, 对绑定型宿主必然 403, 只能作排序末位兜底。
+    // 2026-10-27 v5 REX 对照: embed 直连只发一发 req (REX 为单发
+    // Widget.http 直连), 不再三栈并行 (chFetch 与 chReq 设备上同栈,
+    // 同毫秒重复提交疑似触发拦截); 直连不成再走 own/demo 与代理波次。
+    // 出口一致性不变: req 仍是设备自身出口, 与播放器同 IP。
     await runWave([
-      ['fetch', chFetch, 9000],
-      ['req', chReq, 9000],
-      ['https', chHttps, 9000],
+      ['req', chReq, 10000],
     ]);
     if (!winner && !opts.directOnly) {
       await runWave([
@@ -2495,26 +2497,23 @@ async function httpPostForm(url, bodyStr, opts = {}) {
   }, 10000, 'POST', bodyStr);
   // 注: codetabs POST 已实测挂掉 (VM 与真机均超时, 2026-10-27
   // 删), 仅 GET 波次保留 codetabs。
-  await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost]]);
-  if (!winner && !outcomes.some((o) => o.sawJson) && (Date.now() - t0) < 20000) {
-    // own 单次短重试 (2026-10-27 详情巨慢修复): own 的上游 403
-    // 是站方 CF 对 Workers 出口的时段/colo 间歇拒绝, 但实测自愈
-    // 在分钟级 (16:07 403、16:10 200), 秒级连打两发基本无益,
-    // 却各烧 12s 超时 —— 原 own2+own3 是详情超时的主因之一。
-    // 只留一发 8s 短重试, 20s 后不再重试; aoRaw 也只在 25s
-    // 内才打, 总 POST 封顶约 30s。均打 www 上游 (apex 主机名
-    // 实测回 405 不收 POST, 轮换无用, 2026-10-22 curl 直验)。
-    // 前提不变: 任何通道拿到过 JSON=false 说明令牌本身被拒,
-    // 重试无益, 跳过。
-    const tryOwn = async (name, target) => {
-      let res;
-      try { res = await ownPostTo(target, 8000); } catch (e) { res = { status: 0, body: '' }; }
-      judge(name, res);
-    };
-    await new Promise((r) => setTimeout(r, 1200));
-    await tryOwn('own2', url);
+    // 2026-10-27 v5 REX 对照移植: REX 两组件 (Widget.http) 现铸只走
+  // own-post -> direct-post 两路串行, 设备上可播; 猫源此前并行
+  // 四路 + own2 重试 + aoRaw 的打法在设备上全灭 (own403/直连403/
+  // demo429), 疑似并行突发 + 同令牌重复提交触发站方拦截。
+  // 改为串行: own -> req -> fetch -> demo -> aoRaw, 一家成即停,
+  // 单发 12/12/12/12/10s, 总 elapsed 满 30s 即停 (v2 封顶保留)。
+  // own2 已删 (REX 无 own 重试; v2 注释本身也承认秒级连打无益)。
+  // 注意: fetch 在设备无全局 fetch 时退化为 req (与 reqPost 同栈),
+  // 串行下第二发仅在第一发失败时才打, 不再是同毫秒重复提交。
+  const chain = [['own', ownPost], ['req', reqPost], ['fetch', fetchPost], ['demo', demoPost], ['aoRaw', aoPost]];
+  for (let ci = 0; ci < chain.length; ci++) {
+    if (winner) break;
+    if (Date.now() - t0 >= budget) break;
+    let res;
+    try { res = await chain[ci][1](); } catch (e) { res = { status: 0, body: '' }; }
+    judge(chain[ci][0], res);
   }
-  if (!winner && (Date.now() - t0) < 25000) await runWave([['aoRaw', aoPost]]);
   if (winner) return { text: winner.text, via: winner.via, outcomes, diag: postDiagOf(outcomes) };
   // 全灭归因: 有通道拿到带 status 字段的 JSON (站方明确回 false) ->
   // post-bad; 连 JSON 都没拿到 -> post-none。
