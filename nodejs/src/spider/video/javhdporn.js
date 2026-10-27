@@ -752,13 +752,9 @@ async function httpPostForm(url, bodyStr, opts = {}) {
   const aoPost = async () => fetchRaw2('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
     'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA,
   }, 10000, 'POST', bodyStr);
-  // 2026-10-27 截图定位修复: 铸造 POST 全通道 403/429/超时时
-  // 加 codetabs 代理通道 (通用转发代理, 转发 POST 方法与表单
-  // 体; 不通则本通道自败, 不影响其余通道)。
-  const codePost = async () => fetchRaw2('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), {
-    'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA,
-  }, 12000, 'POST', bodyStr);
-  await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost], ['codetabs', codePost]]);
+  // 注: codetabs POST 已实测挂掉 (VM 与真机均超时, 2026-10-27
+  // 删), 仅 GET 波次保留 codetabs。
+  await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost]]);
   if (!winner && !outcomes.some((o) => o.sawJson) && (Date.now() - t0) < 20000) {
     // own 单次短重试 (2026-10-27 详情巨慢修复): own 的上游 403
     // 是站方 CF 对 Workers 出口的时段/colo 间歇拒绝, 但实测自愈
