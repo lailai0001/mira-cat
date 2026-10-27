@@ -1,4 +1,4 @@
-// 51吃瓜 (https://bus.egyjtzsa.cc) -> CatPawOpen spider
+// 51吃瓜 (https://51cg1.com) -> CatPawOpen spider
 // 重写版：干净实现，封面走 Cloudflare Worker 解密代理
 // 2026-10-23 修复：站点 bus 线路域名轮换（bus.qkvsednb.cc 整站 301 跳 bus.yueshrxet.cc，
 // 设备端取不到旧域内容导致全分类空白）。改为多主机自愈：依次探测下列主机，
@@ -11,13 +11,18 @@
 // okzdnjeu 均直连 200；qkvsednb 现 301 到 okzdnjeu）。直连域置顶，
 // 301 域垫底——设备不跟随 301 时仍有 3 个直连镜域可命中，不再因
 // 单域轮换全灭；解析已兼容新旧两种卡片 id 写法。
+// 2026-10-27 修复：bus 域再次轮换至 bus.hszhzwngt.cc（旧 bus 域一律 301 到新域；
+// okzdnjeu 301 到 2h3uq.hszhzwngt.cc 同域变体）。品牌域 51cg1.com 置顶直连（不 301、
+// 不随 bus 轮换），新域次之，旧 bus 域全部作后备——设备不跟随 301 时仍有直连域可命中；
+// 51cg1.com 与新域实测分类/详情/播放标记齐全，解析与播放逻辑不动。
 import req from '../../util/req.js';
 
 const KEY = 'py_51chigua';
 const NAME = '51吃瓜';
 const HOSTS = [
-  'https://bus.egyjtzsa.cc',
   'https://51cg1.com',
+  'https://bus.hszhzwngt.cc',
+  'https://bus.egyjtzsa.cc',
   'https://bus.okzdnjeu.cc',
   'https://bus.yueshrxet.cc',
   'https://bus.qkvsednb.cc',
