@@ -2373,13 +2373,13 @@ async function fetchPage(url, opts = {}) {
       ['req', chReq, 9000],
       ['https', chHttps, 9000],
     ]);
-    if (!winner) {
+    if (!winner && !opts.directOnly) {
       await runWave([
         ['own', chOwn, 10000],
         ['demo', chDemo, 10000],
       ]);
     }
-    if (!winner) {
+    if (!winner && !opts.directOnly) {
       await runWave([
         ['jina', chJina, 10000],
         ['aoGet', chAoGet, 12000],
@@ -2493,7 +2493,13 @@ async function httpPostForm(url, bodyStr, opts = {}) {
   const aoPost = async () => fetchRaw2('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
     'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA,
   }, 10000, 'POST', bodyStr);
-  await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost]]);
+  // 2026-10-27 截图定位修复: 铸造 POST 全通道 403/429/超时时
+  // 加 codetabs 代理通道 (通用转发代理, 转发 POST 方法与表单
+  // 体; 不通则本通道自败, 不影响其余通道)。
+  const codePost = async () => fetchRaw2('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), {
+    'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA,
+  }, 12000, 'POST', bodyStr);
+  await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost], ['codetabs', codePost]]);
   if (!winner && !outcomes.some((o) => o.sawJson)) {
     // own 重试做足 (第九轮): own 的上游 403 是站方 CF 对 Workers
     // 出口的时段/colo 间歇拒绝 (16:07 真机 403、16:10 同请求 200),
@@ -2728,8 +2734,10 @@ function extractPlaySeed(html) {
 // 形态别名 (2026-10-23 真机坐实): 站方列表/搜索发的 watch 链
 // 接带 /v\d+/ 前缀且会漂移, 入库键多为去前缀 canonical 形 ——
 // 精确一发未命中时, 明明在库的片也照样全灭。候选序: 精确址 ->
-// canonical 形 -> 其余前缀形, 最多 3 发 GET (查库不耗写入预
-// 算), 命中即停; 首发超时沿用 6s, 变体发 3s。
+// canonical 形 -> 其余前缀形, 全部并行查 (查库不耗写入预
+// 算), 按序取首命中; 首发超时沿用 6s, 变体发 3s。
+// 2026-10-27 截图定位修复: 原 slice(0,3) 会截掉别名前缀形
+// 入库键, 造成假性库未命中。
 const CAST_ALIAS_PREFIXES = '/v1,/v2'.split(',');
 function castBankCandidates(watchUrl) {
   const out = [watchUrl];
@@ -2741,7 +2749,7 @@ function castBankCandidates(watchUrl) {
     const u = m[1] + p + m[2];
     if (!out.includes(u)) out.push(u);
   }
-  return out.slice(0, 3);
+  return out;
 }
 
 async function castBankGet(watchUrl, timeoutMs) {
@@ -2768,10 +2776,8 @@ async function castBankGet(watchUrl, timeoutMs) {
 
 async function castBankLookup(watchUrl) {
   const cands = castBankCandidates(watchUrl);
-  for (let i = 0; i < cands.length; i++) {
-    const hit = await castBankGet(cands[i], i === 0 ? 6000 : 3000);
-    if (hit) return hit;
-  }
+  const results = await Promise.all(cands.map((c, i) => castBankGet(c, i === 0 ? 6000 : 3000)));
+  for (const hit of results) if (hit) return hit;
   return { hit: false };
 }
 
@@ -2838,9 +2844,9 @@ const DIRECT_CHANNELS = new Set(['fetch', 'req', 'https']);
 // embed 页 -> {sources, direct} (单条硬顶 20s, 防慢 embed 拖死详情)。
 // direct=true 表示 embed 由直连栈取回, 文件令牌绑设备 IP, 与播放器
 // 自洽; direct=false 为借代理出口解出, 仅对非绑定宿主可用。
-async function resolveEmbed(embedUrl, referer) {
+async function resolveEmbed(embedUrl, referer, directOnly) {
   const r = await Promise.race([
-    fetchPage(embedUrl, { kind: 'embed', referer, profile: 'embed', deadlineMs: 20000 }),
+    fetchPage(embedUrl, { kind: 'embed', referer, profile: 'embed', deadlineMs: 20000, directOnly }),
     new Promise((res) => setTimeout(() => res(null), 20000)),
   ]);
   if (!r || !r.html) return null;
@@ -2999,16 +3005,24 @@ function displayHost(file, embedUrl) {
 // 路径集 -> 线路表 (embed 解出 + 清晰度展开 + 全局排序), 供库直出
 // 与常规流程共用。
 async function linesFromPaths(paths, durl) {
-  const lines = [];
-  await Promise.all(paths.slice(0, 8).map(async (p, idx) => {
-    const embedUrl = 'https:' + p.path;
-    const r = await resolveEmbed(embedUrl, durl);
-    if (!r) return;
-    const expanded = await expandSources(r.sources, embedUrl);
-    for (const e of expanded) {
-      lines.push({ idx, v: e.v, lo: p.lo, embedUrl, file: e.file, parentFile: e.parent, type: e.type, host: displayHost(e.file, embedUrl), q: e.q, direct: !!r.direct });
-    }
-  }));
+  // 2026-10-27 截图定位修复: 首发 0 线时只用直连三栈再打一发
+  // (直连失败多为间歇 403/抖动, 第二发常能成; 借线对绑定型
+  // 宿主必 403, 重试不走代理波, 成功路径零额外耗时)。
+  const run = async (directOnly) => {
+    const out = [];
+    await Promise.all(paths.slice(0, 8).map(async (p, idx) => {
+      const embedUrl = 'https:' + p.path;
+      const r = await resolveEmbed(embedUrl, durl, directOnly);
+      if (!r) return;
+      const expanded = await expandSources(r.sources, embedUrl);
+      for (const e of expanded) {
+        out.push({ idx, v: e.v, lo: p.lo, embedUrl, file: e.file, parentFile: e.parent, type: e.type, host: displayHost(e.file, embedUrl), q: e.q, direct: !!r.direct });
+      }
+    }));
+    return out;
+  };
+  let lines = await run(false);
+  if (!lines.length && paths.length) lines = await run(true);
   // 排序: 直连解出 (令牌绑设备 IP, 与播放器自洽) 最前; 借线解出的
   // hugstream 前置 (master.txt, 实测不绑 IP、只认 Referer) 次之;
   // 借线解出的绑定型宿主 (令牌绑代理出口, 设备必 403) 末位。组内

@@ -752,7 +752,13 @@ async function httpPostForm(url, bodyStr, opts = {}) {
   const aoPost = async () => fetchRaw2('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {
     'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA,
   }, 10000, 'POST', bodyStr);
-  await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost]]);
+  // 2026-10-27 截图定位修复: 铸造 POST 全通道 403/429/超时时
+  // 加 codetabs 代理通道 (通用转发代理, 转发 POST 方法与表单
+  // 体; 不通则本通道自败, 不影响其余通道)。
+  const codePost = async () => fetchRaw2('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), {
+    'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA,
+  }, 12000, 'POST', bodyStr);
+  await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost], ['codetabs', codePost]]);
   if (!winner && !outcomes.some((o) => o.sawJson)) {
     // own 重试: own 的上游 403 是站方 CF 对 Workers 出口的时段/
     // colo 间歇拒绝 (BJP 真机 16:07 403、16:10 同请求 200), 隔
@@ -797,9 +803,10 @@ function extractPlaySeed(html) {
 // 形态别名 (2026-10-23 真机坐实): 站方列表/搜索发的 watch 链
 // 接带 /v\d+/ 前缀且会漂移 (本站出现过 /v2//v4/), 入库键多为
 // 去前缀 canonical 形 —— 精确一发未命中时, 明明在库的片也照
-// 样全灭。候选序: 精确址 -> canonical 形 -> 其余前缀形, 最多
-// 3 发 GET (查库不耗写入预算), 命中即停; 首发超时沿用 6s,
-// 变体发 3s。
+// 样全灭。候选序: 精确址 -> canonical 形 -> 其余前缀形, 全部
+// 并行查 (查库不耗写入预算), 按序取首命中; 首发超时沿用 6s,
+// 变体发 3s。2026-10-27 截图定位修复: 原 slice(0,3) 会截掉
+// /v1 或 /v4 形入库键, 造成假性库未命中。
 const CAST_ALIAS_PREFIXES = '/v2,/v4,/v1'.split(',');
 function castBankCandidates(watchUrl) {
   const out = [watchUrl];
@@ -811,7 +818,7 @@ function castBankCandidates(watchUrl) {
     const u = m[1] + p + m[2];
     if (!out.includes(u)) out.push(u);
   }
-  return out.slice(0, 3);
+  return out;
 }
 
 async function castBankGet(watchUrl, timeoutMs) {
@@ -838,10 +845,8 @@ async function castBankGet(watchUrl, timeoutMs) {
 
 async function castBankLookup(watchUrl) {
   const cands = castBankCandidates(watchUrl);
-  for (let i = 0; i < cands.length; i++) {
-    const hit = await castBankGet(cands[i], i === 0 ? 6000 : 3000);
-    if (hit) return hit;
-  }
+  const results = await Promise.all(cands.map((c, i) => castBankGet(c, i === 0 ? 6000 : 3000)));
+  for (const hit of results) if (hit) return hit;
   return { hit: false };
 }
 
@@ -885,7 +890,7 @@ const DIRECT_CHANNELS = new Set(['fetch', 'req', 'https']);
 
 // embed 取页: 直连三栈优先 (令牌绑查看者 IP), 代理只兜底。
 // 回 {html, win:{name,status}} —— 有效 = 正文含 data-config。
-async function fetchEmbedPage(url, referer) {
+async function fetchEmbedPage(url, referer, directOnly) {
   const t0 = Date.now();
   const budget = 20000;
   const outcomes = [];
@@ -916,16 +921,16 @@ async function fetchEmbedPage(url, referer) {
   const eReq = async (u, to) => reqRaw(u, hdrs, to);
   const eDemo = async (u, to) => fetchRaw2('https://test.cors.workers.dev/?' + u, { ...WD_HEADERS }, to);
   await runWave([['fetch', eFetch, 9000], ['req', eReq, 9000], ['https', chHttps, 9000]]);
-  if (!winner) await runWave([['own', chOwn, 10000], ['demo', eDemo, 10000]]);
-  if (!winner) await runWave([['jina', chJina, 10000], ['aoGet', chAoGet, 10000], ['aoRaw', chAoRaw, 10000], ['codetabs', chCodetabs, 9000]]);
+  if (!winner && !directOnly) await runWave([['own', chOwn, 10000], ['demo', eDemo, 10000]]);
+  if (!winner && !directOnly) await runWave([['jina', chJina, 10000], ['aoGet', chAoGet, 10000], ['aoRaw', chAoRaw, 10000], ['codetabs', chCodetabs, 9000]]);
   if (winner) return { html: winner.html, win: winner.oc, outcomes };
   return { html: '', win: null, outcomes };
 }
 
 // embed 页 -> {sources, direct, viaName} (direct = 直连栈取回,
 // 文件令牌绑设备 IP, 与播放器自洽)
-async function resolveEmbed(embedUrl, referer) {
-  const r = await fetchEmbedPage(embedUrl, referer);
+async function resolveEmbed(embedUrl, referer, directOnly) {
+  const r = await fetchEmbedPage(embedUrl, referer, directOnly);
   if (!r.html) return null;
   const cfg = (r.html.match(/data-config="([^"]+)"/) || [])[1];
   if (!cfg) return null;
@@ -1110,16 +1115,24 @@ const STAGE_TEXT = {
 // 路径集 -> 线路表 (embed 解出 + 清晰度展开 + 全局排序), 供库直出
 // 与常规流程共用。
 async function linesFromPaths(paths, durl) {
-  const lines = [];
-  await Promise.all(paths.slice(0, 8).map(async (p, idx) => {
-    const embedUrl = 'https:' + p.path;
-    const r = await resolveEmbed(embedUrl, durl);
-    if (!r) return;
-    const expanded = await expandSources(r.sources, embedUrl);
-    for (const e of expanded) {
-      lines.push({ idx, v: e.v, lo: p.lo, embedUrl, file: e.file, parentFile: e.parent, type: e.type, host: displayHost(e.file, embedUrl), q: e.q, direct: !!r.direct });
-    }
-  }));
+  // 2026-10-27 截图定位修复: 首发 0 线时只用直连三栈再打一发
+  // (直连失败多为间歇 403/抖动, 第二发常能成; 借线对绑定型
+  // 宿主必 403, 重试不走代理波, 成功路径零额外耗时)。
+  const run = async (directOnly) => {
+    const out = [];
+    await Promise.all(paths.slice(0, 8).map(async (p, idx) => {
+      const embedUrl = 'https:' + p.path;
+      const r = await resolveEmbed(embedUrl, durl, directOnly);
+      if (!r) return;
+      const expanded = await expandSources(r.sources, embedUrl);
+      for (const e of expanded) {
+        out.push({ idx, v: e.v, lo: p.lo, embedUrl, file: e.file, parentFile: e.parent, type: e.type, host: displayHost(e.file, embedUrl), q: e.q, direct: !!r.direct });
+      }
+    }));
+    return out;
+  };
+  let lines = await run(false);
+  if (!lines.length && paths.length) lines = await run(true);
   // 排序骨架不变 (出口组优先), 组内先比清晰度 (高清在前), 再比
   // 宿主可靠性与原序 —— 修 (1): 1080p 线不再被 720p 线压在后面。
   lines.sort((a, b) => (lineGroup(a) - lineGroup(b)) || ((b.q || 0) - (a.q || 0)) || (hostRank(a.host) - hostRank(b.host)) || (a.idx - b.idx) || ((a.v || 0) - (b.v || 0)));
