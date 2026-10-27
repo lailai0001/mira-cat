@@ -853,9 +853,11 @@ async function castBankLookup(watchUrl) {
 // 调 /api/play/ 并解出全部线路的 embed 路径: {paths, stage, via, postDiag}
 // 令牌盐按 data-ver 选; 站方回 status:false (post-bad) 时换下一盐重试。
 async function fetchEmbedPaths(postId, mpu, ver, referer) {
-  // 铸造库优先: 命中直接用库内路径集, 不打铸造 POST 竞速。
-  const bank = await castBankLookup(referer);
-  if (bank.hit) return { paths: bank.paths, stage: 'ok', via: 'cast-bank', postDiag: '', bank: 'hit' };
+  // 2026-10-27 详情巨慢+播不了修复: 库直出已由 resolveLines
+  // 先做 (命中且有线直接返回); 走到这里说明库未命中或库内
+  // 路径已死 (embed 全灭), 必须现铸拿新路径 —— 原先这里又
+  // 查一次库、命中即原样返回同一批死路径, POST 永不执行,
+  // 还白跑第二遍 embed 全波次, 是详情巨慢的主因之一。
   let lastDiag = '';
   let lastStage = 'post-none';
   for (const salt of tokenSalts(ver)) {
@@ -1159,7 +1161,8 @@ async function resolveLines(durl) {
   if (!html) return { html: '', res, lines: [], stage: 'page', via: '', pageDiag: pageDiagOf(res.outcomes) };
   const { postId, mpu, ver } = extractPlaySeed(html);
   if (!postId || !mpu) return { html, res, lines: [], stage: 'seed', via: '' };
-  const { paths, stage, via, postDiag, bank } = await fetchEmbedPaths(postId, mpu, ver, durl);
+  const { paths, stage, via, postDiag, bank: postBank } = await fetchEmbedPaths(postId, mpu, ver, durl);
+  const bank = bank0.hit ? 'hit' : postBank;
   if (!paths.length) return { html, res, lines: [], stage, via, postDiag, bank };
   const lines = await linesFromPaths(paths, durl);
   if (!lines.length) return { html, res, lines: [], stage: 'embed', via, postDiag, pathsN: paths.length, bank };
