@@ -2466,9 +2466,9 @@ async function httpPostForm(url, bodyStr, opts = {}) {
     const deadline = new Promise((r) => setTimeout(r, remain));
     await Promise.race([winP, all, deadline]);
   };
-  const ownPostTo = async (target) => {
+  const ownPostTo = async (target, to) => {
     const w = OWN_FETCH + '/post?u=' + encodeURIComponent(target) + '&ref=' + encodeURIComponent(referer);
-    return fetchRaw2(w, { 'User-Agent': UA, 'Content-Type': 'application/x-www-form-urlencoded' }, 12000, 'POST', bodyStr);
+    return fetchRaw2(w, { 'User-Agent': UA, 'Content-Type': 'application/x-www-form-urlencoded' }, to || 12000, 'POST', bodyStr);
   };
   const ownPost = async () => ownPostTo(url);
   // 'fetch' 铸造通道: 有全局 fetch 时用它; 设备无 fetch 时退化为
@@ -2500,27 +2500,25 @@ async function httpPostForm(url, bodyStr, opts = {}) {
     'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA,
   }, 12000, 'POST', bodyStr);
   await runWave([['own', ownPost], ['fetch', fetchPost], ['req', reqPost], ['demo', demoPost], ['codetabs', codePost]]);
-  if (!winner && !outcomes.some((o) => o.sawJson)) {
-    // own 重试做足 (第九轮): own 的上游 403 是站方 CF 对 Workers
-    // 出口的时段/colo 间歇拒绝 (16:07 真机 403、16:10 同请求 200),
-    // 几分钟内常自愈, 重试的价值在时间间隔。前提是没有任何通道
-    // 拿到站方 JSON —— 拿到过 JSON=false 说明令牌本身被拒, 重试
-    // 无益, 跳过。节奏: 隔 1.2s 打第二发 (own2), 再隔 2.5s 打第
-    // 三发 (own3), 均打 www 上游 (apex 主机名实测回 405 不收
-    // POST, 轮换无用, 2026-10-22 curl 直验)。
+  if (!winner && !outcomes.some((o) => o.sawJson) && (Date.now() - t0) < 20000) {
+    // own 单次短重试 (2026-10-27 详情巨慢修复): own 的上游 403
+    // 是站方 CF 对 Workers 出口的时段/colo 间歇拒绝, 但实测自愈
+    // 在分钟级 (16:07 403、16:10 200), 秒级连打两发基本无益,
+    // 却各烧 12s 超时 —— 原 own2+own3 是详情超时的主因之一。
+    // 只留一发 8s 短重试, 20s 后不再重试; aoRaw 也只在 25s
+    // 内才打, 总 POST 封顶约 30s。均打 www 上游 (apex 主机名
+    // 实测回 405 不收 POST, 轮换无用, 2026-10-22 curl 直验)。
+    // 前提不变: 任何通道拿到过 JSON=false 说明令牌本身被拒,
+    // 重试无益, 跳过。
     const tryOwn = async (name, target) => {
       let res;
-      try { res = await ownPostTo(target); } catch (e) { res = { status: 0, body: '' }; }
+      try { res = await ownPostTo(target, 8000); } catch (e) { res = { status: 0, body: '' }; }
       judge(name, res);
     };
     await new Promise((r) => setTimeout(r, 1200));
     await tryOwn('own2', url);
-    if (!winner) {
-      await new Promise((r) => setTimeout(r, 2500));
-      await tryOwn('own3', url);
-    }
   }
-  if (!winner) await runWave([['aoRaw', aoPost]]);
+  if (!winner && (Date.now() - t0) < 25000) await runWave([['aoRaw', aoPost]]);
   if (winner) return { text: winner.text, via: winner.via, outcomes, diag: postDiagOf(outcomes) };
   // 全灭归因: 有通道拿到带 status 字段的 JSON (站方明确回 false) ->
   // post-bad; 连 JSON 都没拿到 -> post-none。
@@ -3035,12 +3033,16 @@ async function resolveLines(durl) {
   // 库直出 (2026-10-25, 同 javhdporn): 详情取页常被站方墙挡, 但库
   // 内路径只凭 watch URL 即可查 —— 先查库, 命中且 embed 解出线则
   // 直接用, 不必等详情页。未命中或 embed 全灭才走原流程。
+  // 2026-10-27 详情巨慢修复: 查库与详情取页并行 (getDetailRes
+  // 内有 5 分钟详情缓存, 并行不影响缓存语义); 库命中且有线
+  // 仍优先, 未命中时直接用已在跑的详情结果。
+  const detailP = getDetailRes(durl);
   const bank0 = await castBankLookup(durl);
   if (bank0.hit) {
     const lines0 = await linesFromPaths(bank0.paths, durl);
     if (lines0.length) return { html: '', lines: lines0, stage: 'ok', via: 'cast-bank', postDiag: '', bank: 'hit' };
   }
-  const { html, res } = await getDetailRes(durl);
+  const { html, res } = await detailP;
   if (!html) return { html: '', lines: [], stage: 'page', via: '', pageDiag: pageDiagOf(res ? res.outcomes : []) };
   const { postId, mpu } = extractPlaySeed(html);
   if (!postId || !mpu) return { html, lines: [], stage: 'seed', via: '' };
