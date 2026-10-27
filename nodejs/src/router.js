@@ -58,7 +58,6 @@ import brazz from './spider/video/brazz.js';
 import bigbuttshub from './spider/video/bigbuttshub.js';
 import mmtv from './spider/video/7mmtv.js';
 import javideo from './spider/video/javideo.js';
-import javhdporn from './spider/video/javhdporn.js';
 import bestjavporn from './spider/video/bestjavporn.js';
 import chaturbate from './spider/video/chaturbate.js';
 import asmrba from './spider/video/asmrba.js';
@@ -119,7 +118,7 @@ const spiders = [
     youzidj,
     stripchat,
     hohoj,
-    rip17, brazz, bigbuttshub, mmtv, javideo, javhdporn, bestjavporn, chaturbate, asmrba,];
+    rip17, brazz, bigbuttshub, mmtv, javideo, bestjavporn, chaturbate, asmrba,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
