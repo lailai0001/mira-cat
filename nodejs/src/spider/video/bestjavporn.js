@@ -2368,12 +2368,13 @@ async function fetchPage(url, opts = {}) {
     // 与 embed 查看者 IP 绑定, 故第一波只用直连三栈 (设备自身出口,
     // 与播放器同 IP); 直连全灭才借代理通道 —— 借线解出的令牌绑的
     // 是代理出口, 对绑定型宿主必然 403, 只能作排序末位兜底。
-    // 2026-10-27 v5 REX 对照: embed 直连只发一发 req (REX 为单发
-    // Widget.http 直连), 不再三栈并行 (chFetch 与 chReq 设备上同栈,
-    // 同毫秒重复提交疑似触发拦截); 直连不成再走 own/demo 与代理波次。
-    // 出口一致性不变: req 仍是设备自身出口, 与播放器同 IP。
+    // 2026-10-27 v7 回退: 同 javhdporn (v5 单发收窄是错的; REX
+    // embed 本就并行, 10-22 能播时直连就是三栈并行)。恢复三栈
+    // 并行; 出口一致性不变 (直连栈均为设备自身出口)。
     await runWave([
-      ['req', chReq, 10000],
+      ['fetch', chFetch, 9000],
+      ['req', chReq, 9000],
+      ['https', chHttps, 9000],
     ]);
     if (!winner && !opts.directOnly) {
       await runWave([

@@ -961,10 +961,12 @@ async function fetchEmbedPage(url, referer, directOnly) {
   const eFetch = async (u, to) => (HAS_FETCH ? fetchViaGlobal(u, hdrs, to) : reqRaw(u, hdrs, to));
   const eReq = async (u, to) => reqRaw(u, hdrs, to);
   const eDemo = async (u, to) => fetchRaw2('https://test.cors.workers.dev/?' + u, { ...WD_HEADERS }, to);
-    // 2026-10-27 v5 REX 对照: embed 直连只发一发 req (REX 为单发
-  // Widget.http 直连), 不再三栈并行 (eFetch 与 eReq 设备上同栈,
-  // 同毫秒重复提交疑似触发拦截); 直连不成再走 own/demo 与代理波次。
-  await runWave([['req', eReq, 10000]]);
+    // 2026-10-27 v7 回退: v5 把直连波次收成单发 req 是错的 —— REX
+  // 自己 embed 就是并行的 (Promise.all), 且 10-22 能播时直连就是
+  // 三栈并行; 单发 req 若不是当初取胜的那栈, 库命中标题的
+  // embed 反而取不回。恢复三栈并行 (直连不成再走 own/demo 与
+  // 代理波次); 现铸串行 (v5) 与 cookie (v6) 保留不动。
+  await runWave([['fetch', eFetch, 9000], ['req', eReq, 9000], ['https', chHttps, 9000]]);
   if (!winner && !directOnly) await runWave([['own', chOwn, 10000], ['demo', eDemo, 10000]]);
   if (!winner && !directOnly) await runWave([['jina', chJina, 10000], ['aoGet', chAoGet, 10000], ['aoRaw', chAoRaw, 10000], ['codetabs', chCodetabs, 9000]]);
   if (winner) return { html: winner.html, win: winner.oc, outcomes };
