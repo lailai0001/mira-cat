@@ -72,15 +72,14 @@ function parseArticles(html) {
     const href = found.trim();
     if (!href || href === '#' || seen.has(href)) continue;
     seen.add(href);
-    const t = blk.match(/<h2[^>]*>([^<]{2,120})<\/h2>/i)
-      || blk.match(/class="entry-title"[^>]*>([^<]{2,120})/i)
-      || blk.match(/class="post-title"[^>]*>([^<]{2,120})/i);
-    let title = t ? t[1].trim() : '';
+    const strip = (s) => String(s || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    const hm = blk.match(/<h2[^>]*>([\s\S]{0,300}?)<\/h2>/i);
+    let title = hm ? strip(hm[1]) : '';
     if (!title) {
       const at = blk.match(/<a[^>]*>([\s\S]{0,300}?)<\/a>/i);
-      if (at) title = at[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+      if (at) title = strip(at[1]);
     }
-    if (!title) continue;
+    if (!title || title.length < 2) continue;
     const tm = blk.match(/<time[^>]*>([^<]{2,40})<\/time>/i);
     items.push({
       vod_id: href,
@@ -88,7 +87,22 @@ function parseArticles(html) {
       vod_pic: proxyCover(imgOf(blk)),
       vod_remarks: tm ? tm[1].trim() : '',
     });
-    if (items.length >= 30) break;
+    if (items.length >= 60) break;
+  }
+  // 兜底：article 块未产出时，直接扫 /archives/ 链接 + 就近 h2 标题
+  if (!items.length) {
+    const are = /<a[^>]*href="([^"]*\/archives\/[^"]+)"[^>]*>/gi;
+    while ((m = are.exec(html)) !== null) {
+      const href = m[1].trim();
+      if (!href || href === '#' || seen.has(href)) continue;
+      const rest = html.slice(m.index, m.index + 3000);
+      const hm2 = rest.match(/<h2[^>]*>([\s\S]{0,300}?)<\/h2>/i);
+      const title = hm2 ? hm2[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : '';
+      if (!title || title.length < 2) continue;
+      seen.add(href);
+      items.push({ vod_id: href, vod_name: title, vod_pic: '', vod_remarks: '' });
+      if (items.length >= 60) break;
+    }
   }
   return items;
 }
@@ -97,11 +111,12 @@ function parseCategories(html) {
   const items = [];
   const seen = new Set();
   // 取所有 /category/ 链接：导航分类可能是裸 <a>，也可能被 <li> 包裹，两种都认
-  const re = /<a[^>]*href="(?:https?:\/\/[^"\/]+)?(\/category\/[^"]+)"[^>]*>([^<]{2,20})<\/a>/gi;
+  const strip = (s) => String(s || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+  const re = /<a[^>]*href="(?:https?:\/\/[^"\/]+)?(\/category\/[^"]+)"[^>]*>([\s\S]{0,80}?)<\/a>/gi;
   let m;
   while ((m = re.exec(html)) !== null) {
-    const href = m[1].trim(), name = m[2].trim();
-    if (!href || href === '#' || !name || seen.has(href)) continue;
+    const href = m[1].trim(), name = strip(m[2]);
+    if (!href || href === '#' || !name || name.length < 2 || name.length > 20 || seen.has(href)) continue;
     seen.add(href);
     items.push({ type_id: href, type_name: name });
   }

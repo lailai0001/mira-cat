@@ -4,7 +4,8 @@
 // 分类：导航栏 /category/{slug}/ 链接（裸 <a>，不用 <li> 包裹也能抓）。
 // 列表：<article> 块（链接 + h2 标题）；封面多路提取（z-image-loader-url、
 // img data-src/src、CSS background-image、块内首个图片地址），因卡片封面
-// 可能不是普通 <img> 标签。详情：/archives/{id}.html，视频在内联 JS 播放器
+// 可能不是普通 <img> 标签。2026-10-28 三轮：真机列表正常、仅封面空白，列表页抓取无图片标记；
+// 封面在 imgOf 已有通用图片地址兜底外再加 data-cover 类属性。详情：/archives/{id}.html，视频在内联 JS 播放器
 // 配置里（DPlayer 风格 data-config 或直链），多路提取；配置具体形式待真机验收。
 import req from '../../util/req.js';
 
@@ -74,6 +75,8 @@ function imgOf(block) {
   if (m) return m[1];
   m = clean.match(/url\(\s*['"]?(https?:[^'")]+)['"]?\s*\)/i);
   if (m) return m[1];
+  m = clean.match(/data-(?:cover|image|thumb|poster)\s*=\s*"([^"]+)"/i);
+  if (m && /^https?:\/\//i.test(m[1])) return m[1];
   m = clean.match(/https?:\/\/[^"'\s)]+\.(?:jpg|png|jpeg|webp)/i);
   if (m) return m[0];
   return '';

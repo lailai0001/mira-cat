@@ -20,6 +20,8 @@
 // pic.gyezbp.cn 明文 .jpeg 可正常出图）。列表与详情均加该提取，旧写法保留作后备。
 // 2026-10-28 二轮：用户真机截图示列表标题日期正常、仅封面空白，列表解析无问题；
 // 封面再加 srcset、CSS 背景图（background-image / data-background）、noscript 三路提取。
+// 2026-10-28 三轮：真机列表标题日期正常、仅封面空白，且抓取到的列表页无任何图片标记；
+// 封面再加 data-cover 类属性与块内首个图片地址通用兜底。
 import req from '../../util/req.js';
 
 const KEY = 'py_51chigua';
@@ -217,6 +219,16 @@ function parseList(html) {
     if (!pic) {
       const ns = b.match(/<noscript>[\s\S]{0,500}?<img[^>]+src="([^"]+)"/i);
       if (ns) pic = absUrl(ns[1]);
+    }
+    if (!pic) {
+      // data-cover / data-image / data-thumb 类属性
+      const dc = b.match(/data-(?:cover|image|thumb|poster)\s*=\s*"([^"]+)"/i);
+      if (dc && /^https?:\/\//i.test(dc[1])) pic = absUrl(dc[1]);
+    }
+    if (!pic) {
+      // 通用兜底：卡片块内出现的第一个图片地址（JSON、属性等各种形式）
+      const gi = b.match(/https?:\/\/[^"'\s)]+\.(?:jpg|jpeg|png|webp)/i);
+      if (gi) pic = absUrl(gi[0]);
     }
 
     // 时间
