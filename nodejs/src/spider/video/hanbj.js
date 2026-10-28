@@ -1,5 +1,7 @@
 // 韩国BJ - CatPawOpen JS Spider
-// Ported from KoreanBJ.py (HOST=https://ww1.koreanbj.club)
+// Ported from KoreanBJ.py (HOST=https://kbjclub.club; 2026-10-29 由 ww1.koreanbj.club 切换：
+// 实测两域为同一 WordPress 站的多域名映射——同帖同播放器 id/token、kbjclub 首页
+// canonical 仍指 ww1、主题含 multiple-domain 类；用户浏览器在 kbjclub 侧全通，故切换)
 // 列表: loop-video /video/slug/
 // 播放: VOE 系 embed → 六层混淆解包 → m3u8/mp4 直出
 // 请求: 双通道 — 先框架 req(axios, MiraPlayer 内核可用)，失败再试 Node 原生 fetch
@@ -18,7 +20,7 @@ import req from '../../util/req.js';
 
 const KEY = 'py_hanbj';
 const NAME = '韩国BJ';
-const HOST = 'https://ww1.koreanbj.club';
+const HOST = 'https://kbjclub.club';
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -177,7 +179,7 @@ function extractEmbedUrls(html, pageUrl) {
   const add = (u) => {
     u = absUrl(u, pageUrl);
     if (!u || seen.has(u) || !u.startsWith('http')) return;
-    if (/koreanbj\.club/i.test(u) && /\/video\//i.test(u) && !/\/e\//i.test(u)) return;
+    if (/(koreanbj\.club|kbjclub\.club)/i.test(u) && /\/video\//i.test(u) && !/\/e\//i.test(u)) return;
     if (/googletag|\/ads\/|placeholder|\/trailers\/|test-videos/i.test(u)) return;
     if (/\.webm$/i.test(u)) return;
     seen.add(u);
