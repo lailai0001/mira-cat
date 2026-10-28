@@ -356,6 +356,24 @@ async function detail(reqIn) {
   }
 }
 
+// 2026-10-29：HLS 中转。站方自带播放器在用户手机浏览器里也报“资源加载失败”，
+// 91 还明说“留言您所在地区”——即放视频的 CDN（yd-hls / tp*.drleao.cn）对用户所在地区
+// 不给资源，蜘蛛字段再对也播不了。播放时先向用户自建的 html-relay Worker 要一份
+// 中转版 m3u8（Worker 在 CF 边缘抓流、字节原样转发、不解密），中转可用就走中转，
+// 中转未部署或同样不可用时回落直连，行为不比原来差。
+const RELAY = 'https://html-relay.li768435813.workers.dev/';
+async function relayM3u8(m3u8Url) {
+  if (!/\.m3u8/i.test(m3u8Url)) return '';
+  try {
+    const relayUrl = RELAY + 'hls?url=' + encodeURIComponent(m3u8Url);
+    const res = await req.get(relayUrl, { headers: { 'User-Agent': UA }, timeout: 15000 });
+    const d = res && res.data;
+    const text = typeof d === 'string' ? d : (d == null ? '' : String(d));
+    if (text.includes('#EXTM3U')) return relayUrl;
+  } catch (e) {}
+  return '';
+}
+
 async function play(reqIn) {
   // play id = 分集页 URL 本身 (详情 vod_play_url 里 $ 后即是)。旧版在 id 里塞 $$$集号 再拆,
   // 会被 App 按 $$$ 分隔线路时拆坏, 是不能播放的主因之一 —— 新版 id 不含任何分隔符。
@@ -377,7 +395,8 @@ async function play(reqIn) {
     url = String(url || '').replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&').trim();
     if (!/^https?:\/\//i.test(url)) return { parse: 0, url: '', header: {} };
     // 2026-10-29 加固：Referer 改为分集页 URL 本身（原 HOST 根路径在个别 CDN 校验下更弱）
-    return { parse: 0, url, header: { 'User-Agent': UA, 'Referer': pageUrl } };
+    const relay = await relayM3u8(url);
+    return { parse: 0, url: relay || url, header: { 'User-Agent': UA, 'Referer': pageUrl } };
   } catch (e) {
     return { parse: 0, url: '', header: {} };
   }
