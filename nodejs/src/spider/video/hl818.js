@@ -9,18 +9,24 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 // 封面为 AES-128-CBC 加密存储（key f5d965df75336270 / iv 97b60394abc2fbe1），走解密代理出图
 // 2026-10-28 四轮：cell 域每次 301 到随机 jvtshrap.cc 子域，设备端加载不出内容；
 // 改走站方自报永久地址 818hlw1.com（实测直出 30 篇、无跳转）；分类仍取所有 /category/ 链接；
-// sugfew 封面同样加密存储，bagua 代理实测可解密（返回合法 JPEG），封面仍走 bagua 代理。
+// 2026-10-29 封面根因：站方封面已全迁 pic.nihmcl.cn，原图仍为加密密文；旧代码全走 bagua 代理，
+// 但 bagua 对 nihmcl 域回 400 Invalid URL，封面全灭。已改按域路由：pic.*.cn 走 51chigua（实测出图），其余走 bagua。
 // /latest/ 与 /hot/ 已证实为站内 404 样式页，不再作 fallback；详情视频多路提取
 // （data-config、内联 JS url、全文 m3u8/mp4、og:video），因播放器配置形式未在
 // 原始 HTML 里验到。
-const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
+// 封面代理按域路由（2026-10-29 实测，见下）：两站封面已全迁 pic.nihmcl.cn；
+// bagua 代理对该域回 400 Invalid URL（png/jpeg/gif 全灭），51chigua 代理回 200 合法图片；
+// 故 pic.*.cn 域固定走 51chigua，其余域沿用 bagua——两代理各擅长域不同，写死单一代理迟早再坏。
+const IMG_PROXY_51 = 'https://51chigua.li768435813.workers.dev/img?url=';
+const IMG_PROXY_BAGUA = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
 
 function proxyCover(url) {
   url = String(url || '').trim();
   if (!url) return '';
   if (url.indexOf('data:') === 0) return url;
-  if (url.indexOf('bagua-img-proxy') >= 0) return url;
-  return IMG_PROXY + encodeURIComponent(url);
+  if (url.indexOf('51chigua.li768435813.workers.dev') >= 0 || url.indexOf('bagua-img-proxy') >= 0) return url;
+  if (/^https?:\/\/pic\.[^\/]*\.cn\//i.test(url)) return IMG_PROXY_51 + encodeURIComponent(url);
+  return IMG_PROXY_BAGUA + encodeURIComponent(url);
 }
 
 function H() {
@@ -101,7 +107,7 @@ function parseArticles(html) {
       const title = hm2 ? hm2[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : '';
       if (!title || title.length < 2) continue;
       seen.add(href);
-      items.push({ vod_id: href, vod_name: title, vod_pic: '', vod_remarks: '' });
+      items.push({ vod_id: href, vod_name: title, vod_pic: proxyCover(imgOf(rest)), vod_remarks: '' });
       if (items.length >= 60) break;
     }
   }
