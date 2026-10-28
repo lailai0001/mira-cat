@@ -72,6 +72,7 @@ import camhub from './spider/video/camhub.js';
 import ultra from './spider/video/ultra.js';
 import asian from './spider/video/asian.js';
 import iwank from './spider/video/iwank.js';
+import pikped from './spider/video/pikped.js';
 
 const spiders = [
     missav_xptv,
@@ -129,7 +130,7 @@ const spiders = [
     youzidj,
     stripchat,
     hohoj,
-    rip17, brazz, bigbuttshub, mmtv, javideo, bestjavporn, chaturbate, asmrba, hlbdy, shipin51, erome, javneon, dycg66, cg91, noodle, camhub, ultra, asian, iwank,];
+    rip17, brazz, bigbuttshub, mmtv, javideo, bestjavporn, chaturbate, asmrba, hlbdy, shipin51, erome, javneon, dycg66, cg91, noodle, camhub, ultra, asian, iwank, pikped,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
