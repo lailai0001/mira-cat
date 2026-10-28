@@ -1,13 +1,14 @@
-// javneon 镜像抓取脚本 —— 由 GitHub Actions 定时运行（见 .github/workflows/javneon-mirror.yml）。
+// javneon 镜像抓取脚本 —— 由助理侧定时任务运行（本机 curl 能过站方验证）。
 //
 // 为什么需要镜像：javneon.tv 的 Cloudflare 机器人验证只放行真浏览器与部分 IP，
 // MiraPlayer App 的请求、Cloudflare Worker 中转、Jina、AllOrigins、翻译代理
 // 全部被挑战页拦下；站方自己的 wp-json / feed 也因插件故障 500，
 // 只有 curl 这类常规客户端能正常抓到内容。于是改走“铸造库”同款思路：
-// 由 Actions（跑在 GitHub runner 上，用 curl 抓取）定时把列表与详情按钮
-// 预抓成静态 JSON 提交回仓库，App 端蜘蛛直接从 ghfast/raw 读镜像，
-// 不再实时碰 javneon.tv。播放链本身（lk1 / vidhide）不在 javneon.tv 上，
-// 仍由 App 端实时走（直连优先、中转兜底），不受镜像影响。
+// 定时把列表与详情按钮预抓成静态 JSON 提交回仓库，App 端蜘蛛直接从
+// ghfast/raw 读镜像，不再实时碰 javneon.tv。播放链本身（lk1 / vidhide）
+// 不在 javneon.tv 上，仍由 App 端实时走（直连优先、中转兜底），不受镜像影响。
+// 注意：GitHub Actions runner 也被同一挑战页拦（实测 403 Just a moment），
+// 故不要再把本脚本挂到 Actions 定时任务上；刷新走助理侧定时任务。
 //
 // 输出：mirror/javneon/<slug>.json（每分类含第 1、2 页去重后的条目，
 // 每条含详情页按钮的 data-link 十六进制串，供蜘蛛直接跑播放链）
@@ -89,7 +90,9 @@ function parseDetail(html, fallbackTitle, fallbackPic) {
   const hm = html.match(/<h2[^>]*>([\s\S]{0,400}?)<\/h2>/i);
   const pm = html.match(/player-wrap[^>]*style="[^"]*background-image:\s*url\((https?:[^)]+)\)/i)
     || html.match(/player-wrap[^>]*style='[^']*background-image:\s*url\((https?:[^)]+)\)/i);
-  const btns = [...html.matchAll(/class="btn-server"[^>]*data-link="([0-9a-f]+)"/gi)].map(x => x[1]);
+  // 注意：首个按钮是 class="btn-server active"，旧正则 class="btn-server" 后紧跟引号
+  // 会漏掉它（SSIS-105 实测：旧正则只抓到 4 个，漏了 EVS）。必须允许 active 后缀。
+  const btns = [...html.matchAll(/class="btn-server[^"]*"[^>]*data-link="([0-9a-f]+)"/gi)].map(x => x[1]);
   return {
     title: hm ? stripTags(hm[1]) : fallbackTitle,
     pic: pm ? pm[1] : fallbackPic,

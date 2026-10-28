@@ -92,16 +92,54 @@ function pageForm(tid, page, token) {
   if (token) parts.push('csrfmiddlewaretoken=' + encodeURIComponent(token));
   return parts.join('&');
 }
-async function postPage(url, form, referer) {
+// 2026-10-29 翻页根因补记：站方是 Django，POST 翻页必须带 GET 时种下的
+// csrftoken cookie，否则 nginx 直接 403（本机实测：无 cookie 403、有 cookie 200
+// 且三类分类——range=week、now、popular/trending——全部返回第 2 页新内容）。
+// 旧代码 POST 不带任何 cookie，故永远 403、永远空——这就是“无法加载更多”的真因，
+// 与 pagecount 无关。token 与 cookie 必须取自同一次 GET；中转路径下 Worker 会把
+// 源站 Set-Cookie 透传回 x-set-cookie（见 html-relay-worker.js 职能三），
+// 蜘蛛读 x-set-cookie 与 set-cookie 两路，再以 Cookie / X-Cookie 双头带回。
+function parseSetCookie(headers) {
+  if (!headers) return '';
+  const raw = headers['set-cookie'] || headers['Set-Cookie'] || headers['x-set-cookie'] || headers['X-Set-Cookie'];
+  const arr = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+  const pairs = [];
+  for (const c of arr) {
+    for (const part of String(c).split(';;')) {
+      const nv = part.split(';')[0].trim();
+      if (nv && nv.includes('=')) pairs.push(nv);
+    }
+  }
+  return [...new Set(pairs)].join('; ');
+}
+async function getWithCookies(url, referer) {
   try {
-    const res = await req.post(url, form, { headers: { ...H(referer), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, timeout: 20000, maxRedirects: 10 });
+    const res = await req.get(url, { headers: H(referer), timeout: 20000, maxRedirects: 10 });
+    const data = (res && res.data !== undefined) ? res.data : res;
+    return { html: String(data || ''), cookie: parseSetCookie(res && res.headers) };
+  } catch { return { html: '', cookie: '' }; }
+}
+async function relayGetFull(url, referer) {
+  try {
+    const res = await req.get(RELAY + '?url=' + encodeURIComponent(url), { headers: H(referer), timeout: 20000, maxRedirects: 10 });
+    const data = (res && res.data !== undefined) ? res.data : res;
+    return { html: String(data || ''), cookie: parseSetCookie(res && res.headers) };
+  } catch { return { html: '', cookie: '' }; }
+}
+async function postWithCookie(url, form, cookie, referer) {
+  try {
+    const headers = { ...H(referer), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
+    if (cookie) headers['Cookie'] = cookie;
+    const res = await req.post(url, form, { headers, timeout: 20000, maxRedirects: 10 });
     const data = (res && res.data !== undefined) ? res.data : res;
     return String(data || '');
   } catch { return ''; }
 }
-async function postViaRelay(url, form, referer) {
+async function relayPostFull(url, form, cookie, referer) {
   try {
-    const res = await req.post(RELAY + '?url=' + encodeURIComponent(url), form, { headers: { ...H(referer), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, timeout: 20000, maxRedirects: 10 });
+    const headers = { ...H(referer), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
+    if (cookie) { headers['Cookie'] = cookie; headers['X-Cookie'] = cookie; }
+    const res = await req.post(RELAY + '?url=' + encodeURIComponent(url), form, { headers, timeout: 20000, maxRedirects: 10 });
     const data = (res && res.data !== undefined) ? res.data : res;
     return String(data || '');
   } catch { return ''; }
@@ -129,20 +167,26 @@ async function category(reqIn) {
   const url = HOST + tid;
   if (page <= 1) {
     const { list } = await listSmart(url, HOST);
-    return { page: 1, pagecount: 9999, limit: 90, total: list.length, list };
+    // total 必须给一个“远大于已加载”的数：旧代码 total=list.length（24）会让
+    // App 认为已加载全部、不再请求第 2 页；limit 改为真实页大小 24。
+    return { page: 1, pagecount: 9999, limit: 24, total: list.length ? 999999 : 0, list };
   }
-  // 第 2 页起：先 GET 一次拿 csrf token，再 POST 翻页；直连 POST 解析为空时走中转 POST
-  let baseHtml = await getText(url, HOST);
-  if (!parseList(baseHtml).length) baseHtml = await fetchViaRelay(url, HOST);
-  const token = parseCsrf(baseHtml);
+  // 第 2 页起：先 GET 一次同取 csrf token 与 cookie，再带 cookie POST 翻页；
+  // 直连 POST 解析为空时走中转 POST（同样带 cookie）
+  let base = await getWithCookies(url, HOST);
+  if (!parseList(base.html).length) {
+    const rb = await relayGetFull(url, HOST);
+    if (parseList(rb.html).length) base = rb;
+  }
+  const token = parseCsrf(base.html);
   const form = pageForm(tid, page, token);
-  let html = await postPage(url, form, HOST);
+  let html = await postWithCookie(url, form, base.cookie, HOST);
   let list = parseList(html);
   if (!list.length) {
-    const rh = await postViaRelay(url, form, HOST);
+    const rh = await relayPostFull(url, form, base.cookie, HOST);
     list = parseList(rh);
   }
-  return { page, pagecount: 9999, limit: 90, total: list.length, list };
+  return { page, pagecount: 9999, limit: 24, total: list.length ? 999999 : 0, list };
 }
 // 详情播放地址提取：window.playlist 四档优先，空时回退 videofile 单线
 function detailPlayUrl(html, raw) {

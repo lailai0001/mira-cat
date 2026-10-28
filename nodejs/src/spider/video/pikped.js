@@ -27,6 +27,12 @@
 // 故本版分类只给已验证的 4 个 primaryTag（girls/couples/men/trans）；搜索接口同样未证实，
 // search 暂返回空。18+ 确认与 406 问题随接口路线自然消失（接口不需年龄确认 cookie，
 // 但发 API 请求务必带 Accept: application/json）。
+// v3.3（2026-10-29）：匿名 HLS 已彻底证伪——edge-hls 三个 host（.media/.live/.com）
+// 的 master 与媒体清单，不带或带房间页 cookie，最终都 302 到 CPA 广告流
+// （#EXT-X-MOUFLON-ADVERT，4 秒×5，约 20 秒），房间页 HTML 里也不嵌真流地址，
+// 真流只在浏览器跑起房间 JS、建好会话后才给。故 App 内唯一能拿到真流的路仍是
+// 房间页嗅探（WebView 跑 JS 建会话），本版做两件事抬高嗅探成功率：① 详情先按 id
+// 验直播状态，过滤刚下播的主播；② play 头给全套桌面浏览器头（缺头房间页 406）。
 import req from '../../util/req.js';
 
 const KEY = 'py_pikped';
@@ -121,13 +127,28 @@ async function detail(reqIn) {
         if (hit && hit.username) { username = hit.username; break; }
       }
     }
+    // v3.3：详情先验直播状态——直播站主播上下播极快，点到刚下播的主播是
+    // “无法播放”的常见原因之一。按 id 查公开接口 /api/front/models/{id}
+    // （实测 200，含 status/isLive/isOnline，无流地址）；查不到时不拦路，
+    // 照常出房间线；查到已下播则标题明说已下播，不给一条点开必死的线。
+    let live = true;
+    if (id) {
+      const bj = await getJson(HOST + 'api/front/models/' + encodeURIComponent(id));
+      if (bj && (('status' in bj) || ('isLive' in bj) || ('isOnline' in bj))) {
+        const st = String(bj.status || '').toLowerCase();
+        live = (st === 'public' || st === 'groupshow' || bj.isLive === true || bj.isOnline === true)
+          && st !== 'offline' && bj.isLive !== false && bj.isOnline !== false;
+      }
+    }
     // 房间页 + 嗅探才是正片；实在找不到用户名时才回落旧接口流（会是广告，仅作兜底）
-    const playUrl = username
-      ? ('直播$' + HOST + username)
-      : (legacyMaster ? ('直播$' + legacyMaster) : ('未找到直播源$' + HOST));
+    const playUrl = !live && username
+      ? ('主播已下播$' + HOST + username)
+      : (username
+        ? ('直播$' + HOST + username)
+        : (legacyMaster ? ('直播$' + legacyMaster) : ('未找到直播源$' + HOST)));
     list.push({
       vod_id: raw,
-      vod_name: username || 'PikPedCams',
+      vod_name: username ? (live ? username : (username + '（已下播）')) : 'PikPedCams',
       vod_pic: '',
       vod_play_from: 'PikPedCams',
       vod_play_url: playUrl,
@@ -139,7 +160,24 @@ async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
   if (id.includes('$')) id = id.split('$').pop().trim();
   const isVideo = /\.(m3u8|mp4)/i.test(id);
-  return { parse: isVideo ? 0 : 1, url: id, header: { 'User-Agent': UA, 'Referer': HOST } };
+  // v3.3：房间页实测——缺浏览器头回 406（0 字节）、带全套桌面浏览器头回 200。
+  // App 内 WebView 嗅探能不能拿到流，首先取决于房间页能不能加载出来，
+  // 故 play 头给全套浏览器头（桌面 UA + Accept + Sec-Fetch + 升级请求），
+  // 而不是只给 UA + Referer。
+  return {
+    parse: isVideo ? 0 : 1,
+    url: id,
+    header: {
+      'User-Agent': UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Referer': HOST,
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Dest': 'document',
+      'Upgrade-Insecure-Requests': '1',
+    },
+  };
 }
 async function search(reqIn) {
   // 搜索接口未证实，暂返回空，不猜 URL

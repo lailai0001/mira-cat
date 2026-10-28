@@ -18,6 +18,14 @@
 //   links.hls3 为 master.txt 兜底。蜘蛛在 JS 内实现解包器，不依赖外部库。
 // - 注意：本机直取 master.m3u8 曾回 403（机房 IP / CDN 校验可能），
 //   设备端（用户开 VPN）实测才是最终 verdict，推包前不得宣称已播通。
+// - 2026-10-29 镜像优先（v4）：javneon.tv 的 Cloudflare 挑战页拦 App、Worker、
+//   Jina、AllOrigins、翻译代理，也拦 GitHub Actions runner（实测 403 Just a moment），
+//   只有真浏览器与本机 curl 能过。故列表/详情/搜索优先读仓库里的静态镜像
+//   （mirror/javneon/<slug>.json，每分类第 1、2 页、每条含详情按钮串，
+//   由助理侧定时任务用本机 curl 刷新；不要再挂 Actions 定时）。
+//   镜像缺失或查不到时才回落直连→中转实时抓。播放链（lk1/vidhide）不在
+//   javneon.tv 上，仍实时走，不受镜像影响。镜像里的 vod_id 统一用站内 path
+//   （/video/<slug>/），详情时按 path 查镜像，不再先抓详情页。
 import req from '../../util/req.js';
 
 const KEY = 'py_javneon';
@@ -53,6 +61,43 @@ async function fetchViaRelay(url, referer) {
     const finalUrl = (res && res.headers && (res.headers['x-final-url'] || res.headers['X-Final-Url'])) || url;
     return { html: String(data || ''), finalUrl };
   } catch { return { html: '', finalUrl: url }; }
+}
+
+// ---- 镜像读取（ghfast 优先，raw 兜底；任一拿到含 items 的 JSON 即算成功）----
+const MIRROR_BASES = [
+  'https://ghfast.top/https://raw.githubusercontent.com/lailai0001/mira-cat/refs/heads/main/mirror/javneon/',
+  'https://raw.githubusercontent.com/lailai0001/mira-cat/refs/heads/main/mirror/javneon/',
+];
+const MIRROR_CATS = ['censored-jav', 'uncensored-jav', 'amateur', 'chinese-subtitles', 'reducing-mosaic', 'english-subtitles', 'popular'];
+async function fetchMirrorJson(slug) {
+  for (const base of MIRROR_BASES) {
+    try {
+      const res = await req.get(base + slug + '.json', { headers: { 'User-Agent': UA, 'Accept': 'application/json,*/*' }, timeout: 20000, maxRedirects: 10 });
+      const data = (res && res.data !== undefined) ? res.data : res;
+      const j = (typeof data === 'string') ? JSON.parse(data) : data;
+      if (j && Array.isArray(j.items) && j.items.length) return j;
+    } catch {}
+  }
+  return null;
+}
+async function fetchAllMirror() {
+  const out = [];
+  for (const slug of MIRROR_CATS) {
+    const j = await fetchMirrorJson(slug);
+    if (j) out.push(...j.items.map(it => ({ ...it, _cat: slug })));
+  }
+  return out;
+}
+function mirrorToVod(it) {
+  return { vod_id: it.path, vod_name: it.title || '', vod_pic: it.pic || '', vod_remarks: it.date || '' };
+}
+// vod_id（完整 URL / path / 旧收藏）统一归一化为站内 path（/video/<slug>/）
+function toMirrorPath(raw) {
+  let s = String(raw || '').trim();
+  const m = s.match(/\/video\/[^?#\s]+/i);
+  if (m) { s = m[0]; if (!s.endsWith('/')) s += '/'; return s; }
+  if (s.startsWith('/')) { if (!s.endsWith('/')) s += '/'; return s; }
+  return s;
 }
 
 // 跟随重定向并返回最终 URL（axios 在 Node 下把最终地址放在
@@ -174,9 +219,14 @@ function extractM3u8(embedHtml) {
 //    根本没有该接口，原代码会对它们各空等一次超时，App 侧表现为一直加载不出。
 // ③ 详情改出多线路：VAS 新 API 线在前、EVS 打包线在后，任一可用即可播。
 // presetHtml：详情页 HTML 已由调用方取好时直接用（中转兜底时传入中转抓到的 HTML）。
+// 注意：首个按钮是 class="btn-server active"，旧正则 class="btn-server" 后紧跟引号
+// 会漏掉它（SSIS-105 实测：旧正则只抓到 4 个，漏了 EVS）。必须允许 active 后缀。
 async function resolvePlayLines(detailUrl, presetHtml) {
   const html = presetHtml !== undefined ? presetHtml : await getText(detailUrl, HOST);
-  const btns = [...html.matchAll(/class="btn-server"[^>]*data-link="([0-9a-f]+)"/gi)].map(x => x[1]);
+  const btns = [...html.matchAll(/class="btn-server[^"]*"[^>]*data-link="([0-9a-f]+)"/gi)].map(x => x[1]);
+  return resolvePlayLinesFromButtons(btns, detailUrl);
+}
+async function resolvePlayLinesFromButtons(btns, detailUrl) {
   const lines = [];
   const seen = new Set();
   const push = (name, u) => {
@@ -247,6 +297,23 @@ async function listSmart(url, referer) {
 }
 
 async function home() {
+  const mj = await fetchMirrorJson('censored-jav');
+  if (mj) {
+    const list = mj.items.slice(0, 24).map(mirrorToVod);
+    return {
+      class: [
+        { type_id: 'censored-jav/', type_name: '有修正' },
+        { type_id: 'uncensored-jav/', type_name: '無修正' },
+        { type_id: 'amateur/', type_name: '素人' },
+        { type_id: 'chinese-subtitles/', type_name: '中文字幕' },
+        { type_id: 'reducing-mosaic/', type_name: '破解马赛克' },
+        { type_id: 'english-subtitles/', type_name: '英文字幕' },
+        { type_id: 'popular/', type_name: '人气' },
+      ],
+      filters: {},
+      list,
+    };
+  }
   const { list } = await listSmart(HOST, HOST);
   return {
     class: [
@@ -267,7 +334,15 @@ async function category(reqIn) {
   const body = reqIn?.body || {};
   const tid = String(body.id || 'censored-jav/');
   const page = Math.max(1, parseInt(body.page, 10) || 1);
-  const base = HOST + tid.replace(/^\/+/, '').replace(/\/+$/, '');
+  const slug = tid.replace(/^\/+/, '').replace(/\/+$/, '');
+  const mj = await fetchMirrorJson(slug);
+  if (mj) {
+    const all = mj.items.map(mirrorToVod);
+    const start = (page - 1) * 24;
+    const list = all.slice(start, start + 24);
+    return { page, pagecount: Math.max(1, Math.ceil(all.length / 24)), limit: 24, total: all.length, list };
+  }
+  const base = HOST + slug;
   const url = page === 1 ? (base + '/') : (base + '/page/' + page + '/');
   const { list } = await listSmart(url, HOST);
   return {
@@ -282,11 +357,26 @@ async function detail(reqIn) {
   const list = [];
   for (const raw of ids.filter(Boolean)) {
     const url = /^https?:\/\//i.test(raw) ? raw : HOST + String(raw).replace(/^\/+/, '');
+    // 镜像优先：按 path 查镜像，命中则直接用镜像里的按钮跑播放链，不碰详情页
+    const path = toMirrorPath(raw);
+    const allMirror = await fetchAllMirror();
+    const hit = allMirror.find(it => toMirrorPath(it.path) === path);
+    if (hit && Array.isArray(hit.buttons) && hit.buttons.length) {
+      const lines = await resolvePlayLinesFromButtons(hit.buttons, HOST.replace(/\/$/, '') + path);
+      list.push({
+        vod_id: raw,
+        vod_name: hit.title || 'JavNeon',
+        vod_pic: hit.pic || '',
+        vod_play_from: 'JavNeon',
+        vod_play_url: lines.length ? lines.map(x => x.name + '$' + x.url).join('#') : ('未找到视频源$' + url),
+      });
+      continue;
+    }
     let html = await getText(url, HOST);
-    let btnCount = (html.match(/class="btn-server"[^>]*data-link="/gi) || []).length;
+    let btnCount = (html.match(/class="btn-server[^"]*"[^>]*data-link="/gi) || []).length;
     if (!btnCount) {
       const rr = await fetchViaRelay(url, HOST);
-      if ((rr.html.match(/class="btn-server"[^>]*data-link="/gi) || []).length) html = rr.html;
+      if ((rr.html.match(/class="btn-server[^"]*"[^>]*data-link="/gi) || []).length) html = rr.html;
     }
     const hm = html.match(/<h2[^>]*>([\s\S]{0,400}?)<\/h2>/i);
     // 封面在 player-wrap 的 background-image 里（页内其它 background-image 多为语言旗标，勿取首个）
@@ -320,6 +410,26 @@ async function search(reqIn) {
   const wd = String(body.wd || '').trim();
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!wd) return { page, pagecount: page, limit: 90, total: 0, list: [] };
+  // 镜像内搜索：标题或 path 含关键词（番号/片名片段都可），去重后分页
+  const allMirror = await fetchAllMirror();
+  if (allMirror.length) {
+    const kw = wd.toLowerCase();
+    const seen = new Set();
+    const matched = [];
+    for (const it of allMirror) {
+      const key = toMirrorPath(it.path);
+      if (seen.has(key)) continue;
+      if ((String(it.title || '').toLowerCase().includes(kw)) || key.toLowerCase().includes(kw)) {
+        seen.add(key);
+        matched.push(mirrorToVod(it));
+      }
+    }
+    if (matched.length) {
+      const start = (page - 1) * 90;
+      return { page, pagecount: Math.max(1, Math.ceil(matched.length / 90)), limit: 90, total: matched.length, list: matched.slice(start, start + 90) };
+    }
+    // 镜像里一个都没搜到：可能是新片未入库，仍回落实时搜索，不直接报空
+  }
   let url = HOST + '?s=' + encodeURIComponent(wd);
   if (page > 1) url += '&paged=' + page;
   const { list } = await listSmart(url, HOST);
