@@ -15,6 +15,14 @@
 //   故 v3 的 detail() 永远拿不到流 —— 根因在此。
 //   改为列表时就把主列表地址编进 vod_id（id|主列表地址），detail 直接拆出来用；
 //   兜底：若 vod_id 里没有地址（如旧收藏），重拉 4 个 tag 的列表按 id 找回 hlsPlaylist。
+// v3.2（2026-10-29 修复“全是 20 秒广告”）：上面那条接口流根本不是正片——
+//   实测：任一直播中的主播，其接口 hlsPlaylist 指向的媒体流跟随跳转后都是
+//   /cpa/v2/stream.m3u8（CPA 广告），4 秒×5 + 0.6 秒、共约 20.6 秒、带 ENDLIST，
+//   换 Referer、换 Cookie 照样跳广告；也就是说未登录的接口流只能拿到广告，正片
+//   在房间页播放器里（带站方会话）。所以 detail 不再出接口流，改出房间页地址、
+//   由播放器 parse:1 嗅探房间页拿到真正的直播流（站方播放器自适应清晰度，
+//   接口档位地址同样会跳广告，列出来就是假的，故不做分辨率分档）。
+//   vod_id 改为 id|用户名（详情拼房间页用；'|' 直通 App 已有 91duanju 的先例）。
 // 未证实、不要猜：侧边标签筛选（/girls/chinese 等）在接口里的参数名与取值未定位，
 // 故本版分类只给已验证的 4 个 primaryTag（girls/couples/men/trans）；搜索接口同样未证实，
 // search 暂返回空。18+ 确认与 406 问题随接口路线自然消失（接口不需年龄确认 cookie，
@@ -60,9 +68,8 @@ function parseModels(j) {
     seen.add(id);
     const viewers = m.viewersCount != null ? (m.viewersCount + '人') : '';
     const remarks = [status, viewers].filter(Boolean).join(' · ');
-    // 主列表地址直接编进 vod_id（detail 拆出来即用，不再走会 403 的 streamSpecifics）
-    const master = toMaster(m.hlsPlaylist || '');
-    items.push({ vod_id: master ? (id + '|' + master) : id, vod_name: username, vod_pic: m.previewUrlThumbSmall || m.previewUrl || m.snapshotUrl || '', vod_remarks: remarks });
+    // vod_id 编进用户名，detail 拼房间页地址走嗅探（接口流是广告，见文件头 v3.2）
+    items.push({ vod_id: id + '|' + username, vod_name: username, vod_pic: m.previewUrlThumbSmall || m.previewUrl || m.snapshotUrl || '', vod_remarks: remarks });
     if (items.length >= 90) break;
   }
   return items;
@@ -98,22 +105,32 @@ async function detail(reqIn) {
     const rawStr = String(raw).trim();
     const parts = rawStr.split('|');
     const id = parts[0];
-    let master = parts.length > 1 ? parts.slice(1).join('|') : '';
-    if (!master || !/\.m3u8/i.test(master)) {
-      // 兜底（旧收藏等 vod_id 里没带地址时）：重拉 4 个 tag 的列表按 id 找回 hlsPlaylist
+    let username = '';
+    let legacyMaster = '';
+    if (parts.length > 1) {
+      const second = parts.slice(1).join('|');
+      if (/^https?:\/\//i.test(second)) legacyMaster = second; // v3.1 旧收藏：id|主列表地址
+      else username = second; // v3.2：id|用户名
+    }
+    if (!username) {
+      // 旧收藏（只有 id，或 id|旧地址）：重拉 4 个 tag 的列表按 id 找回用户名
       for (const tag of ['girls', 'couples', 'men', 'trans']) {
         const j = await getJson(HOST + 'api/front/models?primaryTag=' + tag + '&limit=90');
         const arr = j && Array.isArray(j.models) ? j.models : [];
         const hit = arr.find(x => x && String(x.id) === id);
-        if (hit && hit.hlsPlaylist) { master = toMaster(hit.hlsPlaylist); break; }
+        if (hit && hit.username) { username = hit.username; break; }
       }
     }
+    // 房间页 + 嗅探才是正片；实在找不到用户名时才回落旧接口流（会是广告，仅作兜底）
+    const playUrl = username
+      ? ('直播$' + HOST + username)
+      : (legacyMaster ? ('直播$' + legacyMaster) : ('未找到直播源$' + HOST));
     list.push({
       vod_id: raw,
-      vod_name: 'PikPedCams',
+      vod_name: username || 'PikPedCams',
       vod_pic: '',
       vod_play_from: 'PikPedCams',
-      vod_play_url: master ? ('直播$' + master) : ('未找到直播源$' + HOST),
+      vod_play_url: playUrl,
     });
   }
   return { list };

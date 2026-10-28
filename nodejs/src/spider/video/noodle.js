@@ -73,13 +73,50 @@ function parseList(html) {
   return items;
 }
 async function init() { return {}; }
+// 2026-10-29：分类实测——range=month 与 home 返回完全相同的 24 条（站方忽略 month），
+// 故删掉“本月热门”这个重复分类；其余 6 档（day/week/recent/explore/now/热门趋势）
+// 逐个验过、各 24 条（explore 首屏 48 条）且互不重复。
+// 翻页实测——站方“加载更多”不是 GET 翻页：GET 带 ?page= 参数永远返回第 1 页，
+// 真机制是 POST 到当前页（站方自己的 popular_index.js）：body 带原查询参数 +
+// p=页码（从 0 起）+ csrfmiddlewaretoken（取自首页隐藏 input）。
+// 之前 category 固定 pagecount=1，App 根本不请求第 2 页——这就是“无法加载更多”的原因。
+function parseCsrf(html) {
+  const m = html.match(/name="csrfmiddlewaretoken"[^>]*value="([^"]+)"/i)
+    || html.match(/value="([^"]+)"[^>]*name="csrfmiddlewaretoken"/i);
+  return m ? m[1] : '';
+}
+function pageForm(tid, page, token) {
+  const q = (tid.split('?')[1] || '');
+  const parts = q.split('&').filter(s => s && !/^p=/i.test(s) && !/^csrfmiddlewaretoken=/i.test(s));
+  parts.push('p=' + (page - 1));
+  if (token) parts.push('csrfmiddlewaretoken=' + encodeURIComponent(token));
+  return parts.join('&');
+}
+async function postPage(url, form, referer) {
+  try {
+    const res = await req.post(url, form, { headers: { ...H(referer), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, timeout: 20000, maxRedirects: 10 });
+    const data = (res && res.data !== undefined) ? res.data : res;
+    return String(data || '');
+  } catch { return ''; }
+}
+async function postViaRelay(url, form, referer) {
+  try {
+    const res = await req.post(RELAY + '?url=' + encodeURIComponent(url), form, { headers: { ...H(referer), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, timeout: 20000, maxRedirects: 10 });
+    const data = (res && res.data !== undefined) ? res.data : res;
+    return String(data || '');
+  } catch { return ''; }
+}
 async function home() {
   const { list } = await listSmart(HOST + 'home', HOST);
   return {
     class: [
       { type_id: 'home', type_name: '最新' },
+      { type_id: 'home?range=day', type_name: '今日热门' },
       { type_id: 'home?range=week', type_name: '本周热门' },
-      { type_id: 'home?range=month', type_name: '本月热门' },
+      { type_id: 'home?range=recent', type_name: '新收录' },
+      { type_id: 'home?range=explore', type_name: '探索' },
+      { type_id: 'now', type_name: '实时' },
+      { type_id: 'popular/trending', type_name: '趋势榜' },
     ],
     filters: {},
     list,
@@ -88,8 +125,24 @@ async function home() {
 async function category(reqIn) {
   const body = reqIn?.body || {};
   const tid = String(body.id || 'home');
-  const { list } = await listSmart(HOST + tid, HOST);
-  return { page: 1, pagecount: 1, limit: 90, total: list.length, list };
+  const page = Math.max(1, parseInt(body.page, 10) || 1);
+  const url = HOST + tid;
+  if (page <= 1) {
+    const { list } = await listSmart(url, HOST);
+    return { page: 1, pagecount: 9999, limit: 90, total: list.length, list };
+  }
+  // 第 2 页起：先 GET 一次拿 csrf token，再 POST 翻页；直连 POST 解析为空时走中转 POST
+  let baseHtml = await getText(url, HOST);
+  if (!parseList(baseHtml).length) baseHtml = await fetchViaRelay(url, HOST);
+  const token = parseCsrf(baseHtml);
+  const form = pageForm(tid, page, token);
+  let html = await postPage(url, form, HOST);
+  let list = parseList(html);
+  if (!list.length) {
+    const rh = await postViaRelay(url, form, HOST);
+    list = parseList(rh);
+  }
+  return { page, pagecount: 9999, limit: 90, total: list.length, list };
 }
 // 详情播放地址提取：window.playlist 四档优先，空时回退 videofile 单线
 function detailPlayUrl(html, raw) {
