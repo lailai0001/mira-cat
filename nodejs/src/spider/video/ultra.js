@@ -70,13 +70,38 @@ function makeSpider({ KEY, NAME, HOST, VIDEOPATH, CATEGORIES }) {
       const tm = html.match(/<title>([\s\S]{0,300}?)<\/title>/i);
       const vm = html.match(/video_url['"]?\s*[:=]\s*['"]([^'"]+)/i) || html.match(/https?:\/\/[^\s"'<>]+\/get_file\/[^\s"'<>]+\.mp4[^\s"'<>]*/i);
       const pm = html.match(/preview_url['"]?\s*[:=]\s*['"]([^'"]+)/i);
-      const videoUrl = vm ? vm[1] : '';
+      const videoUrl = vm ? vm[1].replace(/&amp;/g, '&') : '';
+      // 2026-10-29：原只取标注 480p 的 video_url，故观感低。实测另有 video_alt_url
+      // （标注 720p、真实文件更大）；video_alt_url2 实测恒为 ?login 登录页，绝不采用；
+      // 也不按文件名拼 _1080p（已证 404）。无 alt 的视频保持单条。
+      const am = html.match(/video_alt_url['"]?\s*[:=]\s*['"]([^'"]+)/i);
+      let altUrl = am ? am[1].replace(/&amp;/g, '&') : '';
+      if (!altUrl || !/get_file/i.test(altUrl) || altUrl.includes('?login')) altUrl = '';
+      const t1 = (html.match(/video_url_text['"]?\s*[:=]\s*['"]([^'"]+)/i) || [])[1] || '';
+      const t2 = (html.match(/video_alt_url_text['"]?\s*[:=]\s*['"]([^'"]+)/i) || [])[1] || '';
+      const lab = (t) => {
+        const s = String(t || '').replace(/[^0-9pP]/g, '');
+        if (/^\d+p$/i.test(s)) return s.toLowerCase();
+        return '';
+      };
+      const l1 = lab(t1) || '480p';
+      const l2 = lab(t2) || (altUrl.match(/_(\d+)p\.mp4/i) ? altUrl.match(/_(\d+)p\.mp4/i)[1] + 'p' : '720p');
+      let playUrl = '';
+      if (videoUrl && altUrl) {
+        // 高清档放前面，默认先播高清
+        const lines = [];
+        const put = (h, u) => { const n = parseInt(h, 10) || 0; lines.push({ h: n, s: h + '$' + u }); };
+        put(l2, altUrl); put(l1, videoUrl);
+        lines.sort((a, b) => b.h - a.h);
+        playUrl = lines.map(x => x.s).join('#');
+      } else if (videoUrl) playUrl = '播放$' + videoUrl;
+      else playUrl = '未找到视频源$' + raw;
       list.push({
         vod_id: raw,
         vod_name: tm ? stripTags(tm[1]) : NAME,
         vod_pic: pm ? pm[1] : '',
         vod_play_from: NAME,
-        vod_play_url: videoUrl ? ('播放$' + videoUrl) : ('未找到视频源$' + raw),
+        vod_play_url: playUrl,
       });
     }
     return { list };

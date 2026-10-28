@@ -52,6 +52,21 @@ async function getWithUrl(url, referer) {
   } catch { return { html: '', finalUrl: url }; }
 }
 
+// 2026-10-29 加固：lk1 中转是干净的 HTTP 302。App 内 req 未必暴露 responseUrl，
+// 故单独以 maxRedirects:0 请求一次，直接读 Location 头拿到嵌套页地址；
+// axios 在 maxRedirects:0 时会把 302 抛成错误，Location 在 error.response 里，两种都要接。
+async function getLk1Target(url, referer) {
+  try {
+    const res = await req.get(url, { headers: H(referer), timeout: 15000, maxRedirects: 0 });
+    const loc = res && res.headers && (res.headers.location || res.headers.Location);
+    return loc ? String(loc) : '';
+  } catch (e) {
+    const r = e && e.response;
+    const loc = r && r.headers && (r.headers.location || r.headers.Location);
+    return loc ? String(loc) : '';
+  }
+}
+
 async function postJson(url, obj, referer) {
   try {
     const res = await req.post(url, obj, {
@@ -137,34 +152,61 @@ function extractM3u8(embedHtml) {
   return any ? any[0] : '';
 }
 
-async function resolvePlay(detailUrl) {
+// 2026-10-29 重构：返回多条线路（不再首条即停），并修两个 App 侧脆弱点：
+// ① lk1 目标优先读 Location 头（不依赖 responseUrl）；
+// ② 只有嵌套地址形如 /e/{filecode} 时才 POST /api/stream——ST/VOE/LUC 等站
+//    根本没有该接口，原代码会对它们各空等一次超时，App 侧表现为一直加载不出。
+// ③ 详情改出多线路：VAS 新 API 线在前、EVS 打包线在后，任一可用即可播。
+async function resolvePlayLines(detailUrl) {
   const html = await getText(detailUrl, HOST);
   const btns = [...html.matchAll(/class="btn-server"[^>]*data-link="([0-9a-f]+)"/gi)].map(x => x[1]);
-  // 按按钮顺序逐个试，首个出 m3u8 即停（实测：首个 VAS 已通新 API 线）
+  const lines = [];
+  const seen = new Set();
+  const push = (name, u) => {
+    if (!u || seen.has(u)) return;
+    seen.add(u);
+    lines.push({ name, url: u });
+  };
   for (const hex of btns) {
     const rev = hex.split('').reverse().join('');
-    // lk1 中转：?c=反转串，req 跟随重定向到嵌套播放页
-    const { html: embedHtml, finalUrl } = await getWithUrl('https://lk1.supremejav.com/javneon.php?c=' + rev, detailUrl);
+    const lk1 = 'https://lk1.supremejav.com/javneon.php?c=' + rev;
+    // 先读 Location 头拿嵌套地址；拿不到再回落跟随重定向
+    let target = await getLk1Target(lk1, detailUrl);
+    let embedHtml = '';
+    if (target) {
+      if (!/^https?:\/\//i.test(target)) {
+        try { target = new URL(target, 'https://lk1.supremejav.com/').href; } catch {}
+      }
+      const r = await getWithUrl(target, detailUrl);
+      embedHtml = r.html;
+      target = r.finalUrl || target;
+    } else {
+      const r = await getWithUrl(lk1, detailUrl);
+      embedHtml = r.html;
+      target = r.finalUrl;
+    }
     if (!embedHtml) continue;
-    // 路线 A：旧 evsishere 打包页 → 解包取 links.hls2
+    // 路线 A：旧 evsishere 打包页 → 解包取 links.hls2（作第二线路）
     const packed = extractM3u8(embedHtml);
-    if (packed) return packed;
+    if (packed) push('EVS', packed);
     // 路线 B：新 vidhide API 页（/e/{filecode}）→ POST /api/stream 取 streaming_url
     // 实测（2026-10-28，DLDSS-568）：POST {filecode, device:"web", codecs:[]}
     // 回 {"streaming_url":"https://m1-s1001604.97bf1.com/hls/.../master.m3u8"}，
     // 该 master 本机直取 200，含 480p/720p/1080p 三档；不带 cookie 也通，
     // codecs 传 ["h264"] 反而会超时/失败，故固定传 []。
-    const fm = String(finalUrl).match(/\/e\/([A-Za-z0-9]+)/);
+    const fm = String(target).match(/\/e\/([A-Za-z0-9]+)/);
     if (fm) {
       let origin = '';
-      try { origin = new URL(finalUrl).origin; } catch {}
+      try { origin = new URL(target).origin; } catch {}
       if (origin) {
-        const j = await postJson(origin + '/api/stream', { filecode: fm[1], device: 'web', codecs: [] }, finalUrl);
-        if (j && j.streaming_url) return j.streaming_url;
+        const j = await postJson(origin + '/api/stream', { filecode: fm[1], device: 'web', codecs: [] }, target);
+        if (j && j.streaming_url) push('VAS', j.streaming_url);
       }
     }
   }
-  return '';
+  // VAS 在前、EVS 在后
+  lines.sort((a, b) => (a.name === 'VAS' ? 0 : 1) - (b.name === 'VAS' ? 0 : 1));
+  return lines;
 }
 
 async function init() { return {}; }
@@ -211,13 +253,13 @@ async function detail(reqIn) {
     // 封面在 player-wrap 的 background-image 里（页内其它 background-image 多为语言旗标，勿取首个）
     const pm = html.match(/player-wrap[^>]*style="[^"]*background-image:\s*url\((https?:[^)]+)\)/i)
       || html.match(/player-wrap[^>]*style='[^']*background-image:\s*url\((https?:[^)]+)\)/i);
-    const m3u8 = await resolvePlay(url);
+    const lines = await resolvePlayLines(url);
     list.push({
       vod_id: raw,
       vod_name: hm ? stripTags(hm[1]) : 'JavNeon',
       vod_pic: pm ? pm[1] : '',
       vod_play_from: 'JavNeon',
-      vod_play_url: m3u8 ? ('播放$' + m3u8) : ('未找到视频源$' + url),
+      vod_play_url: lines.length ? lines.map(x => x.name + '$' + x.url).join('#') : ('未找到视频源$' + url),
     });
   }
   return { list };

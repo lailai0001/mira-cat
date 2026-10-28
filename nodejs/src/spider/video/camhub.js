@@ -36,6 +36,12 @@ function makeSpider({ KEY, NAME, HOST, VIDEOPATH, CATEGORIES }) {
     while ((m = re.exec(html)) !== null) {
       const url = m[1];
       if (seen.has(url)) continue;
+      // 2026-10-29：私密视频过滤。站方私密卡片为 <div class="thumb thumb_rel item private ">，
+      // 无登录态时详情根本不给 get_file 地址，点进去只会“未找到视频源”；列表里直接跳过，
+      // 公开视频逻辑不动。判据：卡片链接前方最近一个 thumb 块内含 private。
+      const before = html.slice(Math.max(0, m.index - 1200), m.index);
+      const ti = before.lastIndexOf('thumb');
+      if (ti >= 0 && /\bprivate\b/i.test(before.slice(ti))) continue;
       const seg = html.slice(m.index, m.index + 3000);
       const im = seg.match(/data-original="(https?:[^"]+)"/i) || seg.match(/<img[^>]*src="(https?:[^"]+)"/i);
       const title = stripTags(m[2]);
@@ -71,10 +77,14 @@ function makeSpider({ KEY, NAME, HOST, VIDEOPATH, CATEGORIES }) {
       const vm = html.match(/video_url['"]?\s*[:=]\s*['"]([^'"]+)/i) || html.match(/https?:\/\/[^\s"'<>]+\/get_file\/[^\s"'<>]+\.mp4[^\s"'<>]*/i);
       const pm = html.match(/preview_url['"]?\s*[:=]\s*['"]([^'"]+)/i);
       const videoUrl = vm ? vm[1] : '';
+      // 2026-10-29：私密视频在详情页明文写着需会员登录才给地址；若命中，给出明确备注，
+      // 让用户分清“会员锁”与“解析坏了”，而不是笼统的未找到视频源。
+      const isPrivate = /This video is a private video/i.test(html);
       list.push({
         vod_id: raw,
         vod_name: tm ? stripTags(tm[1]) : NAME,
         vod_pic: pm ? pm[1] : '',
+        vod_remarks: isPrivate ? '私密视频，需站方会员登录' : '',
         vod_play_from: NAME,
         vod_play_url: videoUrl ? ('播放$' + videoUrl) : ('未找到视频源$' + raw),
       });

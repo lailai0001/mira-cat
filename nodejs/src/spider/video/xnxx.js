@@ -126,6 +126,55 @@ function parseList(html) {
   return videos;
 }
 
+// 2026-10-29：主清单只有约 500 字节，fetchOne 的 >1000 字节门槛会判空，
+// 故单拉主清单用不设门槛的小抓取。
+async function fetchSmall(url) {
+  const headers = {
+    'User-Agent': UA,
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+  try {
+    const { data, status } = await req.get(url, { headers, timeout: 20000, responseType: 'text' });
+    if (status === 200 && data) return String(data);
+  } catch { /* 换通道2 */ }
+  try {
+    if (typeof fetch === 'undefined') return '';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 25000);
+    const r = await fetch(url, { signal: ctrl.signal, headers });
+    clearTimeout(timer);
+    if (!r.ok) return '';
+    return await r.text();
+  } catch { return ''; }
+}
+
+// 解析 HLS 变体主清单 → 按清晰度降序的多线路字符串（有什么列什么，不写死档位）。
+// 相对文件名按主清单目录拼接（token 在目录段内，相对拼接即保留）。
+function parseHlsMaster(masterText, masterUrl) {
+  const dir = masterUrl.slice(0, masterUrl.lastIndexOf('/') + 1);
+  const lines = [];
+  const re = /#EXT-X-STREAM-INF:([^\n]*)\n([^\n\r]+)/g;
+  let m;
+  while ((m = re.exec(masterText)) !== null) {
+    const attrs = m[1];
+    const file = m[2].trim();
+    if (!file || file.startsWith('#')) continue;
+    let h = 0;
+    const nm = attrs.match(/NAME="([^"]+)"/i);
+    const rs = attrs.match(/RESOLUTION=\d+x(\d+)/i);
+    if (rs) h = parseInt(rs[1], 10);
+    else if (nm && /(\d+)p/i.test(nm[1])) h = parseInt(nm[1].match(/(\d+)p/i)[1], 10);
+    const label = h ? (h + 'p') : (nm ? nm[1] : '默认');
+    const abs = /^https?:\/\//i.test(file) ? file : (dir + file);
+    lines.push({ h, label, url: abs });
+  }
+  lines.sort((a, b) => b.h - a.h);
+  const seen = new Set();
+  return lines.filter(x => !seen.has(x.url) && seen.add(x.url))
+    .map(x => x.label + '$' + x.url).join('#');
+}
+
 function extractVideoUrl(html) {
   const patterns = [
     /setVideoUrlHigh\(['"]([^'"]+)['"]\)/,
@@ -183,14 +232,29 @@ async function detail(reqIn) {
     if (!html) continue;
     const tm = html.match(/<h1[^>]*>([^<]{2,200})<\/h1>/i);
     const name = tm ? stripTags(tm[1]) : href;
-    const vurl = extractVideoUrl(html);
-    if (!vurl) continue;
+    // 2026-10-29：原只取 setVideoUrlHigh（实测只是 360p mp4），故观感低。
+    // 优先 setVideoHLS 变体主清单，列出 1080p/720p/480p/360p/250p 等实测档位；
+    // HLS 拉取/解析失败时回退原 mp4 单线（并附 360p/240p 两行，不冒充高清）。
+    let playUrl = '';
+    const hm = html.match(/setVideoHLS\(['"]([^'"]+)['"]\)/);
+    if (hm) {
+      const masterUrl = hm[1].replace(/\\\//g, '/');
+      const masterText = await fetchSmall(masterUrl);
+      if (masterText) playUrl = parseHlsMaster(masterText, masterUrl);
+    }
+    if (!playUrl) {
+      const vurl = extractVideoUrl(html);
+      if (!vurl) continue;
+      const lm = html.match(/setVideoUrlLow\(['"]([^'"]+)['"]\)/);
+      playUrl = `默认$${vurl}`;
+      if (lm && lm[1] !== vurl) playUrl += `#MP4 240p$${lm[1].replace(/\\\//g, '/')}`;
+    }
     list.push({
       vod_id: href,
       vod_name: name,
       vod_pic: '',
       vod_play_from: 'XNXX',
-      vod_play_url: `默认$${vurl}`,
+      vod_play_url: playUrl,
     });
   }
   return { list };

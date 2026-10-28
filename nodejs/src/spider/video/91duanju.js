@@ -2,7 +2,10 @@ import req from '../../util/req.js';
 
 const KEY = 'py_91duanju';
 const NAME = '91成人短剧';
-const HOST = 'https://91crdj.com';
+// 2026-10-29 诊断坐实：旧域名 301 迁到 91crdjai.com（详情/播放页同理），
+// 蜘蛛全靠请求库跟随 301 才工作；App 内任一环节不跟随就会拿到 167 字节 301 页而播不了。
+// 故 HOST 直接改为新域名（headers/detail/play 的 Referer 与拼 URL 均派生自 HOST，无需逐处改）。
+const HOST = 'https://91crdjai.com';
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const PAGE_SIZE = 20;

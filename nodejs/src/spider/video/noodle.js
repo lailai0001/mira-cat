@@ -79,8 +79,26 @@ async function detail(reqIn) {
     const tm = html.match(/data-video-title-base="([^"]+)"/i);
     const title = tm ? stripTags(tm[1]) : 'NoodleMagazine';
     const om = html.match(/og:image[^>]*content="([^"]+)"/i);
-    const vm = html.match(/\/videofile\/[^"'\s<>]+\.mp4/i);
-    const playUrl = vm ? ('播放$' + HOST.replace(/\/$/, '') + vm[0]) : ('未找到视频源$' + raw);
+    // 2026-10-29：详情页 window.playlist 里有 720/480/360/240 四档直链（原只取 videofile
+    // 单线 360p 且多一次 301）；优先按清晰度降序出多线路，playlist 为空时回退 videofile。
+    let playUrl = '';
+    const pl = [];
+    const seenPl = new Set();
+    const plRe = /"file"\s*:\s*"([^"]+)"\s*,\s*"label"\s*:\s*"([^"]+)"/gi;
+    let pm;
+    while ((pm = plRe.exec(html)) !== null) {
+      const f = pm[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+      const lab = pm[2].trim();
+      if (!/^https?:\/\//i.test(f) || seenPl.has(f)) continue;
+      seenPl.add(f);
+      pl.push({ label: lab, file: f });
+    }
+    pl.sort((a, b) => (parseInt(b.label, 10) || 0) - (parseInt(a.label, 10) || 0));
+    if (pl.length) playUrl = pl.map(x => x.label + '$' + x.file).join('#');
+    else {
+      const vm = html.match(/\/videofile\/[^"'\s<>]+\.mp4/i);
+      playUrl = vm ? ('播放$' + HOST.replace(/\/$/, '') + vm[0]) : ('未找到视频源$' + raw);
+    }
     list.push({ vod_id: raw, vod_name: title, vod_pic: om ? om[1] : '', vod_play_from: 'NoodleMagazine', vod_play_url: playUrl });
   }
   return { list };

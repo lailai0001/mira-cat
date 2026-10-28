@@ -366,8 +366,9 @@ async function play(reqIn) {
     const j = parseInitialData(html);
     let url = '';
     if (j) {
-      // 分集页的 videoSrc 即本集正片; epPlaySrcs[本集] 兜底; previewSrc 最后兜底
-      url = j.videoSrc || (j.epPlaySrcs && j.ep ? j.epPlaySrcs[String(j.ep)] : '') || j.previewSrc || '';
+      // 分集页的 videoSrc 即本集正片; epPlaySrcs[本集] 兜底; previewSrc 兜底;
+      // 2026-10-29 加固：再补一级 videoSrcHevc（个别剧目主 videoSrc 为空时才用）
+      url = j.videoSrc || (j.epPlaySrcs && j.ep ? j.epPlaySrcs[String(j.ep)] : '') || j.previewSrc || j.videoSrcHevc || '';
     }
     if (!url) {
       const m = html.match(/"videoSrc"\s*:\s*"([^"]+)"/);
@@ -375,7 +376,8 @@ async function play(reqIn) {
     }
     url = String(url || '').replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&').trim();
     if (!/^https?:\/\//i.test(url)) return { parse: 0, url: '', header: {} };
-    return { parse: 0, url, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
+    // 2026-10-29 加固：Referer 改为分集页 URL 本身（原 HOST 根路径在个别 CDN 校验下更弱）
+    return { parse: 0, url, header: { 'User-Agent': UA, 'Referer': pageUrl } };
   } catch (e) {
     return { parse: 0, url: '', header: {} };
   }

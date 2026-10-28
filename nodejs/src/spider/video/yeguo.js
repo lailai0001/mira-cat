@@ -74,13 +74,20 @@ function unwrap(d) {
   return x;
 }
 
+const IMG_WORKER_51 = 'https://51chigua.li768435813.workers.dev';
 function proxiedCover(url) {
   url = t(url);
   if (!url) return '';
-  // pic.sugfew.cn（现行主力封面主机）与 pic.jtzatly.cn 的图是 AES-128-CBC 加密存储
+  // pic.sugfew.cn 与 pic.jtzatly.cn 的图是 AES-128-CBC 加密存储
   // （与 818/91 同手法）：直连拿到的是密文、App 解不出图，必须走解密 Worker 出图。
   if (/pic\.sugfew\.cn|pic\.jtzatly\.cn/i.test(url)) {
     return IMG_WORKER + '/img?url=' + encodeURIComponent(url);
+  }
+  // 2026-10-29 诊断坐实：封面主力域名已迁到 pic.nihmcl.cn（分类 24/24），
+  // 直连同样是加密密文（非 JPEG 魔数）；且现行 bagua 代理对该域回 400，
+  // 只有 51chigua 代理实测出真 JPEG，故 nihmcl 单独走 51chigua 代理。
+  if (/pic\.nihmcl\.cn/i.test(url)) {
+    return IMG_WORKER_51 + '/img?url=' + encodeURIComponent(url);
   }
   // 其余主机（如 imgpublic.ycomesc.live）是明文图，直连即可；
   // 原 wulii 出图代理已失效（实测 500），不再走它。
