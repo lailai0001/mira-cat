@@ -10,6 +10,12 @@
 //   但页面 DOM 里搜不到 m3u8 与播放器 API 端点，流地址格式未证实。
 // - 因此本蜘蛛不做直链提取：详情直接返回主播页，play 用 parse:1 由播放器嗅探页面流；
 //   能不能播、列表能不能拉到，全由用户手机实测说了算，播不了即撤掉。
+// v2（2026-10-28 晚，用户选“先放宽解析再试一次”后改）：
+// - 浏览器 21:05 复查证实首页渲染 DOM 里确实有 /用户名 链接 + 用户名 plain text，
+//   但缩略图地址未能证实；v1 要求卡片内必须有 img.doppiocdn.net/snapshot 图片才算一条，
+//   若设备端抓到的原始 HTML 里没有那张图，parseList 会误判为空。
+// - 故 v2 放宽：只认 /用户名 链接 + 用户名文本，图片改为可选（有则用、无则空图只列名）；
+//   若设备端仍 406/空体/被 18+ 确认页挡住，列表仍空，届时按约定撤掉。
 // - 搜索：站内搜索栏格式未经浏览器核实，本版 search 暂返回空列表，不猜 URL。
 import req from '../../util/req.js';
 
@@ -40,17 +46,25 @@ function parseList(html) {
     const am = blk.match(/^href="\/([A-Za-z0-9_\-\.]+)"[^>]*>/i);
     if (!am) continue;
     const username = am[1];
-    // 排除导航与分类链接：girls/、couples、men、trans 等非主播路径
+    // 排除导航与分类链接：couples、men、trans、girls 等非主播路径
+    // （分类链接如 /girls/chinese 因含第二段斜杠，已被上面单段正则排除）
     if (['couples', 'men', 'trans', 'girls'].includes(username.toLowerCase())) continue;
-    if (blk.toLowerCase().includes('/girls/') && !blk.match(/img\.doppiocdn\.net\/snapshot\//i)) continue;
-    const pm = blk.match(/<img[^>]*src="(https?:\/\/img\.doppiocdn\.net\/snapshot\/[^"]+)"/i);
-    if (!pm) continue;
     const url = HOST + username;
     if (seen.has(url)) continue;
+    // v2 放宽：不再要求卡片内有 doppio 缩略图；用户名文本即标题来源
     const alm = blk.match(/alt="([^"]+)"/i);
-    const title = alm ? stripTags(alm[1]).replace(/\s*网络视讯表演\s*$/, '') : username;
+    let title = alm ? stripTags(alm[1]) : '';
+    if (!title) {
+      const afterTag = blk.replace(/^href="[^"]*"[^>]*>/i, '');
+      const tm = afterTag.match(/^[^<]+/);
+      title = tm ? stripTags(tm[0]) : '';
+    }
+    title = title.replace(/\s*网络视讯表演\s*$/, '').trim() || username;
+    // 图片可选：有 doppio 图用它，否则用块内任意首图，否则空图只列名
+    const pm = blk.match(/<img[^>]*src="(https?:\/\/img\.doppiocdn\.net\/snapshot\/[^"]+)"/i)
+      || blk.match(/<img[^>]*src="(https?:\/\/[^"]+)"/i);
     seen.add(url);
-    items.push({ vod_id: url, vod_name: title || username, vod_pic: pm[1] });
+    items.push({ vod_id: url, vod_name: title, vod_pic: pm ? pm[1] : '' });
     if (items.length >= 24) break;
   }
   return items;
