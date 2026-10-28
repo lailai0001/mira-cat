@@ -33,6 +33,8 @@
 //   VAS master（实测 480p/720p/1080p 三档）现取现拆为清晰度线；
 //   EVS master 本机直取 403（与 Referer/Cookie 无关，原因未坐实），故 EVS
 //   只留单线备份、不拆档位。
+// - 2026-10-29 晚 v5.1：EVS 在 VAS 出线时也尽量拆档（拆不开回落单线）；新加
+//   tag-huge-butt（大屁股，实测 5 页各 24 条不重复）→ 14 分类。
 import req from '../../util/req.js';
 
 const KEY = 'py_javneon';
@@ -75,12 +77,13 @@ const MIRROR_BASES = [
   'https://ghfast.top/https://raw.githubusercontent.com/lailai0001/mira-cat/refs/heads/main/mirror/javneon/',
   'https://raw.githubusercontent.com/lailai0001/mira-cat/refs/heads/main/mirror/javneon/',
 ];
-const MIRROR_CATS = ['censored-jav', 'uncensored-jav', 'amateur', 'chinese-subtitles', 'reducing-mosaic', 'english-subtitles', 'popular', 'tag-big-tits', 'tag-creampie', 'tag-solowork', 'tag-married-woman', 'tag-beautiful-girl', 'maker-s1-no-1-style'];
+const MIRROR_CATS = ['censored-jav', 'uncensored-jav', 'amateur', 'chinese-subtitles', 'reducing-mosaic', 'english-subtitles', 'popular', 'tag-big-tits', 'tag-creampie', 'tag-solowork', 'tag-married-woman', 'tag-beautiful-girl', 'maker-s1-no-1-style', 'tag-huge-butt'];
 // 新分类在站内的真实路径（仅直连回落时用；镜像文件统一用 key 名）
 const CAT_PATHS = {
   'tag-big-tits': 'tag/big-tits', 'tag-creampie': 'tag/creampie',
   'tag-solowork': 'tag/solowork', 'tag-married-woman': 'tag/married-woman',
   'tag-beautiful-girl': 'tag/beautiful-girl', 'maker-s1-no-1-style': 'maker/s1-no-1-style',
+  'tag-huge-butt': 'tag/huge-butt',
 };
 // 2026-10-29 v5：路径索引 lookup.json（path -> {s: 分类 key, t: 标题, p: 封面}），
 // 详情/搜索先查索引再只取一个分类文件，不再 13 个文件全拉（详情慢的主因之一）。
@@ -304,8 +307,8 @@ async function expandMaster(masterUrl, referer, prefix) {
 // 2026-10-29 v5：VAS 优先、EVS 兜底，解析提速。
 // 旧逻辑把 5 个按钮全跑一遍（ST/VOE/LUC 常超时），是“点开解析慢”的主因之一。
 // 新逻辑：按按钮顺序跑 lk1，集齐 VAS 与 EVS 各一个即停（SSIS-105 实测顺序为
-// EVS、VAS、ST、VOE、LUC，通常 2 次即停）；VAS 出线后只出 VAS 清晰度线 +
-// EVS 单线备份；VAS 全失败才试 EVS 拆档；两者全失败才逐个试其余按钮。
+// EVS、VAS、ST、VOE、LUC，通常 2 次即停）；VAS 出线后出 VAS 清晰度线 + EVS 尽量拆档
+// （拆不开回落单线）；VAS 全失败时 EVS 同样拆档；两者全失败才逐个试其余按钮。
 // 注意：vidhide API 固定传 codecs:[]（传 ["h264"] 会超时/失败，2026-10-28 实测）。
 async function resolvePlayLinesFromButtons(btns, detailUrl) {
   const lines = [];
@@ -349,10 +352,15 @@ async function resolvePlayLinesFromButtons(btns, detailUrl) {
     }
   }
   if (vasOk) {
-    // VAS 已出线：EVS 只留单线备份，不再拆档（省一次 master 请求）
+    // VAS 已出线：EVS 也尽量拆档（与 VAS 失败分支同款）；拆不开（master 403 等）
+    // 时回落单线备份，不影响 VAS 线。
     if (evs) {
       const packed = extractM3u8(evs.embedHtml);
-      if (packed) push('EVS', packed);
+      if (packed) {
+        const expanded = await expandMaster(packed, evs.target, 'EVS');
+        if (expanded.length) expanded.forEach(l => push(l.name, l.url));
+        else push('EVS', packed);
+      }
     }
     return lines;
   }
@@ -414,6 +422,7 @@ async function home() {
         { type_id: 'tag-married-woman/', type_name: '人妻' },
         { type_id: 'tag-beautiful-girl/', type_name: '美少女' },
         { type_id: 'maker-s1-no-1-style/', type_name: 'S1' },
+        { type_id: 'tag-huge-butt/', type_name: '大屁股' },
       ],
       filters: {},
       list,
@@ -435,6 +444,7 @@ async function home() {
       { type_id: 'tag-married-woman/', type_name: '人妻' },
       { type_id: 'tag-beautiful-girl/', type_name: '美少女' },
       { type_id: 'maker-s1-no-1-style/', type_name: 'S1' },
+      { type_id: 'tag-huge-butt/', type_name: '大屁股' },
     ],
     filters: {},
     list,
