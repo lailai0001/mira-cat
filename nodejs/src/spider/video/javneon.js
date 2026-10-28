@@ -39,6 +39,22 @@ async function getText(url, referer) {
   return r.html;
 }
 
+// 2026-10-29：App 内请求被站方 WAF 拦时的中转。直连在浏览器与本机都通、
+// 唯独 App 内列表为空，说明站方按客户端指纹拦 App 请求；
+// 中转 Worker（用户 CF 账号自建，见 ~/workspace/fix15/html-relay-worker.js，
+// 部署后地址 https://html-relay.li768435813.workers.dev/）在 CF 边缘替 App 抓一次。
+// 策略永远是“直连优先、中转兜底”：直连解析出内容就不走中转；直连解析为空才走中转，
+// 中转没部署或同样为空时行为与原来一致，不回归、不报错。
+const RELAY = 'https://html-relay.li768435813.workers.dev/';
+async function fetchViaRelay(url, referer) {
+  try {
+    const res = await req.get(RELAY + '?url=' + encodeURIComponent(url), { headers: H(referer), timeout: 20000, maxRedirects: 10 });
+    const data = (res && res.data !== undefined) ? res.data : res;
+    const finalUrl = (res && res.headers && (res.headers['x-final-url'] || res.headers['X-Final-Url'])) || url;
+    return { html: String(data || ''), finalUrl };
+  } catch { return { html: '', finalUrl: url }; }
+}
+
 // 跟随重定向并返回最终 URL（axios 在 Node 下把最终地址放在
 // res.request.res.responseUrl；拿不到时回落为请求地址）
 async function getWithUrl(url, referer) {
@@ -157,8 +173,9 @@ function extractM3u8(embedHtml) {
 // ② 只有嵌套地址形如 /e/{filecode} 时才 POST /api/stream——ST/VOE/LUC 等站
 //    根本没有该接口，原代码会对它们各空等一次超时，App 侧表现为一直加载不出。
 // ③ 详情改出多线路：VAS 新 API 线在前、EVS 打包线在后，任一可用即可播。
-async function resolvePlayLines(detailUrl) {
-  const html = await getText(detailUrl, HOST);
+// presetHtml：详情页 HTML 已由调用方取好时直接用（中转兜底时传入中转抓到的 HTML）。
+async function resolvePlayLines(detailUrl, presetHtml) {
+  const html = presetHtml !== undefined ? presetHtml : await getText(detailUrl, HOST);
   const btns = [...html.matchAll(/class="btn-server"[^>]*data-link="([0-9a-f]+)"/gi)].map(x => x[1]);
   const lines = [];
   const seen = new Set();
@@ -184,6 +201,12 @@ async function resolvePlayLines(detailUrl) {
       const r = await getWithUrl(lk1, detailUrl);
       embedHtml = r.html;
       target = r.finalUrl;
+    }
+    // lk1 直连拿不到嵌套页时（App 被 WAF 拦），走中转再试一次
+    if (!embedHtml) {
+      const rr = await fetchViaRelay(lk1, detailUrl);
+      embedHtml = rr.html;
+      target = rr.finalUrl || target;
     }
     if (!embedHtml) continue;
     // 路线 A：旧 evsishere 打包页 → 解包取 links.hls2（作第二线路）
@@ -211,8 +234,20 @@ async function resolvePlayLines(detailUrl) {
 
 async function init() { return {}; }
 
+// 直连解析为空时走中转再解析一次（中转未部署时返回空，与原来一致）
+async function listSmart(url, referer) {
+  const html = await getText(url, referer);
+  let list = parsePosts(html);
+  if (!list.length) {
+    const rr = await fetchViaRelay(url, referer);
+    const list2 = parsePosts(rr.html);
+    if (list2.length) { list = list2; return { list, html: rr.html }; }
+  }
+  return { list, html };
+}
+
 async function home() {
-  const html = await getText(HOST, HOST);
+  const { list } = await listSmart(HOST, HOST);
   return {
     class: [
       { type_id: 'censored-jav/', type_name: '有修正' },
@@ -224,7 +259,7 @@ async function home() {
       { type_id: 'popular/', type_name: '人气' },
     ],
     filters: {},
-    list: parsePosts(html),
+    list,
   };
 }
 
@@ -234,8 +269,7 @@ async function category(reqIn) {
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const base = HOST + tid.replace(/^\/+/, '').replace(/\/+$/, '');
   const url = page === 1 ? (base + '/') : (base + '/page/' + page + '/');
-  const html = await getText(url, HOST);
-  const list = parsePosts(html);
+  const { list } = await listSmart(url, HOST);
   return {
     page, pagecount: 9999, limit: 90,
     total: list.length ? 999999 : 0,
@@ -248,12 +282,17 @@ async function detail(reqIn) {
   const list = [];
   for (const raw of ids.filter(Boolean)) {
     const url = /^https?:\/\//i.test(raw) ? raw : HOST + String(raw).replace(/^\/+/, '');
-    const html = await getText(url, HOST);
+    let html = await getText(url, HOST);
+    let btnCount = (html.match(/class="btn-server"[^>]*data-link="/gi) || []).length;
+    if (!btnCount) {
+      const rr = await fetchViaRelay(url, HOST);
+      if ((rr.html.match(/class="btn-server"[^>]*data-link="/gi) || []).length) html = rr.html;
+    }
     const hm = html.match(/<h2[^>]*>([\s\S]{0,400}?)<\/h2>/i);
     // 封面在 player-wrap 的 background-image 里（页内其它 background-image 多为语言旗标，勿取首个）
     const pm = html.match(/player-wrap[^>]*style="[^"]*background-image:\s*url\((https?:[^)]+)\)/i)
       || html.match(/player-wrap[^>]*style='[^']*background-image:\s*url\((https?:[^)]+)\)/i);
-    const lines = await resolvePlayLines(url);
+    const lines = await resolvePlayLines(url, html);
     list.push({
       vod_id: raw,
       vod_name: hm ? stripTags(hm[1]) : 'JavNeon',
@@ -283,8 +322,7 @@ async function search(reqIn) {
   if (!wd) return { page, pagecount: page, limit: 90, total: 0, list: [] };
   let url = HOST + '?s=' + encodeURIComponent(wd);
   if (page > 1) url += '&paged=' + page;
-  const html = await getText(url, HOST);
-  const list = parsePosts(html);
+  const { list } = await listSmart(url, HOST);
   return { page, pagecount: 9999, limit: 90, total: list.length, list };
 }
 

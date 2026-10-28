@@ -68,10 +68,8 @@ import javneon from './spider/video/javneon.js';
 import dycg66 from './spider/video/dycg66.js';
 import cg91 from './spider/video/cg91.js';
 import noodle from './spider/video/noodle.js';
-import camhub from './spider/video/camhub.js';
 import ultra from './spider/video/ultra.js';
 import asian from './spider/video/asian.js';
-import iwank from './spider/video/iwank.js';
 import pikped from './spider/video/pikped.js';
 
 const spiders = [
@@ -130,7 +128,7 @@ const spiders = [
     youzidj,
     stripchat,
     hohoj,
-    rip17, brazz, bigbuttshub, mmtv, javideo, bestjavporn, chaturbate, asmrba, hlbdy, shipin51, erome, javneon, dycg66, cg91, noodle, camhub, ultra, asian, iwank, pikped,];
+    rip17, brazz, bigbuttshub, mmtv, javideo, bestjavporn, chaturbate, asmrba, hlbdy, shipin51, erome, javneon, dycg66, cg91, noodle, ultra, asian, pikped,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**

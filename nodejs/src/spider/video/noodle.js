@@ -27,6 +27,28 @@ async function getText(url, referer) {
     return String(data || '');
   } catch { return ''; }
 }
+// 2026-10-29：与 javneon 同因——浏览器与本机都能抓、唯独 App 内列表为空，
+// 疑为站方按客户端指纹拦 App 请求；中转 Worker（用户 CF 自建，
+// 部署后地址 https://html-relay.li768435813.workers.dev/，代码见 fix15/html-relay-worker.js）
+// 在 CF 边缘替 App 抓一次。策略：直连优先、解析为空才走中转；中转未部署时行为与原来一致。
+const RELAY = 'https://html-relay.li768435813.workers.dev/';
+async function fetchViaRelay(url, referer) {
+  try {
+    const res = await req.get(RELAY + '?url=' + encodeURIComponent(url), { headers: H(referer), timeout: 20000, maxRedirects: 10 });
+    const data = (res && res.data !== undefined) ? res.data : res;
+    return String(data || '');
+  } catch { return ''; }
+}
+async function listSmart(url, referer) {
+  const html = await getText(url, referer);
+  let list = parseList(html);
+  if (!list.length) {
+    const rh = await fetchViaRelay(url, referer);
+    const list2 = parseList(rh);
+    if (list2.length) return { list: list2, html: rh };
+  }
+  return { list, html };
+}
 function stripTags(s) {
   return String(s || '').replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
 }
@@ -52,7 +74,7 @@ function parseList(html) {
 }
 async function init() { return {}; }
 async function home() {
-  const html = await getText(HOST + 'home', HOST);
+  const { list } = await listSmart(HOST + 'home', HOST);
   return {
     class: [
       { type_id: 'home', type_name: '最新' },
@@ -60,45 +82,48 @@ async function home() {
       { type_id: 'home?range=month', type_name: '本月热门' },
     ],
     filters: {},
-    list: parseList(html),
+    list,
   };
 }
 async function category(reqIn) {
   const body = reqIn?.body || {};
   const tid = String(body.id || 'home');
-  const html = await getText(HOST + tid, HOST);
-  const list = parseList(html);
+  const { list } = await listSmart(HOST + tid, HOST);
   return { page: 1, pagecount: 1, limit: 90, total: list.length, list };
+}
+// 详情播放地址提取：window.playlist 四档优先，空时回退 videofile 单线
+function detailPlayUrl(html, raw) {
+  const pl = [];
+  const seenPl = new Set();
+  const plRe = /"file"\s*:\s*"([^"]+)"\s*,\s*"label"\s*:\s*"([^"]+)"/gi;
+  let pm;
+  while ((pm = plRe.exec(html)) !== null) {
+    const f = pm[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+    const lab = pm[2].trim();
+    if (!/^https?:\/\//i.test(f) || seenPl.has(f)) continue;
+    seenPl.add(f);
+    pl.push({ label: lab, file: f });
+  }
+  pl.sort((a, b) => (parseInt(b.label, 10) || 0) - (parseInt(a.label, 10) || 0));
+  if (pl.length) return pl.map(x => x.label + '$' + x.file).join('#');
+  const vm = html.match(/\/videofile\/[^"'\s<>]+\.mp4/i);
+  return vm ? ('播放$' + HOST.replace(/\/$/, '') + vm[0]) : ('未找到视频源$' + raw);
 }
 async function detail(reqIn) {
   const ids = Array.isArray(reqIn?.body?.id) ? reqIn.body.id : [reqIn?.body?.id];
   const list = [];
   for (const raw of ids.filter(Boolean)) {
     const url = /^https?:\/\//i.test(raw) ? raw : HOST + String(raw).replace(/^\/+/, '');
-    const html = await getText(url, HOST);
+    let html = await getText(url, HOST);
+    let playUrl = detailPlayUrl(html, raw);
+    if (playUrl.startsWith('未找到视频源')) {
+      const rh = await fetchViaRelay(url, HOST);
+      const playUrl2 = detailPlayUrl(rh, raw);
+      if (!playUrl2.startsWith('未找到视频源')) { html = rh; playUrl = playUrl2; }
+    }
     const tm = html.match(/data-video-title-base="([^"]+)"/i);
     const title = tm ? stripTags(tm[1]) : 'NoodleMagazine';
     const om = html.match(/og:image[^>]*content="([^"]+)"/i);
-    // 2026-10-29：详情页 window.playlist 里有 720/480/360/240 四档直链（原只取 videofile
-    // 单线 360p 且多一次 301）；优先按清晰度降序出多线路，playlist 为空时回退 videofile。
-    let playUrl = '';
-    const pl = [];
-    const seenPl = new Set();
-    const plRe = /"file"\s*:\s*"([^"]+)"\s*,\s*"label"\s*:\s*"([^"]+)"/gi;
-    let pm;
-    while ((pm = plRe.exec(html)) !== null) {
-      const f = pm[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&');
-      const lab = pm[2].trim();
-      if (!/^https?:\/\//i.test(f) || seenPl.has(f)) continue;
-      seenPl.add(f);
-      pl.push({ label: lab, file: f });
-    }
-    pl.sort((a, b) => (parseInt(b.label, 10) || 0) - (parseInt(a.label, 10) || 0));
-    if (pl.length) playUrl = pl.map(x => x.label + '$' + x.file).join('#');
-    else {
-      const vm = html.match(/\/videofile\/[^"'\s<>]+\.mp4/i);
-      playUrl = vm ? ('播放$' + HOST.replace(/\/$/, '') + vm[0]) : ('未找到视频源$' + raw);
-    }
     list.push({ vod_id: raw, vod_name: title, vod_pic: om ? om[1] : '', vod_play_from: 'NoodleMagazine', vod_play_url: playUrl });
   }
   return { list };
@@ -113,8 +138,7 @@ async function search(reqIn) {
   const body = reqIn?.body || {};
   const wd = String(body.wd || '').trim();
   if (!wd) return { page: 1, pagecount: 1, limit: 90, total: 0, list: [] };
-  const html = await getText(HOST + 'video/' + encodeURIComponent(wd), HOST);
-  const list = parseList(html);
+  const { list } = await listSmart(HOST + 'video/' + encodeURIComponent(wd), HOST);
   return { page: 1, pagecount: 1, limit: 90, total: list.length, list };
 }
 export default function createSpider() {

@@ -8,8 +8,13 @@
 //   viewersCount，以及 hlsPlaylist（如 https://edge-hls.doppiocdn.media/hls/{id}/master/{id}_240p.m3u8）。
 // v3 路线（套用同仓库 chaturbate.js 的“公开 JSON 接口 + 直链 m3u8”路子）：
 //   列表走 /api/front/models?primaryTag={tag}&limit=90 解析 JSON；
-//   播放取 /api/front/models/{id}/streamSpecifics 的 hlsPlaylist，去掉 _240p 后缀后
-//   播主列表 m3u8（接口给的 _240p 变体直接播会低清，故播主列表）；不再 parse:1 嗅探主播页。
+//   列表项本身就带 hlsPlaylist（如 .../master/{id}_240p.m3u8），去掉 _240p 后缀后
+//   即主列表 m3u8（接口给的 _240p 变体直接播会低清，故播主列表）；不再 parse:1 嗅探主播页。
+// v3.1（2026-10-29 修复“未找到直播源”）：实测 /api/front/models/{id}/streamSpecifics
+//   按 id 查回 403 {"error":"User is unauthorized"}、按用户名查回 404，
+//   故 v3 的 detail() 永远拿不到流 —— 根因在此。
+//   改为列表时就把主列表地址编进 vod_id（id|主列表地址），detail 直接拆出来用；
+//   兜底：若 vod_id 里没有地址（如旧收藏），重拉 4 个 tag 的列表按 id 找回 hlsPlaylist。
 // 未证实、不要猜：侧边标签筛选（/girls/chinese 等）在接口里的参数名与取值未定位，
 // 故本版分类只给已验证的 4 个 primaryTag（girls/couples/men/trans）；搜索接口同样未证实，
 // search 暂返回空。18+ 确认与 406 问题随接口路线自然消失（接口不需年龄确认 cookie，
@@ -55,7 +60,9 @@ function parseModels(j) {
     seen.add(id);
     const viewers = m.viewersCount != null ? (m.viewersCount + '人') : '';
     const remarks = [status, viewers].filter(Boolean).join(' · ');
-    items.push({ vod_id: id, vod_name: username, vod_pic: m.previewUrlThumbSmall || m.previewUrl || m.snapshotUrl || '', vod_remarks: remarks });
+    // 主列表地址直接编进 vod_id（detail 拆出来即用，不再走会 403 的 streamSpecifics）
+    const master = toMaster(m.hlsPlaylist || '');
+    items.push({ vod_id: master ? (id + '|' + master) : id, vod_name: username, vod_pic: m.previewUrlThumbSmall || m.previewUrl || m.snapshotUrl || '', vod_remarks: remarks });
     if (items.length >= 90) break;
   }
   return items;
@@ -88,20 +95,19 @@ async function detail(reqIn) {
   const ids = Array.isArray(reqIn?.body?.id) ? reqIn.body.id : [reqIn?.body?.id];
   const list = [];
   for (const raw of ids.filter(Boolean)) {
-    const id = String(raw).trim();
-    let master = '';
-    const j = await getJson(HOST + 'api/front/models/' + encodeURIComponent(id) + '/streamSpecifics');
-    const walk = (o) => {
-      if (!o || typeof o !== 'object') return '';
-      if (typeof o.hlsPlaylist === 'string' && o.hlsPlaylist) return o.hlsPlaylist;
-      for (const k of Object.keys(o)) {
-        const v = walk(o[k]);
-        if (v) return v;
+    const rawStr = String(raw).trim();
+    const parts = rawStr.split('|');
+    const id = parts[0];
+    let master = parts.length > 1 ? parts.slice(1).join('|') : '';
+    if (!master || !/\.m3u8/i.test(master)) {
+      // 兜底（旧收藏等 vod_id 里没带地址时）：重拉 4 个 tag 的列表按 id 找回 hlsPlaylist
+      for (const tag of ['girls', 'couples', 'men', 'trans']) {
+        const j = await getJson(HOST + 'api/front/models?primaryTag=' + tag + '&limit=90');
+        const arr = j && Array.isArray(j.models) ? j.models : [];
+        const hit = arr.find(x => x && String(x.id) === id);
+        if (hit && hit.hlsPlaylist) { master = toMaster(hit.hlsPlaylist); break; }
       }
-      return '';
-    };
-    const hls = walk(j);
-    if (hls) master = toMaster(hls);
+    }
     list.push({
       vod_id: raw,
       vod_name: 'PikPedCams',
