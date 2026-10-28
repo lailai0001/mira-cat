@@ -29,6 +29,7 @@ jobs:
       - name: Fetch javneon lists and details
         run: node mirror/javneon/fetch.mjs
       - name: Commit mirror if changed
+        if: always()
         run: |
           git config user.name "javneon-mirror"
           git config user.email "javneon-mirror@users.noreply.github.com"

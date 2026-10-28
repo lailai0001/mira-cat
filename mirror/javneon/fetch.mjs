@@ -32,6 +32,7 @@ const CATS = [
 ];
 const OUT_DIR = join(dirname(fileURLToPath(import.meta.url)));
 
+const DIAG = [];
 function curl(url) {
   return new Promise((resolve) => {
     execFile(
@@ -39,9 +40,14 @@ function curl(url) {
       ['-sS', '--max-time', '30', '-A', UA,
        '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
        '-H', 'Accept-Language: en-US,en;q=0.9',
-       '--compressed', url],
+       '--compressed', '-w', '\n__CURLMETA__:%{http_code}:%{size_download}', url],
       { maxBuffer: 20 * 1024 * 1024 },
-      (err, stdout) => resolve(err ? '' : String(stdout || '')),
+      (err, stdout) => {
+        const out = String(stdout || '');
+        const m = out.match(/\n__CURLMETA__:(\d+):(\d+)\s*$/);
+        const body = m ? out.slice(0, m.index) : out;
+        resolve({ code: m ? m[1] : (err ? 'ERR' : '?'), bytes: m ? m[2] : String(body.length), body, err: err ? String(err.message).slice(0, 200) : '' });
+      },
     );
   });
 }
@@ -112,9 +118,10 @@ for (const slug of CATS) {
   const pages = [HOST + slug + '/', HOST + slug + '/page/2/'];
   const byPath = new Map();
   for (const url of pages) {
-    const html = await curl(url);
-    const posts = parsePosts(html);
-    console.log(`list ${url} -> ${posts.length} items`);
+    const r = await curl(url);
+    const posts = parsePosts(r.body);
+    DIAG.push({ url, code: r.code, bytes: r.bytes, posts: posts.length, err: r.err, head: r.body.slice(0, 200).replace(/\s+/g, ' ') });
+    console.log(`list ${url} -> ${r.code} ${r.bytes}B ${posts.length} items`);
     for (const p of posts) if (!byPath.has(p.path)) byPath.set(p.path, p);
   }
   const items = [...byPath.values()];
@@ -124,9 +131,9 @@ for (const slug of CATS) {
   }
   // 详情按钮：并发抓，每条失败时 buttons 留空（列表仍可用，详情回落实时抓）
   const details = await pool(items.map((it) => async () => {
-    const html = await curl(HOST.replace(/\/$/, '') + it.path);
-    if (!html) return null;
-    return parseDetail(html, it.title, it.pic);
+    const r = await curl(HOST.replace(/\/$/, '') + it.path);
+    if (!r.body) return null;
+    return parseDetail(r.body, it.title, it.pic);
   }), 8);
   let withBtn = 0;
   const outItems = items.map((it, idx) => {
@@ -151,6 +158,10 @@ for (const slug of CATS) {
 
 writeFileSync(join(OUT_DIR, 'index.json.tmp'), JSON.stringify(index, null, 0));
 renameSync(join(OUT_DIR, 'index.json.tmp'), join(OUT_DIR, 'index.json'));
+// 诊断文件：即使全部失败也写出，供从仓库直接读取 runner 侧看到的状态码与页面头
+const ctl = await curl('https://example.com/');
+DIAG.unshift({ control: 'example.com', code: ctl.code, bytes: ctl.bytes, err: ctl.err });
+writeFileSync(join(OUT_DIR, '_diag.json'), JSON.stringify({ updated: new Date().toISOString(), okCats, diag: DIAG }, null, 0));
 console.log(`done: ${okCats}/${CATS.length} categories ok`);
 if (!okCats) {
   console.error('FATAL: all categories failed');
