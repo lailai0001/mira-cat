@@ -1,25 +1,16 @@
-// 韩国BJ - CatPawOpen JS Spider
-// Ported from KoreanBJ.py (HOST=https://kbjclub.club; 2026-10-29 由 ww1.koreanbj.club 切换：
-// 实测两域为同一 WordPress 站的多域名映射——同帖同播放器 id/token、kbjclub 首页
-// canonical 仍指 ww1、主题含 multiple-domain 类；用户浏览器在 kbjclub 侧全通，故切换)
-// 列表: loop-video /video/slug/
-// 播放: VOE 系 embed → 六层混淆解包 → m3u8/mp4 直出
-// 请求: 双通道 — 先框架 req(axios, MiraPlayer 内核可用)，失败再试 Node 原生 fetch
-// 2026-10-29 修复（yuyuhwa 播不了）：
-// 实测结论（纠正初版误判）：旧 JW setup 正则其实能取到 player-6w.php 的
-// master.txt，详情并非无直链；真正要害是该站 txt 链全程 Referer 门禁——
-// master、变体、分片无 Referer 一律 404（实测），有 Referer 则全通。
-// 设备端播不了最可能卡在播放器是否把 play() 的 Referer 带到变体/分片请求，
-// 或个别文件 host 挂掉/下架（见验证记录）。本次修复三点：
-// ① 三档 master 拆成自动/1080p/720p/480p 可选项（变体相对地址解析）；
-// ② 每条成功链路追加一条「网页播」嗅探线（WebView 自带 Referer 链，可绕过
-//    直链 Referer 透传问题）；③ file: 字段全局兜底（playlist 形态等）。
-// play() 的 Referer: HOST 不可去掉。已死文件（如个别 /e/ 嵌套 404）属片源
-// 下架，代码无法复活。
+// Korean BJ - CatPawOpen JS Spider（2026-10-29 重写版，替代旧 韩国BJ）
+// 源站：https://kbjclub.club/（WordPress retrotube 主题，loop-video 卡片）
+// 列表：首页 /、分类 /category/<slug>/、翻页 /page/<n>/、搜索 /?s=<kw>
+// 详情：详情页 player-6w.php 播放器 → JW setup file: master.txt → 三档变体
+//   （自动/1080p/720p/480p）+ 网页播嗅探线；无 player-6w 时回落 /e/ 嵌套（VOE 解包）。
+// 速度（相对旧版的主要改动）：详情只解第一条可用线路即停，旧版逐条解全部
+//   嵌套（详情页含多个 embed 时要多花数倍请求）；play() 直链直接返回不二次请求。
+// txt 链全程 Referer 门禁：master、变体、分片无 Referer 一律 404，
+// play() 的 Referer 绝不可去掉（实测：kbjclub/ww1 任一站域 Referer 均 200）。
 import req from '../../util/req.js';
 
-const KEY = 'py_hanbj';
-const NAME = '韩国BJ';
+const KEY = 'py_koreanbj';
+const NAME = 'Korean BJ';
 const HOST = 'https://kbjclub.club';
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -28,6 +19,7 @@ const CHANNELS = {
   home: { name: '最新', path: '/' },
   'korean-bj': { name: 'Korean BJ', path: '/category/korean-bj/' },
   pandatv: { name: 'PandaTV', path: '/category/pandatv/' },
+  'afreeca-tv': { name: 'Afreeca TV', path: '/category/afreeca-tv/' },
   onlyfans: { name: 'OnlyFans', path: '/category/onlyfans/' },
   amateur: { name: 'Amateur', path: '/category/amateur-porn/' },
   kpop: { name: 'Kpop Deepfake', path: '/category/kpop-deepfake/' },
@@ -37,6 +29,12 @@ const CHANNELS = {
   fantrie: { name: 'Fantrie', path: '/category/fantrie/' },
   nude: { name: 'Nude', path: '/category/nude/' },
   pov: { name: 'POV', path: '/category/pov/' },
+  masturbating: { name: 'Masturbating', path: '/category/masturbating/' },
+  discord: { name: 'Discord', path: '/category/discord/' },
+  'big-ass': { name: 'Big Ass', path: '/category/big-ass/' },
+  'big-boobs': { name: 'Big Boobs', path: '/category/big-boobs/' },
+  chaturbate: { name: 'Chaturbate', path: '/category/chaturbate/' },
+  fansly: { name: 'Fansly', path: '/category/fansly/' },
 };
 
 function t(v) {
@@ -66,21 +64,16 @@ function absUrl(u, base) {
 
 async function getText(url, referer) {
   const hdrs = headers(referer);
-  // 通道1: 框架 req (axios) — MiraPlayer 内核可用
   try {
     const { data, status } = await req.get(url, { headers: hdrs, timeout: 20000, responseType: 'text' });
-    const t = String(data || '');
-    if (status === 200 && t) return t;
+    const s = String(data || '');
+    if (status === 200 && s) return s;
   } catch { /* 换通道2 */ }
-  // 通道2: Node 原生 fetch
   try {
     if (typeof fetch === 'undefined') return '';
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 22000);
-    const r = await fetch(url, {
-      headers: hdrs,
-      signal: ctrl.signal,
-    });
+    const r = await fetch(url, { headers: hdrs, signal: ctrl.signal });
     clearTimeout(timer);
     if (!r.ok) return '';
     return t(await r.text());
@@ -121,13 +114,13 @@ function parseList(html) {
       vod_id: vodId,
       vod_name: name.replace(/\s+/g, ' ').slice(0, 120),
       vod_pic: pic,
-      vod_remarks: 'KoreanBJ',
+      vod_remarks: 'Korean BJ',
     });
   }
   return videos;
 }
 
-// ---------- VOE 解包 (对齐 SupJav) ----------
+// ---------- VOE 解包（/e/ 嵌套回落用） ----------
 function rot13(s) {
   return s.replace(/[a-zA-Z]/g, (c) => {
     const base = c <= 'Z' ? 65 : 97;
@@ -162,7 +155,6 @@ function voeDecode(html) {
       s = s.split(k).join('_');
     }
     s = s.split('_').join('');
-    // 六层：rot13 → b64 → 每字符-3 → b64(反转)
     let tt = b64d(rot13(s));
     tt = [...tt].map((c) => String.fromCharCode(c.charCodeAt(0) - 3)).join('');
     tt = b64d([...tt].reverse().join(''));
@@ -173,6 +165,7 @@ function voeDecode(html) {
   }
 }
 
+// 详情页嵌套地址提取；player-6w.php 排最前（主链路），其余嵌套作回落。
 function extractEmbedUrls(html, pageUrl) {
   const urls = [];
   const seen = new Set();
@@ -195,6 +188,7 @@ function extractEmbedUrls(html, pageUrl) {
   while ((m = re3.exec(h)) !== null) add(m[1]);
   const re4 = /https?:\/\/(?:[a-z0-9\-]+\.)?(?:voe|io\d+storege|streamtape|filemoon)[^"'\s<>]+/gi;
   while ((m = re4.exec(h)) !== null) add(m[0]);
+  urls.sort((a, b) => (a.includes('player-6w') ? 0 : 1) - (b.includes('player-6w') ? 0 : 1));
   return urls;
 }
 
@@ -203,15 +197,11 @@ async function resolveVoe(embedUrl, referer) {
   if (!html) return { m3u8: '', direct: '' };
   const hits = html.match(/https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*/g) || [];
   if (hits.length && !/test-videos/i.test(hits[0])) return { m3u8: hits[0], direct: '' };
-  // JW Player file: 字段（master.txt 实为 m3u8）
   const jw = html.match(/jwplayer\([^)]*\)\.setup\(\{\s*file:\s*"([^"]+)"/i);
   if (jw) {
     const f = jw[1].replace(/\\\//g, '/');
     if (/^https?:\/\//i.test(f)) return { m3u8: f, direct: '' };
   }
-  // 2026-10-29 兜底：全局搜 file: "..."（playlist:[{file:}] 等非 setup 直写形态）。
-  // 说明：标准 setup({file:}) 形态旧 JW 正则已能取到，此处只补其它形态；
-  // 只认 http(s)/协议相对、且含 master.txt/.m3u8/hls 的值，排除 vtt 缩略图。
   const fms = [...html.matchAll(/file:\s*"([^"]+)"/gi)].map((x) => x[1].replace(/\\\//g, '/'));
   for (const f of fms) {
     let u = f;
@@ -231,11 +221,7 @@ async function resolveVoe(embedUrl, referer) {
   return { m3u8: '', direct: '' };
 }
 
-// 2026-10-29 新增：master 档位展开（清晰度自选）。
-// 实测：player-6w.php 的 master.txt 是三档 master（480p/720p/1080p，
-// 变体为同目录相对文件 index-f1/f2/f3-v1-a1.txt）；vidhide 系 .m3u8
-// master 同理（相对变体）。旧代码只把 master 当一条线出，用户只能看
-// 播放器自动档；现拆成「自动 + 各档位」多条线，由用户自选。
+// master 档位展开（清晰度自选）：master.txt / .m3u8 变体 → 自动 + 各档位。
 // master 取不到或无变体时返回 []，调用方回落单条 master 线。
 async function expandMaster(masterUrl, referer) {
   try {
@@ -305,8 +291,8 @@ async function category(reqIn) {
     list: videos,
     page: pg,
     pagecount,
-    limit: 24,
-    total: pagecount * Math.max(videos.length, 1),
+    limit: 21,
+    total: pagecount * 21,
   };
 }
 
@@ -318,7 +304,7 @@ async function detail(reqIn) {
     if (!/^https?:\/\//i.test(url)) url = absUrl(url);
     const html = await getText(url);
     if (!html) {
-      list.push({ vod_id: url, vod_name: 'KoreanBJ' });
+      list.push({ vod_id: url, vod_name: 'Korean BJ' });
       continue;
     }
     let name = '';
@@ -335,7 +321,6 @@ async function detail(reqIn) {
     for (const emb of embeds) {
       const { m3u8, direct } = await resolveVoe(emb, url);
       if (m3u8) {
-        // 多档 master 拆成可选项；展开失败时仍出单条 master 线兜底
         const vars = await expandMaster(m3u8, emb);
         if (vars.length) {
           plays.push(['自动', m3u8]);
@@ -344,11 +329,14 @@ async function detail(reqIn) {
           plays.push(['HLS', m3u8]);
         }
         // 网页播嗅探线：WebView 自带 Referer 链，可绕过直链 Referer 透传问题。
-        // play() 见到 sniff=1 标记直接返回 parse:1，不再二次解析。
         plays.push(['网页播', emb + (emb.includes('?') ? '&' : '?') + 'sniff=1']);
+        break; // 第一条可用线路即停，不再解剩余嵌套（旧版慢的主因）
       }
-      if (direct) plays.push(['MP4', direct]);
-      if (!m3u8 && !direct) plays.push(['Embed', emb]);
+      if (direct) {
+        plays.push(['MP4', direct]);
+        break;
+      }
+      // 未解出：继续试下一个嵌套
     }
     if (!plays.length) plays.push(['原页', url]);
 
@@ -361,11 +349,11 @@ async function detail(reqIn) {
     }
     list.push({
       vod_id: url,
-      vod_name: name || 'KoreanBJ',
+      vod_name: name || 'Korean BJ',
       vod_pic: pic,
       vod_remarks: '',
       vod_content: '',
-      vod_play_from: 'KoreanBJ',
+      vod_play_from: 'Korean BJ',
       vod_play_url: uniq.join('#'),
     });
   }
@@ -380,15 +368,14 @@ async function play(reqIn) {
   const header = { 'User-Agent': UA, Referer: HOST + '/' };
   if (/^\/\//.test(id)) id = 'https:' + id;
 
-  // 网页播嗅探线（detail 追加的 sniff=1 标记）：直接走 WebView 播放，不再二次解析。
-  // 注意必须在 m3u8/embed 分支之前判断，否则会被 /embed/ 分支重新解析回直链。
+  // 网页播嗅探线：直接走 WebView 播放，不再二次解析。
   if (/[?&]sniff=1\b/.test(id)) {
     const clean = id.replace(/([?&])sniff=1(&|$)/, (m, q, amp) => (amp ? q : ''));
     return { parse: 1, jx: 0, url: clean, header };
   }
 
   // HLS 直链（含 master.txt 伪装的 m3u8，及展开出的变体 index-fX-v1-a1.txt）。
-  // 注意：master 与变体必须带 Referer 才会回 200（实测：无 Referer 回 404），
+  // master 与变体必须带 Referer 才会回 200（无 Referer 回 404），
   // 下面的 header.Referer = HOST + '/' 正好满足；不要把 Referer 去掉。
   if (/\.(m3u8|mp4)(\?|$)/i.test(id) || /master\.txt/i.test(id) || /index-f\d+-v1-a1\.txt/i.test(id) || /^hls$/i.test(flag)) {
     if (/cloudwindow-route|ugc-cdn/i.test(id)) {
@@ -417,12 +404,12 @@ async function search(reqIn) {
   const body = reqIn?.body || {};
   const wd = t(body.wd);
   const pg = Math.max(1, parseInt(body.page, 10) || 1);
-  if (!wd) return { page: pg, pagecount: pg, limit: 24, total: 0, list: [] };
+  if (!wd) return { page: pg, pagecount: pg, limit: 21, total: 0, list: [] };
   const kw = encodeURIComponent(wd);
   const url = pg === 1 ? HOST + '/?s=' + kw : HOST + '/page/' + pg + '/?s=' + kw;
   const html = await getText(url);
   const list = parseList(html);
-  return { list, page: pg, pagecount: pg + 1, limit: 24, total: 9999 };
+  return { list, page: pg, pagecount: pg + 1, limit: 21, total: 9999 };
 }
 
 export default function createSpider() {
