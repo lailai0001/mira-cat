@@ -3,6 +3,17 @@
 // 列表: loop-video /video/slug/
 // 播放: VOE 系 embed → 六层混淆解包 → m3u8/mp4 直出
 // 请求: 双通道 — 先框架 req(axios, MiraPlayer 内核可用)，失败再试 Node 原生 fetch
+// 2026-10-29 修复（yuyuhwa 播不了）：
+// 实测结论（纠正初版误判）：旧 JW setup 正则其实能取到 player-6w.php 的
+// master.txt，详情并非无直链；真正要害是该站 txt 链全程 Referer 门禁——
+// master、变体、分片无 Referer 一律 404（实测），有 Referer 则全通。
+// 设备端播不了最可能卡在播放器是否把 play() 的 Referer 带到变体/分片请求，
+// 或个别文件 host 挂掉/下架（见验证记录）。本次修复三点：
+// ① 三档 master 拆成自动/1080p/720p/480p 可选项（变体相对地址解析）；
+// ② 每条成功链路追加一条「网页播」嗅探线（WebView 自带 Referer 链，可绕过
+//    直链 Referer 透传问题）；③ file: 字段全局兜底（playlist 形态等）。
+// play() 的 Referer: HOST 不可去掉。已死文件（如个别 /e/ 嵌套 404）属片源
+// 下架，代码无法复活。
 import req from '../../util/req.js';
 
 const KEY = 'py_hanbj';
@@ -196,6 +207,17 @@ async function resolveVoe(embedUrl, referer) {
     const f = jw[1].replace(/\\\//g, '/');
     if (/^https?:\/\//i.test(f)) return { m3u8: f, direct: '' };
   }
+  // 2026-10-29 兜底：全局搜 file: "..."（playlist:[{file:}] 等非 setup 直写形态）。
+  // 说明：标准 setup({file:}) 形态旧 JW 正则已能取到，此处只补其它形态；
+  // 只认 http(s)/协议相对、且含 master.txt/.m3u8/hls 的值，排除 vtt 缩略图。
+  const fms = [...html.matchAll(/file:\s*"([^"]+)"/gi)].map((x) => x[1].replace(/\\\//g, '/'));
+  for (const f of fms) {
+    let u = f;
+    if (u.startsWith('//')) u = 'https:' + u;
+    if (/^https?:\/\//i.test(u) && /(master\.txt|\.m3u8|\/hls\d*\/?)/i.test(u) && !/\.vtt$/i.test(u)) {
+      return { m3u8: u, direct: '' };
+    }
+  }
   const cfg = voeDecode(html);
   const src = t(cfg.source);
   if (/\.m3u8/i.test(src) || /^https?:\/\//i.test(src)) {
@@ -205,6 +227,45 @@ async function resolveVoe(embedUrl, referer) {
   if (/^https?:\/\//i.test(dau)) return { m3u8: '', direct: dau };
   if (/^https?:\/\//i.test(src)) return { m3u8: '', direct: src };
   return { m3u8: '', direct: '' };
+}
+
+// 2026-10-29 新增：master 档位展开（清晰度自选）。
+// 实测：player-6w.php 的 master.txt 是三档 master（480p/720p/1080p，
+// 变体为同目录相对文件 index-f1/f2/f3-v1-a1.txt）；vidhide 系 .m3u8
+// master 同理（相对变体）。旧代码只把 master 当一条线出，用户只能看
+// 播放器自动档；现拆成「自动 + 各档位」多条线，由用户自选。
+// master 取不到或无变体时返回 []，调用方回落单条 master 线。
+async function expandMaster(masterUrl, referer) {
+  try {
+    const txt = await getText(masterUrl, referer);
+    if (!txt || !txt.includes('#EXTM3U')) return [];
+    const out = [];
+    const re = /#EXT-X-STREAM-INF:([^\n]*)\n([^\n#][^\n]*)/g;
+    let m;
+    while ((m = re.exec(txt)) !== null) {
+      const attrs = m[1];
+      const rel = m[2].trim();
+      const rm = attrs.match(/RESOLUTION=(\d+)x(\d+)/i);
+      const bm = attrs.match(/BANDWIDTH=(\d+)/i);
+      let label = '';
+      if (rm) {
+        const h = parseInt(rm[2], 10);
+        label = h >= 1080 ? '1080p' : h >= 720 ? '720p' : h >= 480 ? '480p' : (rm[2] + 'p');
+      } else if (bm) {
+        label = Math.round(parseInt(bm[1], 10) / 1000) + 'k';
+      } else {
+        continue;
+      }
+      let u = rel;
+      try { u = new URL(rel, masterUrl).toString(); } catch {}
+      out.push([label, u]);
+    }
+    const order = { '1080p': 0, '720p': 1, '480p': 2 };
+    out.sort((a, b) => (order[a[0]] ?? 9) - (order[b[0]] ?? 9));
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 // ---------- CatPawOpen API ----------
@@ -271,7 +332,19 @@ async function detail(reqIn) {
     const plays = [];
     for (const emb of embeds) {
       const { m3u8, direct } = await resolveVoe(emb, url);
-      if (m3u8) plays.push(['HLS', m3u8]);
+      if (m3u8) {
+        // 多档 master 拆成可选项；展开失败时仍出单条 master 线兜底
+        const vars = await expandMaster(m3u8, emb);
+        if (vars.length) {
+          plays.push(['自动', m3u8]);
+          for (const [lab, u] of vars) plays.push([lab, u]);
+        } else {
+          plays.push(['HLS', m3u8]);
+        }
+        // 网页播嗅探线：WebView 自带 Referer 链，可绕过直链 Referer 透传问题。
+        // play() 见到 sniff=1 标记直接返回 parse:1，不再二次解析。
+        plays.push(['网页播', emb + (emb.includes('?') ? '&' : '?') + 'sniff=1']);
+      }
       if (direct) plays.push(['MP4', direct]);
       if (!m3u8 && !direct) plays.push(['Embed', emb]);
     }
@@ -305,8 +378,17 @@ async function play(reqIn) {
   const header = { 'User-Agent': UA, Referer: HOST + '/' };
   if (/^\/\//.test(id)) id = 'https:' + id;
 
-  // HLS 直链（含 master.txt 伪装的 m3u8）
-  if (/\.(m3u8|mp4)(\?|$)/i.test(id) || /master\.txt/i.test(id) || /^hls$/i.test(flag)) {
+  // 网页播嗅探线（detail 追加的 sniff=1 标记）：直接走 WebView 播放，不再二次解析。
+  // 注意必须在 m3u8/embed 分支之前判断，否则会被 /embed/ 分支重新解析回直链。
+  if (/[?&]sniff=1\b/.test(id)) {
+    const clean = id.replace(/([?&])sniff=1(&|$)/, (m, q, amp) => (amp ? q : ''));
+    return { parse: 1, jx: 0, url: clean, header };
+  }
+
+  // HLS 直链（含 master.txt 伪装的 m3u8，及展开出的变体 index-fX-v1-a1.txt）。
+  // 注意：master 与变体必须带 Referer 才会回 200（实测：无 Referer 回 404），
+  // 下面的 header.Referer = HOST + '/' 正好满足；不要把 Referer 去掉。
+  if (/\.(m3u8|mp4)(\?|$)/i.test(id) || /master\.txt/i.test(id) || /index-f\d+-v1-a1\.txt/i.test(id) || /^hls$/i.test(flag)) {
     if (/cloudwindow-route|ugc-cdn/i.test(id)) {
       header.Referer = 'https://jeremyparticipantanything.com/';
     }
