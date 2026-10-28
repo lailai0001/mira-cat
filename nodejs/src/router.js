@@ -23,7 +23,6 @@ import koreanbj from './spider/video/koreanbj.js';
 import duanju91 from './spider/video/91duanju.js';
 import asmr from './spider/video/asmr.js';
 import pandalive from './spider/video/pandalive.js';
-import march from './spider/video/march.js';
 import jinguo from './spider/video/jinguo.js';
 import chengguo from './spider/video/chengguo.js';
 import yeguo from './spider/video/yeguo.js';
@@ -31,9 +30,7 @@ import mrds from './spider/video/mrds.js';
 import bianfu from './spider/video/bianfu.js';
 import bagua from './spider/video/bagua.js';
 import xnxx from './spider/video/xnxx.js';
-import uu from './spider/video/uu.js';
 import sanjipian from './spider/video/sanjipian.js';
-import woxiu from './spider/video/woxiu.js';
 import juheduanju from './spider/video/juheduanju.js';
 import xingmengasmr from './spider/video/xingmengasmr.js';
 import avjoy from './spider/video/avjoy.js';
@@ -49,7 +46,6 @@ import avhub from './spider/video/avhub.js';
 import sextb from './spider/video/sextb.js';
 import javsb from './spider/video/javsb.js';
 import porncgw from './spider/video/porncgw.js';
-import xhongyan from './spider/video/xhongyan.js';
 import youzidj from './spider/video/youzidj.js';
 import stripchat from './spider/video/stripchat.js';
 import hohoj from './spider/video/hohoj.js';
@@ -63,14 +59,12 @@ import chaturbate from './spider/video/chaturbate.js';
 import asmrba from './spider/video/asmrba.js';
 import hlbdy from './spider/video/hlbdy.js';
 import shipin51 from './spider/video/51shipin.js';
-import erome from './spider/video/erome.js';
 import javneon from './spider/video/javneon.js';
 import dycg66 from './spider/video/dycg66.js';
 import cg91 from './spider/video/cg91.js';
 import noodle from './spider/video/noodle.js';
 import ultra from './spider/video/ultra.js';
 import asian from './spider/video/asian.js';
-import pikped from './spider/video/pikped.js';
 
 const spiders = [
     missav_xptv,
@@ -98,7 +92,6 @@ const spiders = [
     duanju91,
     asmr,
     pandalive,
-    march,
     jinguo,
     chengguo,
     yeguo,
@@ -106,9 +99,7 @@ const spiders = [
     bianfu,
     bagua,
     xnxx,
-    uu,
     sanjipian,
-    woxiu,
     juheduanju,
     xingmengasmr,
     avjoy,
@@ -124,11 +115,10 @@ const spiders = [
     sextb,
     javsb,
     porncgw,
-    xhongyan,
     youzidj,
     stripchat,
     hohoj,
-    rip17, brazz, bigbuttshub, mmtv, javideo, bestjavporn, chaturbate, asmrba, hlbdy, shipin51, erome, javneon, dycg66, cg91, noodle, ultra, asian, pikped,];
+    rip17, brazz, bigbuttshub, mmtv, javideo, bestjavporn, chaturbate, asmrba, hlbdy, shipin51, javneon, dycg66, cg91, noodle, ultra, asian,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
