@@ -10,6 +10,13 @@
 //   与 /videofile/{owner}_{id}.mp4（301 跳到 CDN vid_360p.mp4，带时效 token，
 //   详情时现取现用，播放器跟随重定向即可）；另有 720p/480p/240p 变体但页内只给
 //   videofile 入口，故只返回 videofile 一条线。
+// 2026-10-29 封面修复（只动封面提取，翻页/详情/播放逻辑未动）：
+// 新收录/探索全灭、实时少数坏的根因是 data-src 里的 HTML 实体 &amp; 未解码——
+// img.pvvstream.pro 预览 URL 的 query 参数被 &amp; 拆散（如 tkn 变成 amp;tkn），
+// 浏览器解析 HTML 时会自动还原所以浏览器里正常，但 App 直接拿原值请求会 403；
+// 解码后实测 200 image/jpeg（与 Referer 无关）。cdn2 preview_320.jpg 直链不受影响。
+// 另：实时里 3 条 VK 原图本身已死（上游 404，代理只回 575-790B 占位 PNG，详情页
+// og:image 同样占位），任何渠道都无真封面，属片源问题、代码修不出来，如实保留。
 import req from '../../util/req.js';
 
 const KEY = 'py_noodle';
@@ -52,6 +59,10 @@ async function listSmart(url, referer) {
 function stripTags(s) {
   return String(s || '').replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
 }
+// HTML 属性值里的实体必须还原，否则带 query 参数的图片 URL 会被 &amp; 拆散而 403。
+function decodeEntities(s) {
+  return String(s || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+}
 function parseList(html) {
   const items = [];
   const seen = new Set();
@@ -67,7 +78,7 @@ function parseList(html) {
     if (!title || title.length < 2) continue;
     const pm = blk.match(/data-src="(https?:[^"]+preview_320\.jpg[^"]*)"/i) || blk.match(/data-src="(https?:[^"]+)"/i);
     seen.add(url);
-    items.push({ vod_id: url, vod_name: title, vod_pic: pm ? pm[1] : '' });
+    items.push({ vod_id: url, vod_name: title, vod_pic: pm ? decodeEntities(pm[1]) : '' });
     if (items.length >= 24) break;
   }
   return items;
@@ -221,7 +232,7 @@ async function detail(reqIn) {
     const tm = html.match(/data-video-title-base="([^"]+)"/i);
     const title = tm ? stripTags(tm[1]) : 'NoodleMagazine';
     const om = html.match(/og:image[^>]*content="([^"]+)"/i);
-    list.push({ vod_id: raw, vod_name: title, vod_pic: om ? om[1] : '', vod_play_from: 'NoodleMagazine', vod_play_url: playUrl });
+    list.push({ vod_id: raw, vod_name: title, vod_pic: om ? decodeEntities(om[1]) : '', vod_play_from: 'NoodleMagazine', vod_play_url: playUrl });
   }
   return { list };
 }

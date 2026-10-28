@@ -2,7 +2,9 @@
 // 源站：https://kbjclub.club/（WordPress retrotube 主题，loop-video 卡片）
 // 列表：首页 /、分类 /category/<slug>/、翻页 /page/<n>/、搜索 /?s=<kw>
 // 详情：详情页 player-6w.php 播放器 → JW setup file: master.txt → 三档变体
-//   （自动/1080p/720p/480p）+ 网页播嗅探线；无 player-6w 时回落 /e/ 嵌套（VOE 解包）。
+//   （自动/1080p/720p/480p）；无 player-6w 时回落 /e/ 嵌套（VOE 解包）或 oct4 嵌套
+//   （JW file 为 .php 播放列表，需现取现验）。死链（master 取不到）不推死线，
+//   改试下一个嵌套；全部嵌套都死才回落原页。详情不再生成网页播线。
 // 速度（相对旧版的主要改动）：详情只解第一条可用线路即停，旧版逐条解全部
 //   嵌套（详情页含多个 embed 时要多花数倍请求）；play() 直链直接返回不二次请求。
 // txt 链全程 Referer 门禁：master、变体、分片无 Referer 一律 404，
@@ -199,8 +201,10 @@ async function resolveVoe(embedUrl, referer) {
   if (hits.length && !/test-videos/i.test(hits[0])) return { m3u8: hits[0], direct: '' };
   const jw = html.match(/jwplayer\([^)]*\)\.setup\(\{\s*file:\s*"([^"]+)"/i);
   if (jw) {
-    const f = jw[1].replace(/\\\//g, '/');
-    if (/^https?:\/\//i.test(f)) return { m3u8: f, direct: '' };
+    // JW file 可能是相对地址（如 oct4 的 /embed/ppc*.php），须按嵌套页补全；
+    // 扩展名不限（.php 也可能是 HLS 播放列表），由调用方现取现验。
+    const u = absUrl(jw[1], embedUrl);
+    if (/^https?:\/\//i.test(u)) return { m3u8: u, direct: '' };
   }
   const fms = [...html.matchAll(/file:\s*"([^"]+)"/gi)].map((x) => x[1].replace(/\\\//g, '/'));
   for (const f of fms) {
@@ -221,38 +225,43 @@ async function resolveVoe(embedUrl, referer) {
   return { m3u8: '', direct: '' };
 }
 
-// master 档位展开（清晰度自选）：master.txt / .m3u8 变体 → 自动 + 各档位。
-// master 取不到或无变体时返回 []，调用方回落单条 master 线。
+// master 文本解析（清晰度自选）：变体 → 各档位（降序）；无变体返回 []。
+function parseMasterText(txt, baseUrl) {
+  const out = [];
+  const re = /#EXT-X-STREAM-INF:([^\n]*)\n([^\n#][^\n]*)/g;
+  let m;
+  while ((m = re.exec(txt)) !== null) {
+    const attrs = m[1];
+    const rel = m[2].trim();
+    const rm = attrs.match(/RESOLUTION=(\d+)x(\d+)/i);
+    const bm = attrs.match(/BANDWIDTH=(\d+)/i);
+    let label = '';
+    if (rm) {
+      const h = parseInt(rm[2], 10);
+      label = h >= 1080 ? '1080p' : h >= 720 ? '720p' : h >= 480 ? '480p' : (rm[2] + 'p');
+    } else if (bm) {
+      label = Math.round(parseInt(bm[1], 10) / 1000) + 'k';
+    } else {
+      continue;
+    }
+    let u = rel;
+    try { u = new URL(rel, baseUrl).toString(); } catch {}
+    out.push([label, u]);
+  }
+  const order = { '1080p': 0, '720p': 1, '480p': 2 };
+  out.sort((a, b) => (order[a[0]] ?? 9) - (order[b[0]] ?? 9));
+  return out;
+}
+
+// master 档位展开：取不到（死链，如随机快闪域名已死/被墙）返回 live:false，
+// 调用方不得推死线；取到但无变体返回 live:true, vars:[]（单码流，已验可达）。
 async function expandMaster(masterUrl, referer) {
   try {
     const txt = await getText(masterUrl, referer);
-    if (!txt || !txt.includes('#EXTM3U')) return [];
-    const out = [];
-    const re = /#EXT-X-STREAM-INF:([^\n]*)\n([^\n#][^\n]*)/g;
-    let m;
-    while ((m = re.exec(txt)) !== null) {
-      const attrs = m[1];
-      const rel = m[2].trim();
-      const rm = attrs.match(/RESOLUTION=(\d+)x(\d+)/i);
-      const bm = attrs.match(/BANDWIDTH=(\d+)/i);
-      let label = '';
-      if (rm) {
-        const h = parseInt(rm[2], 10);
-        label = h >= 1080 ? '1080p' : h >= 720 ? '720p' : h >= 480 ? '480p' : (rm[2] + 'p');
-      } else if (bm) {
-        label = Math.round(parseInt(bm[1], 10) / 1000) + 'k';
-      } else {
-        continue;
-      }
-      let u = rel;
-      try { u = new URL(rel, masterUrl).toString(); } catch {}
-      out.push([label, u]);
-    }
-    const order = { '1080p': 0, '720p': 1, '480p': 2 };
-    out.sort((a, b) => (order[a[0]] ?? 9) - (order[b[0]] ?? 9));
-    return out;
+    if (!txt || !txt.includes('#EXTM3U')) return { live: false, vars: [] };
+    return { live: true, vars: parseMasterText(txt, masterUrl) };
   } catch {
-    return [];
+    return { live: false, vars: [] };
   }
 }
 
@@ -321,16 +330,26 @@ async function detail(reqIn) {
     for (const emb of embeds) {
       const { m3u8, direct } = await resolveVoe(emb, url);
       if (m3u8) {
-        const vars = await expandMaster(m3u8, emb);
-        if (vars.length) {
+        if (/\.(m3u8|txt)(\?|$)/i.test(m3u8)) {
+          const r = await expandMaster(m3u8, emb);
+          if (r.live && r.vars.length) {
+            plays.push(['自动', m3u8]);
+            for (const [lab, u] of r.vars) plays.push([lab, u]);
+            break; // 第一条可用线路即停，不再解剩余嵌套（旧版慢的主因）
+          }
+          if (r.live) { plays.push(['自动', m3u8]); break; } // 单码流，已验可达
+          continue; // 死链：不推死线，试下一个嵌套
+        }
+        if (/\.mp4(\?|$)/i.test(m3u8)) { plays.push(['自动', m3u8]); break; }
+        // 其它形式（如 oct4 的 .php 播放列表）：现取现验，确为 m3u8 才推。
+        const txt = await getText(m3u8, emb);
+        if (txt && txt.includes('#EXTM3U')) {
+          const vars = parseMasterText(txt, m3u8);
           plays.push(['自动', m3u8]);
           for (const [lab, u] of vars) plays.push([lab, u]);
-        } else {
-          plays.push(['HLS', m3u8]);
+          break;
         }
-        // 网页播嗅探线：WebView 自带 Referer 链，可绕过直链 Referer 透传问题。
-        plays.push(['网页播', emb + (emb.includes('?') ? '&' : '?') + 'sniff=1']);
-        break; // 第一条可用线路即停，不再解剩余嵌套（旧版慢的主因）
+        continue; // 验不出播放列表，试下一个嵌套
       }
       if (direct) {
         plays.push(['MP4', direct]);
@@ -368,10 +387,16 @@ async function play(reqIn) {
   const header = { 'User-Agent': UA, Referer: HOST + '/' };
   if (/^\/\//.test(id)) id = 'https:' + id;
 
-  // 网页播嗅探线：直接走 WebView 播放，不再二次解析。
+  // 旧包缓存的网页播线（新详情不再生成）：仍走 WebView，免得已缓存的旧详情点开就坏。
   if (/[?&]sniff=1\b/.test(id)) {
     const clean = id.replace(/([?&])sniff=1(&|$)/, (m, q, amp) => (amp ? q : ''));
     return { parse: 1, jx: 0, url: clean, header };
+  }
+
+  // oct4 的 .php 播放列表（detail 已验其返回 #EXTM3U）：直接当 HLS 流出，
+  // 不可再当嵌套页二次解析（它含 /embed/，否则会误入下面的嵌套分支）。
+  if (/\.php(\?|$)/i.test(id)) {
+    return { parse: 0, jx: 0, url: id, header };
   }
 
   // HLS 直链（含 master.txt 伪装的 m3u8，及展开出的变体 index-fX-v1-a1.txt）。
