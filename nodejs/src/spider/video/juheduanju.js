@@ -254,8 +254,22 @@ async function qxAuth() {
     'platform': '1', 'user_agent': QX_UA, 'content-type': 'application/json; charset=utf-8',
   });
   const tk = j && j.data && typeof j.data === 'object' ? String(j.data.token || '') : '';
-  if (tk) { qxToken = tk; qxTokenAt = Date.now(); }
-  return tk;
+  if (tk) { qxToken = tk; qxTokenAt = Date.now(); return tk; }
+  // v3 拿不到 token（App 内裸 base64 体 + JSON 头可能被变形，或服务端 2010007 繁忙）时，
+  // 改走星芽同款 v1 表单登录（已实测：v1 token 可用于七星现有全链路，列表/详情/搜索计数与 v3 一致）
+  try {
+    const lh = {
+      'User-Agent': 'okhttp/4.10.0', 'Content-Type': 'application/x-www-form-urlencoded',
+      'x-app-id': '7', 'platform': '1', 'version_name': '3.3.1', 'app_version': '3.3.1',
+      'device_platform': 'android', 'device_id': XY_DEVICE, 'device_type': 'RMX1931',
+      'device_brand': 'realme', 'os_version': '9', 'channel': 'default', 'uuid': XY_UUID,
+    };
+    const form = 'device=' + XY_DEVICE + '&install_first_open=false&first_install_time=1723214205125&last_update_time=1723214205125&report_link_url=';
+    const j2 = await httpPostForm(QX_AUTH + '/user/v1/account/login', form, lh);
+    const tk2 = j2 && j2.data && typeof j2.data === 'object' ? String(j2.data.token || '').trim() : '';
+    if (tk2) { qxToken = tk2; qxTokenAt = Date.now(); return tk2; }
+  } catch (e) { /* v1 也失败则返回空 */ }
+  return '';
 }
 function qxH(tk) { return { 'authorization': tk, 'platform': '1', 'version_name': '3.8.3.1', 'User-Agent': QX_UA }; }
 function qxCard(item, catName) {
@@ -674,10 +688,10 @@ async function jwQuery(params) {
 }
 async function jwQueryPage(params) {
   const j = await httpGetJson(JW_SITE + '/api.php/provide/vod/?' + new URLSearchParams(params).toString(), jwH());
-  if (!j || j.code !== 1) return { items: [], hasMore: false };
+  if (!j || j.code !== 1) return { items: [], hasMore: false, total: 0, apiPagecount: 0 };
   const items = Array.isArray(j.list) ? j.list : [];
   const pg = parseInt(j.page, 10) || 1, pgc = parseInt(j.pagecount, 10) || 1;
-  return { items, hasMore: items.length > 0 && pg < pgc };
+  return { items, hasMore: items.length > 0 && pg < pgc, total: parseInt(j.total, 10) || 0, apiPagecount: pgc };
 }
 function jwPlayEps(raw) {
   let best = [];
@@ -696,8 +710,24 @@ function jwPlayEps(raw) {
 const juwu = {
   cats: JW_CATS,
   async list(cat, page) {
-    const { items, hasMore } = await jwQueryPage({ ac: 'detail', t: cat || '1', pg: String(page) });
-    return { list: items.map(jwCard).filter(Boolean), hasMore };
+    // 剧屋 API 每页只给 3 条（limit 参数无效）：App 一页映射为 M 页 API，并行合并凑满一排
+    const M = 8;
+    const start = (page - 1) * M + 1, end = page * M;
+    const jobs = [];
+    for (let pg = start; pg <= end; pg++) jobs.push(jwQueryPage({ ac: 'detail', t: cat || '1', pg: String(pg) }).catch(() => ({ items: [], hasMore: false, total: 0, apiPagecount: 0 })));
+    const pages = await Promise.all(jobs);
+    const seen = new Set(), list = [];
+    let total = 0, apiPagecount = 0;
+    for (const p of pages) {
+      if ((p.total || 0) > total) total = p.total;
+      if ((p.apiPagecount || 0) > apiPagecount) apiPagecount = p.apiPagecount;
+      for (const it of (p.items || []).map(jwCard).filter(Boolean)) {
+        if (seen.has(it.vod_id)) continue;
+        seen.add(it.vod_id); list.push(it);
+      }
+    }
+    const pagecount = apiPagecount > 0 ? Math.ceil(apiPagecount / M) : (list.length > 0 ? page + 1 : page);
+    return { list, hasMore: list.length > 0 && page < pagecount, total, pagecount };
   },
   async search(wd) {
     const items = await jwQuery({ ac: 'detail', wd, pg: '1' });
@@ -889,13 +919,13 @@ async function category(reqIn) {
   const cats = platCats(pkey);
   const sub = String((body.extend && body.extend.class) || body.class || cats[0].type_id);
   const valid = cats.some(c => c.type_id === sub) ? sub : cats[0].type_id;
-  let list = [], hasMore = false;
+  let list = [], hasMore = false, rPagecount = 0, rTotal = 0;
   try {
     const r = await plat.list(valid, page);
-    if (r && typeof r === 'object' && !Array.isArray(r)) { list = r.list || []; hasMore = !!r.hasMore; }
+    if (r && typeof r === 'object' && !Array.isArray(r)) { list = r.list || []; hasMore = !!r.hasMore; if (r.pagecount) rPagecount = r.pagecount; if (r.total) rTotal = r.total; }
     else if (Array.isArray(r)) { list = r; hasMore = list.length >= 12; }
   } catch (e) {}
-  return { page, pagecount: hasMore ? page + 1 : page, limit: list.length, total: 9999, list };
+  return { page, pagecount: rPagecount || (hasMore ? page + 1 : page), limit: list.length, total: rTotal || 9999, list };
 }
 
 async function detail(reqIn) {

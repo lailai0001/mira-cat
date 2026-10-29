@@ -70,22 +70,41 @@ function goodPage(html) {
 }
 
 const pageCache = new Map(); // target url -> { html, at }，只缓存 goodPage 真页 180 秒
+let lastFetchStarted = 0, lastFetchFromCache = false;
 async function fetchPage(url, bypassCooldown = false) {
   const hit = pageCache.get(url);
-  if (hit && Date.now() - hit.at < 180000) return hit.html;
-  const t0 = Date.now();
-  for (const ch of PAGE_CHANNELS) {
-    if (Date.now() - t0 > PAGE_BUDGET_MS) break;
-    if (!bypassCooldown && (chanDeadUntil[ch.name] || 0) > Date.now()) continue;
-    const html = await getText(ch.build(url), ch.timeout);
-    if (goodPage(html)) {
-      delete chanDeadUntil[ch.name];
-      pageCache.set(url, { html, at: Date.now() });
-      return html;
+  if (hit && Date.now() - hit.at < 180000) { lastFetchStarted = 0; lastFetchFromCache = true; return hit.html; }
+  lastFetchFromCache = false;
+  const live = PAGE_CHANNELS.filter((ch) => bypassCooldown || (chanDeadUntil[ch.name] || 0) <= Date.now());
+  lastFetchStarted = live.length;
+  if (!live.length) return '';
+  // 并行取页：各通道同时发出，首个 goodPage 胜出；失败者只记熔断、不写缓存、不覆盖胜者；
+  // req 无 signal，失败者取消不了，会在后台跑到各自超时后自行结算（结果丢弃）
+  return new Promise((resolve) => {
+    let done = false, settled = 0;
+    const timer = setTimeout(() => { if (!done) { done = true; resolve(''); } }, PAGE_BUDGET_MS);
+    const finish = (html) => { if (done) return; done = true; clearTimeout(timer); resolve(html); };
+    for (const ch of live) {
+      (async () => {
+        let html = '';
+        try { html = await getText(ch.build(url), ch.timeout); } catch (e) { html = ''; }
+        if (done) {
+          if (goodPage(html)) delete chanDeadUntil[ch.name];
+          else chanDeadUntil[ch.name] = Date.now() + CHAN_COOLDOWN_MS;
+          return;
+        }
+        if (goodPage(html)) {
+          delete chanDeadUntil[ch.name];
+          pageCache.set(url, { html, at: Date.now() });
+          finish(html);
+        } else {
+          chanDeadUntil[ch.name] = Date.now() + CHAN_COOLDOWN_MS;
+          settled++;
+          if (settled >= live.length) finish('');
+        }
+      })();
     }
-    chanDeadUntil[ch.name] = Date.now() + CHAN_COOLDOWN_MS;
-  }
-  return '';
+  });
 }
 
 function parseCards(html) {
@@ -165,8 +184,8 @@ async function category(reqIn) {
   }
   let html = await fetchPage(url);
   let items = parseCards(html);
-  if (!items.length) {
-    // 空结果整轮重试最多 1 次，且绕开熔断做一次真重试（熔断期内旧重试恒为 0ms 空操作）
+  if (!items.length && lastFetchStarted === 0 && !lastFetchFromCache) {
+    // 首轮一个通道都没启动（全被熔断跳过）时，才绕开熔断做一次真重试；首轮已实打实试过全部通道时不再烧第二轮
     html = await fetchPage(url, true);
     items = parseCards(html);
   }

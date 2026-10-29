@@ -572,7 +572,7 @@ async function detail(reqIn) {
       vod_pic: data.thumb ? (signed.get(t(data.thumb)) || '') : '',
       vod_content: (data.content || '').replace(/<[^>]+>/g, '').trim(),
       vod_play_from: 'Uu视频',
-      vod_play_url: `正片$${vodId}`,
+      vod_play_url: `自动$${vodId}#720p$${vodId}@720p#480p$${vodId}@480p`,
     };
     subRegister(vodId, vod);
     list.push(vod);
@@ -585,6 +585,10 @@ async function play(reqIn) {
   let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
   if (id.includes('$')) id = id.split('$').pop().trim();
+  // 档位后缀（detail 三集用 @ 编码）：播放地址 API 只认纯数字 id，须先剥离；字幕键也用干净 id
+  let quality = '';
+  const qm = id.match(/@(720p|480p)$/);
+  if (qm) { quality = qm[1]; id = id.slice(0, -qm[0].length); }
   const subsP = subSearchAll(subNormKey(id)).catch(() => []);
 
   // 如果已经是完整 URL，直接返回
@@ -607,7 +611,10 @@ async function play(reqIn) {
   try {
     const playData = await apiCallAuth('/api/v2/home/user/video/play/url', { id });
     if (playData) {
-      const relUrl = playData.masterUrl || playData.p720Url || playData.p480Url || '';
+      let relUrl = '';
+      if (quality === '720p') relUrl = playData.p720Url || playData.masterUrl || playData.p480Url || '';
+      else if (quality === '480p') relUrl = playData.p480Url || playData.masterUrl || playData.p720Url || '';
+      else relUrl = playData.masterUrl || playData.p720Url || playData.p480Url || '';
       if (relUrl) {
         const cdns = await getCdnList();
         // cdnId 提示用哪个 CDN；默认用第一个
@@ -617,7 +624,9 @@ async function play(reqIn) {
           const cid = parseInt(cdnIdMatch[1], 10);
           if (cid >= 0 && cid < cdns.length) cdnIdx = cid;
         }
-        const fullUrl = cdns[cdnIdx].replace(/\/$/, '') + relUrl;
+        let fullUrl = cdns[cdnIdx].replace(/\/$/, '') + relUrl;
+        // cdnId=2 的分片实测比 cdnId=0 快（单视频 n=2，弱证据；真机无改善则 revert）
+        if (fullUrl.includes('cdnId=0')) fullUrl = fullUrl.replace('cdnId=0', 'cdnId=2');
         return subAttach({ parse: 0, url: fullUrl, header: { Referer: HOST + '/', 'User-Agent': UA } }, subsP);
       }
     }
