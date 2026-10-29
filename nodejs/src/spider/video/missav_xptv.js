@@ -14,6 +14,8 @@ const CLASSES = [
   { type_id: 'dm513/cn/new', type_name: '最近更新' },
   { type_id: 'dm509/cn/release', type_name: '新作上市' },
   { type_id: 'dm561/cn/uncensored-leak', type_name: '无码流出' },
+  { type_id: 'cn/genres/%E5%B7%A8%E4%B9%B3', type_name: '巨乳' },
+  { type_id: 'cn/genres/%E5%A4%A7%E5%B1%81%E8%82%A1', type_name: '大屁股' },
   { type_id: 'dm2091/cn/genres/VR', type_name: 'VR' },
   { type_id: 'dm242/cn/today-hot', type_name: '今日热门' },
   { type_id: 'dm168/cn/weekly-hot', type_name: '本週热门' },
@@ -40,8 +42,6 @@ const CLASSES = [
   { type_id: 'dm34/cn/madou', type_name: '麻豆传媒' },
   { type_id: 'dm17/cn/twav', type_name: 'TWAV AV' },
   { type_id: 'dm15/cn/furuke', type_name: 'Furuke AV' },
-  { type_id: 'cn/censored', type_name: '有码' },
-  { type_id: 'cn/uncensored', type_name: '无码' },
 ];
 
 const M3U8_PREFIXES = [
