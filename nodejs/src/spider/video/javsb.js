@@ -719,6 +719,8 @@ async function tryOfficialStream(hash, playerUrl, deadline) {
 // 全部校验失败时 play 返回未校验的全链地址作兜底 (见 play 注释)。
 const workerState = new Map(); // hash -> { st, form, t, promise }
 const WORKER_STATE_TTL = 600000;
+const workerFailAt = new Map(); // hash -> 失败时刻；60s 内连点直接回兜底，不重烧前台预算
+const WORKER_FAIL_TTL = 60000;
 
 // 第八轮: 详情URL -> hash 登记 (detail 解析时写入), play 命中即免去
 // 开头重抓详情页的一跳 (第七轮每次 play 先重抓, 坏窗口白吃数秒)。
@@ -1027,8 +1029,8 @@ async function play(reqIn) {
     }
   }
   if (hash && JAVSB_WORKER) {
-    // 第八轮 Worker 路径: 已知结果秒回 -> 预热短等 (<=6s) -> 单次
-    // 有界尝试 (<=10s) -> 未校验兜底; 全程 <=18s。
+    // 第八轮 Worker 路径: 已知结果秒回 -> 60s 内失败结论直接回兜底 ->
+    // 预热短等 (<=6s) -> 两形态各一掷（各 <=5s） -> 未校验兜底；全程 <=18s。
     const wHead = { 'User-Agent': UA, 'Referer': REFERER };
     // 第十一轮探针: 拿到 hash 即与主线并行点火 (结论只进线路名)
     const probeP = probeDirectRaw(hash).catch(() => '探针超时');
@@ -1054,6 +1056,14 @@ async function play(reqIn) {
     };
     let okS = freshOk();
     if (okS && (!formWanted || formWanted === 'proxy' || formWanted === okS.form)) return subAttach(await withProbeName(await fromOk(okS), probeP, deadline), subsP);
+    // 60s 内刚失败过：前台不再重烧等待与尝试，直接回兜底（后台预热仍在
+    // 跑，暖好后下一次点播走 freshOk 秒回）。
+    const failAt = workerFailAt.get(hash);
+    if (failAt && Date.now() - failAt < WORKER_FAIL_TTL) {
+      const fb0 = workerUrlFor(hash, formWanted || 'proxy');
+      noteLayer('worker-unverified-cached', 0, false, fb0);
+      return subAttach(await withProbeName({ parse: 0, url: fb0, header: wHead }, probeP, deadline), subsP);
+    }
     // 预热进行中: 短等 <=6s (第七轮等 20s 是 53s 的主因之一)
     e = workerState.get(hash);
     if (e && e.st === 'pending' && e.promise && remain() > 4000) {
@@ -1062,17 +1072,27 @@ async function play(reqIn) {
       okS = freshOk();
       if (okS && (!formWanted || formWanted === 'proxy' || formWanted === okS.form)) return subAttach(await withProbeName(await fromOk(okS), probeP, deadline), subsP);
     }
-    // 单次有界尝试 (<=10s): 只掷一轮, 不再多轮串行叠加
+    // 两形态各一掷（各 <=5s）：单次 10s 调用会让直链形态吃光预算、全链
+    // 形态没机会；分开掷保证两形态各有一次完整机会。
     if (remain() > 2500) {
-      const got = await playAcquireOnce(hash, formWanted, Math.min(10000, remain() - 1200));
+      let got = '';
+      for (const f of (formWanted ? [formWanted] : ['direct', 'proxy'])) {
+        if (remain() <= 2500) break;
+        got = await playAcquireOnce(hash, f, Math.min(5000, remain() - 1200));
+        if (got) break;
+      }
       if (got) {
         const en = workerState.get(hash) || { st: 'ok', form: got, t: Date.now(), promise: null };
         en.st = 'ok'; en.form = got; en.t = Date.now();
         workerState.set(hash, en);
+        workerFailAt.delete(hash);
         noteLayer('worker-play-once', 0, true, workerUrlFor(hash, got));
         return subAttach(await withProbeName({ parse: 0, url: workerUrlFor(hash, got), header: wHead }, probeP, deadline), subsP);
       }
     }
+    // 本次前台尝试失败：记 60s 结论（60s 内连点直接回兜底），并顺手清旧条目。
+    workerFailAt.set(hash, Date.now());
+    if (workerFailAt.size > 40) workerFailAt.delete(workerFailAt.keys().next().value);
     // 未校验兜底: 立即回想要形态的 Worker 地址 (播放器自取 = 新一
     // 轮竞速; 配合 detail 双线, 可换另一条线再掷一次)。
     const fb = workerUrlFor(hash, formWanted || 'proxy');

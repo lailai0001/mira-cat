@@ -288,17 +288,17 @@ function absUrl(u, base) {
   try { return new URL(u, base).toString(); } catch (e) { return u; }
 }
 
-// 封面解密出图: 走用户自建 Worker (真实 https 地址; App 图片加载走不了本地 js2p 代理)。
-// Worker 有域名白名单, image.cpckgr.cn 未放行 (实测 400 Invalid URL); cpckgr 与 pic.jtzatly.cn
-// 是同路径镜像 (jtzatly 已放行), 先换域名再拼 Worker 地址 (与 hl818/bagua 的 IMG_PROXY 拼法一致)。
+// 封面解密出图: 走 bagua 图片解密代理 (App 图片加载走不了本地 js2p 代理)。
+// 原图 host image.cpckgr.cn 直接走代理出图（实测 200 image/jpeg）；
+// 2026-10-29 前的 jtzatly 换域名写法已证实 502，不要再换域名。
 const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
 function picProxy(pic, reqIn) {
   pic = t(pic);
   if (!pic) return pic;
   if (/workers\.dev/i.test(pic)) return pic;
   if (!/cpckgr\.cn/i.test(pic)) return pic;
-  const swapped = pic.replace(/^[a-z]+:\/\/[^/]*cpckgr\.cn/i, 'https://pic.jtzatly.cn');
-  return IMG_PROXY + encodeURIComponent(swapped);
+  // jtzatly 镜像假说已废弃（实测换域名后代理 502）：直接代理原图出图。
+  return IMG_PROXY + encodeURIComponent(pic);
 }
 
 // m3u8 仅修正相对地址 -> 绝对地址; 分片/密钥本就是公开绝对地址, 保持直连不经代理
@@ -363,8 +363,9 @@ async function fetchManual(url, headers) {
 }
 
 // GET /proxy/m3u8?u={b64url 目标}&r={b64url referer}
-// 目标是 /media/{code} 时: 循环解析 (fangzhou 型 /media 是抽奖: 200 真 m3u8 或 302 死网关, 抽到死链重抽);
-// 目标是直链 m3u8 时: 拉取后只改 Content-Type 返回。分片/密钥一律保持公开直连, 不经代理。
+// 跟随跳转直接取最终清单（今日 /media 12/12 均为 302 到 jw-hls 直链，
+// fangzhou 抽奖模型已过时）；拉取后只改 Content-Type 返回。分片/密钥
+// 一律保持公开直连, 不经代理。拿不到清单才 302 降级回原目标。
 async function m3u8Proxy(request, reply) {
   const q = request?.query || {};
   if (!q.u) { reply.code(400).send('missing u'); return; }
@@ -382,32 +383,14 @@ async function m3u8Proxy(request, reply) {
     reply.send(rewriteM3u8(raw, base));
   };
 
-  const mediaM = target.match(/\/media\/([A-Za-z0-9\-_]+)/);
-  if (!mediaM) {
+  // 不再手动处理 302：req 跟随跳转直接拿到最终清单（今日 /media 均为
+  // 302 到 jw-hls 直链）。拿到 #EXTM3U 即以标准 Content-Type 返回；
+  // 拿不到才 302 降级回原目标。
+  for (let i = 0; i < 3; i++) {
     const raw = await fetchText(target, headers);
     if (raw && raw.includes('#EXTM3U')) { sendList(raw, target); return; }
-    reply.redirect(target);
-    return;
   }
-
-  let lastLoc = '';
-  for (let i = 0; i < 5; i++) {
-    const res = await fetchManual(target, headers);
-    if (res.status === 200 && res.body && res.body.includes('#EXTM3U')) {
-      sendList(res.body, target);
-      return;
-    }
-    const loc = res.location ? absUrl(res.location, target) : '';
-    if (loc) {
-      lastLoc = loc;
-      const raw = await fetchText(loc, headers);
-      if (raw && raw.includes('#EXTM3U')) { sendList(raw, loc); return; }
-      // 目标拉不到 (fangzhou 死网关 502 等): 换一次 /media 重抽
-    }
-    // status 异常/无跳转: 也重抽 (每次 /media 都是新 auth_key/新后端节点)
-  }
-  // 全部尝试失败: 降级 302 到最后一次的跳转目标 (与旧行为一致, 不比现状更差)
-  reply.redirect(lastLoc || target);
+  reply.redirect(target);
 }
 
 async function play(reqIn) {

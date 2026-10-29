@@ -246,7 +246,7 @@ async function getHtml(url, extraHeaders) {
 
 // play 专用快速 POST /ajax/player: 只打详情页同域名，8s 超时，
 // req -> fetch 两通道各一次，失败立即放弃 (不做旧 postJson 的多域名多轮串行)
-async function postJsonFast(durl, body) {
+async function postJsonFast(durl, body, extra) {
   let ajaxUrl = '';
   try {
     ajaxUrl = new URL(durl).origin + '/ajax/player';
@@ -258,6 +258,7 @@ async function postJsonFast(durl, body) {
     'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
     'Accept': 'application/json, text/javascript, */*; q=0.01',
     'X-Requested-With': 'XMLHttpRequest',
+    ...(extra || {}),
   };
   // 通道1: 框架 req
   try {
@@ -561,8 +562,8 @@ async function resolveEmbed(embedUrl, durl) {
 }
 
 // POST /ajax/player 取某条线路的 embed URL
-async function ajaxEmbed(durl, ep, filmId) {
-  const resp = await postJsonFast(durl, { episode: ep.episode, filmId });
+async function ajaxEmbed(durl, ep, filmId, extra) {
+  const resp = await postJsonFast(durl, { episode: ep.episode, filmId }, extra);
   if (!resp) return '';
   try {
     const json = JSON.parse(resp);
@@ -684,6 +685,26 @@ function extractDefaultEmbed(html) {
   return m ? fixUrl(m[1]) : '';
 }
 
+
+// 线路多集：详情页按钮已含 F4/SW/DD/FL/US 等线路名，按优先级出集
+// （F4 > SW > PM > FL > DD > US > ST > PP，其余最后）；无按钮时回落正片。
+// 集 id 形如 F4$<durl>@F4，play 剥离 @ 后缀作优先线路提示。
+function lineEpisodes(html, durl) {
+  const { episodes } = extractPlayerInfo(html);
+  const ORDER = { F4: 0, SW: 1, PM: 2, FL: 3, DD: 4, US: 5, ST: 6, PP: 7 };
+  const seen = new Set();
+  const names = [];
+  for (const ep of episodes) {
+    const nm = t(ep.name).toUpperCase();
+    if (!nm || seen.has(nm)) continue;
+    seen.add(nm);
+    names.push(nm);
+  }
+  names.sort((a, b) => (ORDER[a] ?? 90) - (ORDER[b] ?? 90));
+  if (!names.length) return `正片$${durl}`;
+  return names.map(nm => `${nm}$${durl}@${nm}`).join('#');
+}
+
 async function detail(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -718,7 +739,7 @@ async function detail(reqIn) {
     vod_remarks: '',
     vod_content: name,
     vod_play_from: 'SexTB',
-    vod_play_url: `正片$${durl}`,
+    vod_play_url: lineEpisodes(html, durl),
   };
   subRegister(id, vod);
   return { list: [vod] };
@@ -730,6 +751,10 @@ async function play(reqIn) {
   if (!id) return { parse: 0, url: '' };
   // id 可能是 "正片$https://..." 形式，取 $ 后面的完整 URL
   if (id.includes('$')) id = id.split('$').pop().trim();
+  // 线路多集的 @F4/@SW 后缀：先剥离作优先线路提示，再算 durl
+  let hint = '';
+  const hm = id.match(/@([A-Za-z0-9]+)$/);
+  if (hm) { hint = hm[1].toUpperCase(); id = id.slice(0, -hm[0].length); }
   const subsP = subSearchAll(subNormKey(id)).catch(() => []);
   if (/\.m3u8(\?|$)/i.test(id)) {
     return subAttach({ parse: 0, url: id, header: { 'User-Agent': UA } }, subsP);
@@ -791,7 +816,21 @@ async function play(reqIn) {
     }
   }
 
-  // —— 第二步: 借线（POST /ajax/player），最多 2 条 ——
+  // 会话态补强（best-effort）：直连详情页取 Set-Cookie 回带到 ajax POST，
+  // 并补浏览器 XHR 本来就会带的 Origin；拿不到则与今天一致，绝不因此失败。
+  let sessionHeaders = {};
+  try { sessionHeaders.Origin = new URL(durl).origin; } catch (e) {}
+  try {
+    const ck = await req.get(durl, { headers: { 'User-Agent': UA }, timeout: 6000 });
+    const sc = ck && ck.headers && (ck.headers['set-cookie'] || ck.headers['Set-Cookie']);
+    if (sc) {
+      const arr = Array.isArray(sc) ? sc : [sc];
+      const cookie = arr.map(s => String(s).split(';')[0].trim()).filter(Boolean).join('; ');
+      if (cookie) sessionHeaders.Cookie = cookie;
+    }
+  } catch (e) { /* 无会话态也继续 */ }
+
+  // —— 第二步: 借线（POST /ajax/player），全部线路按优先级试 ——
   // 优先级: F4 > SW > PM > FL > DD > US > ST > PP（F4 借线只需一次 ajax
   // 就能直返 Worker 地址，最快；PM 次之；SW 的 Worker 链需探活确认）
   const PREF = { F4: 0, SW: 1, PM: 2, FL: 3, DD: 4, US: 5, ST: 6, PP: 7 };
@@ -800,18 +839,24 @@ async function play(reqIn) {
     const pb = PREF[t(b.name).toUpperCase()] ?? 90;
     return pa - pb;
   });
+  // 用户点了指定线路集：该线路排最先（ajax 可能走通页面 embed 走不通的路）
+  if (hint) {
+    const hi = sorted.findIndex(e => t(e.name).toUpperCase() === hint);
+    if (hi > 0) { const [h] = sorted.splice(hi, 1); sorted.unshift(h); }
+  }
   const seenName = new Set();
   let borrowed = 0;
   for (const ep of sorted) {
-    if (borrowed >= 2 || Date.now() > deadline) break;
+    if (Date.now() > deadline) break;
     const nm = t(ep.name).toUpperCase();
     if (seenName.has(nm)) continue;
     seenName.add(nm);
-    // 默认线路（episodes[0]）的 embed 已在第一步用过，同线跳过省一次 ajax
-    if (defEmbed && episodes.length && ep.episode === episodes[0].episode) continue;
+    // 默认线路（episodes[0]）的 embed 已在第一步用过，同线跳过省一次 ajax；
+    // 但用户指定点的线路除外（ajax 可能走通页面 embed 走不通的路）
+    if (defEmbed && episodes.length && ep.episode === episodes[0].episode && nm !== hint) continue;
     if (!filmId) break;
     borrowed++;
-    const embed = await ajaxEmbed(durl, ep, filmId);
+    const embed = await ajaxEmbed(durl, ep, filmId, sessionHeaders);
     if (!embed) continue;
     if (!firstEmbed) firstEmbed = embed;
     const host = hostOf(embed);

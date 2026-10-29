@@ -367,7 +367,14 @@ async function detail(reqIn) {
         if (det.date) vod.vod_year = String(det.date);
         if (det.desc) vod.vod_content = '🦋 蝴蝶影视官方交流群: @tvshare23\n\n' + det.desc;
         const episodes = det.episodes || [];
-        if (episodes.length) {
+        // missav 分支：档位按 master 清单实测结果出集（12s 封顶，超时/失败
+        // 回落现有单集逻辑，详情绝不因此挂死）。
+        const resLabels = mod === 'missav'
+          ? await Promise.race([missavVariants(realId), new Promise(r => setTimeout(() => r([]), 12000))]).catch(() => [])
+          : [];
+        if (resLabels.length) {
+          for (const r of resLabels) playUrls.push(r + '$' + mod + '@@' + realId + '@@' + r + '@@' + src + '@@' + sub);
+        } else if (episodes.length) {
           for (const epItem of episodes) {
             const epNo = String(epItem.ep || '1');
             let rawName = String(epItem.name || ('第' + epNo + '集'));
@@ -389,6 +396,40 @@ async function detail(reqIn) {
     list.push(vod);
   }
   return { list };
+}
+
+
+// missav 档位探测：复用 play 的抓法取 missav.fans 页得 uuid + surrit host，
+// 再取 master 清单，只返回其中实测出现的档位（降序）；任一步失败返回 []，
+// 调用方回落现有单集行为。档位只认清单里的 RESOLUTION 与变体路径，绝不猜。
+async function missavVariants(realId) {
+  const missavId = String(realId).toLowerCase();
+  const missavUrl = 'https://missav.fans/cn/' + encodeURIComponent(missavId);
+  const { data } = await req.get(missavUrl, {
+    headers: {
+      'User-Agent': UA,
+      Referer: 'https://missav.fans/',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    },
+    timeout: 15000,
+  });
+  const html = typeof data === 'string' ? data : '';
+  const uuidMatch = html.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
+  if (!uuidMatch) return [];
+  const hostMatch = html.match(/https?:\/\/(surrit\.[^\/\\"\']+)/);
+  const host = hostMatch ? hostMatch[1].replace(/\\/g, '') : 'surrit.mrstcdn.store';
+  const base = `https://${host}/${uuidMatch[0]}`;
+  const pl = await req.get(base + '/playlist.m3u8', {
+    headers: { 'User-Agent': UA, Referer: 'https://missav.fans/' },
+    timeout: 15000,
+  });
+  const text = typeof pl.data === 'string' ? pl.data : '';
+  const heights = new Set();
+  for (const m of text.matchAll(/RESOLUTION=\d+x(\d+)/g)) heights.add(m[1]);
+  for (const m of text.matchAll(/(1080p|720p|480p|360p)\/video\.m3u8/g)) heights.add(m[1].replace('p', ''));
+  const order = ['1080', '720', '480', '360'];
+  return order.filter(h => heights.has(h)).map(h => h + 'p');
 }
 
 async function play(reqIn) {
@@ -421,11 +462,14 @@ async function play(reqIn) {
         const hostMatch = html.match(/https?:\/\/(surrit\.[^\/\\"\']+)/);
         const host = hostMatch ? hostMatch[1].replace(/\\/g, '') : 'surrit.mrstcdn.store';
         const base = `https://${host}/${uuidMatch[0]}`;
-        // 返回多清晰度，默认 720p（1080p 可能是 AV1，iOS 播不了）
-        const m3u8_720 = `${base}/720p/video.m3u8`;
+        // 档位按集名取（detail 只出 master 清单里实测出现的档位）；旧单集
+        // 与数字集号一律回落 720p，与今天行为一致。
+        const RES_OK = ['1080p', '720p', '480p', '360p'];
+        const res = RES_OK.includes(ep) ? ep : '720p';
+        const m3u8 = `${base}/${res}/video.m3u8`;
         return subAttach({
           parse: 0,
-          url: m3u8_720,
+          url: m3u8,
           header: { 'User-Agent': UA, Referer: 'https://missav.fans/' },
         }, subsP);
       }
