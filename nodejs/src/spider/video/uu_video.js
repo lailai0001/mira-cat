@@ -624,9 +624,7 @@ async function play(reqIn) {
           const cid = parseInt(cdnIdMatch[1], 10);
           if (cid >= 0 && cid < cdns.length) cdnIdx = cid;
         }
-        let fullUrl = cdns[cdnIdx].replace(/\/$/, '') + relUrl;
-        // cdnId=2 的分片实测比 cdnId=0 快（单视频 n=2，弱证据；真机无改善则 revert）
-        if (fullUrl.includes('cdnId=0')) fullUrl = fullUrl.replace('cdnId=0', 'cdnId=2');
+        const fullUrl = cdns[cdnIdx].replace(/\/$/, '') + relUrl;
         return subAttach({ parse: 0, url: fullUrl, header: { Referer: HOST + '/', 'User-Agent': UA } }, subsP);
       }
     }
