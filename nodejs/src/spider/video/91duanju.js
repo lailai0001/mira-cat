@@ -43,10 +43,10 @@ async function fetchHtml(url, referer) {
 
 // 2026-10-29：HLS 中转（与黄果同因：站方自带播放器在用户手机浏览器里也报
 // “资源加载失败”，91 还明说“留言您所在地区”——即 yd-hls / tp*.drleao.cn 对用户
-// 所在地区不给资源）。播放时先向用户自建的 html-relay Worker 要一份中转版 m3u8
-// （Worker 在 CF 边缘抓流、字节原样转发、不解密），中转可用就走中转，
+// 所在地区不给资源）。播放时先向用户自建的 javsb-relay 服务（Railway）要一份中转版 m3u8
+// （服务在 Railway 抓流、字节原样转发、不解密），中转可用就走中转，
 // 中转未部署或同样不可用时回落直连，行为不比原来差。
-const RELAY = 'https://html-relay.li768435813.workers.dev/';
+const RELAY = 'https://javsb-relay-production.up.railway.app/';
 async function relayM3u8(m3u8Url) {
   if (!/\.m3u8/i.test(m3u8Url)) return '';
   try {

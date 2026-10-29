@@ -72,6 +72,35 @@ async function fetchViaRelay(url, referer) {
   } catch { return { html: '', finalUrl: url }; }
 }
 
+// ---- javneon.tv 深分页中转（Node 直连代理，非 CF）----
+// javneon.tv 的验证拦 App 也拦 CF Worker（实测 403 Just a moment），只有
+// Node fetch/curl 能过；故第 6 页起的深页与深页详情走本中转，不走 CF 中转。
+// JN_RELAY 为 javsb-relay 服务上的 /jn 路由（Railway 部署，见 javsb-relay 仓库 server.js）。
+const JN_RELAY = 'https://javsb-relay-production.up.railway.app/jn';
+async function fetchJn(url, referer) {
+  try {
+    const res = await req.get(JN_RELAY + '?url=' + encodeURIComponent(url), { headers: H(referer), timeout: 25000, maxRedirects: 10 });
+    const data = (res && res.data !== undefined) ? res.data : res;
+    const finalUrl = (res && res.headers && (res.headers['x-final-url'] || res.headers['X-Final-Url'])) || url;
+    return { html: String(data || ''), finalUrl };
+  } catch { return { html: '', finalUrl: url }; }
+}
+// 分页 UI（<div class="pagination"> 内 /page/N/ 链接 + 当前页 <span>）取最大页码，
+// 即该分类总页数；取不到时回 0（调用方用镜像总页数或当前页兜底）。
+// 注意：末页本身的当前页是 <span> 不是链接，只算链接会少一页（如 4959 而非 4960）。
+function parseTotalPages(html) {
+  let max = 0;
+  const m = String(html || '').match(/<div class="pagination">[\s\S]{0,3000}/i);
+  const src = m ? m[0] : '';
+  for (const mm of src.matchAll(/\/page\/(\d+)\//g)) {
+    const n = parseInt(mm[1], 10);
+    if (n > max) max = n;
+  }
+  const am = src.match(/<li class="active"><span>(\d+)<\/span>/i);
+  if (am && parseInt(am[1], 10) > max) max = parseInt(am[1], 10);
+  return max;
+}
+
 // ---- 镜像读取（ghfast 优先，raw 兜底；任一拿到含 items 的 JSON 即算成功）----
 const MIRROR_BASES = [
   'https://ghfast.top/https://raw.githubusercontent.com/lailai0001/mira-cat/refs/heads/main/mirror/javneon/',
@@ -396,7 +425,7 @@ async function listSmart(url, referer) {
   const html = await getText(url, referer);
   let list = parsePosts(html);
   if (!list.length) {
-    const rr = await fetchViaRelay(url, referer);
+    const rr = await fetchJn(url, referer);
     const list2 = parsePosts(rr.html);
     if (list2.length) { list = list2; return { list, html: rr.html }; }
   }
@@ -459,9 +488,28 @@ async function category(reqIn) {
   const mj = await fetchMirrorJson(slug);
   if (mj) {
     const all = mj.items.map(mirrorToVod);
+    // 总页数以镜像里的 totalPages 为准（站方真实页数，如无码破解 4960），
+    // 没有该字段的旧文件回落为镜像条数折算（5 页）——App 据此才知道后面还有页。
+    const totalPages = (mj.totalPages > 0) ? mj.totalPages : Math.max(1, Math.ceil(all.length / 24));
     const start = (page - 1) * 24;
     const list = all.slice(start, start + 24);
-    return { page, pagecount: Math.max(1, Math.ceil(all.length / 24)), limit: 24, total: all.length, list };
+    if (list.length) {
+      return { page, pagecount: totalPages, limit: 24, total: totalPages * 24, list };
+    }
+    // 镜像里没有这一页（深页）：走 Node 中转实时抓该页
+    if (page > 1) {
+      const deepSlug = CAT_PATHS[slug] || slug;
+      const url = HOST + deepSlug + '/page/' + page + '/';
+      const rr = await fetchJn(url, HOST);
+      const deepList = parsePosts(rr.html);
+      if (deepList.length) {
+        const tp = parseTotalPages(rr.html) || totalPages;
+        return { page, pagecount: tp, limit: 24, total: tp * 24, list: deepList };
+      }
+      // 中转也空：如实返回空页，但 pagecount 给真实总数（App 知道还有更多）
+      return { page, pagecount: totalPages, limit: 24, total: totalPages * 24, list: [] };
+    }
+    return { page, pagecount: totalPages, limit: 24, total: totalPages * 24, list: [] };
   }
   const liveSlug = CAT_PATHS[slug] || slug;
   const base = HOST + liveSlug;
@@ -508,7 +556,7 @@ async function detail(reqIn) {
     let html = await getText(url, HOST);
     let btnCount = (html.match(/class="btn-server[^"]*"[^>]*data-link="/gi) || []).length;
     if (!btnCount) {
-      const rr = await fetchViaRelay(url, HOST);
+      const rr = await fetchJn(url, HOST);
       if ((rr.html.match(/class="btn-server[^"]*"[^>]*data-link="/gi) || []).length) html = rr.html;
     }
     const hm = html.match(/<h2[^>]*>([\s\S]{0,400}?)<\/h2>/i);

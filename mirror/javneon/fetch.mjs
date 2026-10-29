@@ -10,27 +10,39 @@
 // 注意：GitHub Actions runner 也被同一挑战页拦（实测 403 Just a moment），
 // 故不要再把本脚本挂到 Actions 定时任务上；刷新走助理侧定时任务。
 //
-// 输出：mirror/javneon/<slug>.json（每分类含第 1、2 页去重后的条目，
-// 每条含详情页按钮的 data-link 十六进制串，供蜘蛛直接跑播放链）
-// 与 mirror/javneon/index.json（分类总览）。
+// 输出：mirror/javneon/<slug>.json（每分类含第 1～5 页去重后的条目，
+// 每条含详情页按钮的 data-link 十六进制串，供蜘蛛直接跑播放链）、
+// mirror/javneon/index.json（分类总览）与 mirror/javneon/lookup.json
+// （路径索引：path -> {s: 分类, t: 标题, p: 封面}，供蜘蛛详情/搜索快查）。
 // 失败策略：某分类抓到 0 条时不覆盖旧文件；全部失败时以非 0 码退出，
 // 让 Actions 运行显式失败（下次定时再试）。
 import { execFile } from 'node:child_process';
-import { writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { writeFileSync, renameSync, mkdirSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HOST = 'https://javneon.tv/';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const CATS = [
-  'censored-jav',
-  'uncensored-jav',
-  'amateur',
-  'chinese-subtitles',
-  'reducing-mosaic',
-  'english-subtitles',
-  'popular',
+  { key: 'censored-jav', path: '/censored-jav/' },
+  { key: 'uncensored-jav', path: '/uncensored-jav/' },
+  { key: 'amateur', path: '/amateur/' },
+  { key: 'chinese-subtitles', path: '/chinese-subtitles/' },
+  { key: 'reducing-mosaic', path: '/reducing-mosaic/' },
+  { key: 'english-subtitles', path: '/english-subtitles/' },
+  { key: 'popular', path: '/popular/' },
+  // 2026-10-29 新加（均已实测第 1、2 页各 24 条）：标签类与厂商类，分页同为 /page/{n}/
+  { key: 'tag-big-tits', path: '/tag/big-tits/' },
+  { key: 'tag-creampie', path: '/tag/creampie/' },
+  { key: 'tag-solowork', path: '/tag/solowork/' },
+  { key: 'tag-married-woman', path: '/tag/married-woman/' },
+  { key: 'tag-beautiful-girl', path: '/tag/beautiful-girl/' },
+  { key: 'maker-s1-no-1-style', path: '/maker/s1-no-1-style/' },
+  // 2026-10-29 晚 v5.1 新加：大屁股（tag/huge-butt，实测 5 页各 24 条不重复）
+  { key: 'tag-huge-butt', path: '/tag/huge-butt/' },
 ];
+// 2026-10-29：由 2 页扩到 5 页（每分类 120 条），解决 App 内“翻两页就没更多”的问题
+const PAGES_PER_CAT = 5;
 const OUT_DIR = join(dirname(fileURLToPath(import.meta.url)));
 
 const DIAG = [];
@@ -116,9 +128,15 @@ async function pool(tasks, size) {
 mkdirSync(OUT_DIR, { recursive: true });
 let okCats = 0;
 const index = { updated: new Date().toISOString(), categories: [] };
+// 2026-10-29：路径索引 lookup（path -> {s: 分类 key, t: 标题, p: 封面}），
+// 供蜘蛛详情/搜索时先查索引再只取一个分类文件，不再 13 个文件全拉（详情慢的主因）。
+const lookup = {};
 
-for (const slug of CATS) {
-  const pages = [HOST + slug + '/', HOST + slug + '/page/2/'];
+for (const cat of CATS) {
+  const slug = cat.key;
+  const base = HOST + cat.path.slice(1);
+  const pages = [];
+  for (let n = 1; n <= PAGES_PER_CAT; n++) pages.push(n === 1 ? base : base + 'page/' + n + '/');
   const byPath = new Map();
   for (const url of pages) {
     const r = await curl(url);
@@ -150,15 +168,24 @@ for (const slug of CATS) {
       buttons: d ? d.buttons : [],
     };
   });
+  for (const it of outItems) if (!lookup[it.path]) lookup[it.path] = { s: slug, t: it.title, p: it.pic };
   const tmp = join(OUT_DIR, slug + '.json.tmp');
   const fin = join(OUT_DIR, slug + '.json');
-  writeFileSync(tmp, JSON.stringify({ updated: new Date().toISOString(), slug, items: outItems }, null, 0));
+  // totalPages 是站方真实总页数（人工实测回填），刷新时必须沿用旧文件的值，勿丢
+  let oldTotalPages = 0;
+  try { const old = JSON.parse(readFileSync(fin, 'utf-8')); if (old && old.totalPages > 0) oldTotalPages = old.totalPages; } catch (e) {}
+  const catObj = { updated: new Date().toISOString(), slug, items: outItems };
+  if (oldTotalPages > 0) catObj.totalPages = oldTotalPages;
+  writeFileSync(tmp, JSON.stringify(catObj, null, 0));
   renameSync(tmp, fin);
   console.log(`wrote ${slug}.json: ${outItems.length} items, ${withBtn} with buttons`);
-  index.categories.push({ slug, count: outItems.length, withButtons: withBtn });
+  index.categories.push({ slug, count: outItems.length, withButtons: withBtn, ...(oldTotalPages > 0 ? { totalPages: oldTotalPages } : {}) });
   okCats++;
 }
 
+writeFileSync(join(OUT_DIR, 'lookup.json.tmp'), JSON.stringify({ updated: new Date().toISOString(), items: lookup }, null, 0));
+renameSync(join(OUT_DIR, 'lookup.json.tmp'), join(OUT_DIR, 'lookup.json'));
+console.log(`wrote lookup.json: ${Object.keys(lookup).length} paths`);
 writeFileSync(join(OUT_DIR, 'index.json.tmp'), JSON.stringify(index, null, 0));
 renameSync(join(OUT_DIR, 'index.json.tmp'), join(OUT_DIR, 'index.json'));
 // 诊断文件：即使全部失败也写出，供从仓库直接读取 runner 侧看到的状态码与页面头
