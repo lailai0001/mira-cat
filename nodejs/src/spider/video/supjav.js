@@ -50,18 +50,18 @@ async function getText(url, timeout = 60000) {
 // 每个列表/详情请求要烧最长 530 秒、分类/搜索再整轮重试 2 次（最长
 // ~26 分钟）才回空——即用户所报「特别特别慢、加载不出来」。
 // 改法：多通道机会集 + 单通道熔断 + 总预算封顶。任一通道拿到真页面
-// 即返回；失败通道 5 分钟内跳过（蜘蛛进程常驻，模块级状态跨请求有效），
+// 即返回；失败通道 90 秒内跳过（蜘蛛进程常驻，模块级状态跨请求有效），
 // 通道复活后由后续请求自动探活恢复。校验沿用旧口径（非拦截页且
 // >3000B），并补挡 "Attention Required" 硬封页（4.8KB 会漏过旧校验）。
 const PAGE_CHANNELS = [
   { name: 'direct', timeout: 20000, build: (u) => u },
   { name: 'jina', timeout: 20000, build: (u) => 'https://r.jina.ai/' + u },
-  { name: 'worker', timeout: 25000, build: (u) => FETCH_WORKER + '/?u=' + encodeURIComponent(u) },
-  { name: 'fs', timeout: 30000, build: (u) => FS_PAGE_API + encodeURIComponent(u) },
+  { name: 'fs', timeout: 45000, build: (u) => FS_PAGE_API + encodeURIComponent(u) },
   { name: 'page', timeout: 45000, build: (u) => PAGE_API + encodeURIComponent(u) },
+  { name: 'worker', timeout: 25000, build: (u) => FETCH_WORKER + '/?u=' + encodeURIComponent(u) },
 ];
-const PAGE_BUDGET_MS = 75000;
-const CHAN_COOLDOWN_MS = 5 * 60 * 1000;
+const PAGE_BUDGET_MS = 120000;
+const CHAN_COOLDOWN_MS = 90 * 1000;
 const chanDeadUntil = {};
 
 function goodPage(html) {
@@ -69,14 +69,18 @@ function goodPage(html) {
     !html.includes('Just a moment') && !html.includes('Attention Required');
 }
 
-async function fetchPage(url) {
+const pageCache = new Map(); // target url -> { html, at }，只缓存 goodPage 真页 180 秒
+async function fetchPage(url, bypassCooldown = false) {
+  const hit = pageCache.get(url);
+  if (hit && Date.now() - hit.at < 180000) return hit.html;
   const t0 = Date.now();
   for (const ch of PAGE_CHANNELS) {
     if (Date.now() - t0 > PAGE_BUDGET_MS) break;
-    if ((chanDeadUntil[ch.name] || 0) > Date.now()) continue;
+    if (!bypassCooldown && (chanDeadUntil[ch.name] || 0) > Date.now()) continue;
     const html = await getText(ch.build(url), ch.timeout);
     if (goodPage(html)) {
       delete chanDeadUntil[ch.name];
+      pageCache.set(url, { html, at: Date.now() });
       return html;
     }
     chanDeadUntil[ch.name] = Date.now() + CHAN_COOLDOWN_MS;
@@ -162,8 +166,8 @@ async function category(reqIn) {
   let html = await fetchPage(url);
   let items = parseCards(html);
   if (!items.length) {
-    // 空结果整轮重试最多 1 次（旧版 2 次×530 秒级联是慢的主因之一）
-    html = await fetchPage(url);
+    // 空结果整轮重试最多 1 次，且绕开熔断做一次真重试（熔断期内旧重试恒为 0ms 空操作）
+    html = await fetchPage(url, true);
     items = parseCards(html);
   }
   return { page, pagecount: pagecount(html, page), limit: items.length || 24, total: items.length, list: items };

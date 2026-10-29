@@ -647,6 +647,12 @@ function jwCleanPic(pic) {
   let host = '';
   try { host = (new URL(s).hostname || '').toLowerCase(); } catch (e) { return ''; }
   if (!host) return '';
+  if (host === 'img.test.com') {
+    const u = new URL(s);
+    u.hostname = 'static.juwu.tv';
+    u.protocol = 'https:';
+    return u.toString();
+  }
   for (const ph of ['huangdouhui.tv']) {
     if (host === ph || host.endsWith('.' + ph)) return '';
   }

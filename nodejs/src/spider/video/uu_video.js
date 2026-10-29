@@ -392,7 +392,7 @@ async function getCdnList() {
 
 // 调用需要鉴权的 API
 async function apiCallAuth(apiPath, params = {}) {
-  const token = await ensureAccessToken();
+  let token = await ensureAccessToken();
   const query = new URLSearchParams(params).toString();
   for (const base of API_HOSTS) {
     const url = `${base}${apiPath}${query ? '?' + query : ''}`;
@@ -405,8 +405,27 @@ async function apiCallAuth(apiPath, params = {}) {
       if (!text) continue;
       const resp = JSON.parse(text);
       if (resp.code !== 200) {
-        // token 可能过期，重试一次
-        if (resp.code === 401) { _accessToken = ''; }
+        // token 过期：清缓存、重新登录、用新 token 重试该 host 一次（旧写法 continue 后仍用旧 token 试剩下 host，必然全败）
+        if (resp.code === 401) {
+          _accessToken = '';
+          token = await ensureAccessToken().catch(() => '');
+          if (token) {
+            try {
+              const retry = await httpGet(url, {
+                'Referer': HOST + '/',
+                'Accept': 'application/json',
+                'Authorization': 'Bearer ' + token,
+              });
+              if (retry.text) {
+                const resp2 = JSON.parse(retry.text);
+                if (resp2.code === 200 && resp2.data != null) {
+                  if (typeof resp2.data === 'string' && resp2.data) return xorDecrypt(resp2.data, resp2.key || '');
+                  return resp2.data;
+                }
+              }
+            } catch (e2) { /* 重试失败则继续下一 host */ }
+          }
+        }
         continue;
       }
       if (resp.data == null) return null;
@@ -703,7 +722,7 @@ function subRegister(detailIds, vod) {
 // play 侧挂载: 仅当结果带非空 url 且字幕有命中时才加 subs 键。
 async function subAttach(res, subsP) {
   try {
-    const subs = await subsP;
+    const subs = await Promise.race([subsP, new Promise((r) => setTimeout(() => r([]), 800))]);
     if (subs && subs.length && res && typeof res === 'object' && res.url) res.subs = subs;
   } catch (e) { /* 字幕挂载失败不影响播放结果 */ }
   return res;

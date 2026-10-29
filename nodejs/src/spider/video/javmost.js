@@ -427,6 +427,21 @@ async function play(reqIn) {
     // 第2步: dooplayer/mostplayer 系 embed 页直接解析出直链 (parse:0)
     const direct = await resolveEmbedDirect(embedUrl, durl);
     if (direct) {
+      // 直链验活：上游 mostplayer 曾回 500 text/plain 死链，验不过不交死链、落到第3步嗅探
+      let alive = false;
+      try {
+        const vr = await req.get(direct, {
+          headers: { 'User-Agent': UA, 'Referer': embedUrl, 'Origin': new URL(embedUrl).origin, 'Range': 'bytes=0-1023' },
+          timeout: 15000,
+          responseType: 'arraybuffer',
+          validateStatus: () => true,
+        });
+        const ct = String((vr.headers && (vr.headers['content-type'] || vr.headers['Content-Type'])) || '');
+        alive = (vr.status === 200 || vr.status === 206) && !/^text\/(plain|html)/i.test(ct);
+      } catch (e) { alive = false; }
+      if (!alive) {
+        // 验活失败：跳过 parse:0，继续走第3步嗅探 embed 页
+      } else {
       const embedOrigin = new URL(embedUrl).origin;
       return subAttach({
         parse: 0,
@@ -437,6 +452,7 @@ async function play(reqIn) {
           'Origin': embedOrigin,
         },
       }, subsP);
+      }
     }
     // 第3步: 其他 embed 页交给 MiraPlayer 嗅探
     return subAttach({
