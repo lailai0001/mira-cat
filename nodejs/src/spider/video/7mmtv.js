@@ -793,19 +793,6 @@ async function category(reqIn) {
   const tid = t(body.tid || body.id) || 'list:censored';
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const cat = CATMAP.get(tid) || CATS[0];
-  // 巨尻/巨乳/屁股（有码组）同时并有码与无码破解两版：两区标签 id 通用，并行各取一页拼接
-  const DUAL = ['tag:censored:127', 'tag:censored:50', 'tag:censored:137'];
-  if (DUAL.includes(tid)) {
-    const cat2 = { type_id: 'tag:reducing-mosaic-censored:' + tid.split(':')[2], arg: cat.arg };
-    const [h1, h2] = await Promise.all([getPage(catUrl(cat, page), 60000), getPage(catUrl(cat2, page), 60000)]);
-    const seen = new Set();
-    const list = [];
-    for (const c of (h1 ? parseCards(h1) : []).concat(h2 ? parseCards(h2) : [])) {
-      if (!seen.has(c.vod_id)) { seen.add(c.vod_id); list.push(c); }
-    }
-    const pc = Math.max(h1 ? pagecountOf(h1) : page, h2 ? pagecountOf(h2) : page, page);
-    return { page, pagecount: pc, limit: list.length, total: list.length, list };
-  }
   const html = await getPage(catUrl(cat, page), 60000);
   if (!html) return { page, pagecount: page, limit: 20, total: 0, list: [] };
   const list = parseCards(html);

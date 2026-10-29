@@ -215,8 +215,6 @@ async function home() {
       { type_id: 'censored', type_name: '有码' },
       { type_id: 'uncensored', type_name: '无码' },
       { type_id: 'uncensored-leaked', type_name: '无码泄露' },
-      { type_id: 'genres/big-tits', type_name: '巨乳' },
-      { type_id: 'genres/big-ass', type_name: '大屁股' },
       { type_id: 'genres', type_name: '类别' },
       { type_id: 'actresses', type_name: '女演员' },
       { type_id: 'makers', type_name: '制作商' },
