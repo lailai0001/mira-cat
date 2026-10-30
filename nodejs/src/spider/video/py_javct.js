@@ -109,12 +109,16 @@ function parseCards(html) {
     if (!/^https?:\/\//i.test(href)) href = HOST + href;
     if (seen.has(href)) continue;
     seen.add(href);
-    const inner = m[2];
+    // 封面不在 card__play 锚点内（锚点里只有一个播放图标），而是同 card__cover
+    // 块里锚点前面的 <img class="lazy" data-src="imggle webp">；旧写法只在锚点
+    // 内找 img，永远找不到，封面全空。改取锚点前 900 字内最后一个 img。
     let pic = '';
-    const im = inner.match(/<img[^>]*>/i);
+    const before = html.slice(Math.max(0, m.index - 900), m.index);
+    const imgs = [...before.matchAll(/<img[^>]*>/gi)];
+    const im = imgs.length ? imgs[imgs.length - 1][0] : null;
     if (im) {
-      const dm = im[0].match(/data-src="([^"]+)"/i);
-      const sm = im[0].match(/src="([^"]+)"/i);
+      const dm = im.match(/data-src="([^"]+)"/i);
+      const sm = im.match(/src="([^"]+)"/i);
       const cand = (dm && dm[1]) || (sm && sm[1]) || '';
       if (cand && !/default-cover/i.test(cand) && !/data:image/i.test(cand)) {
         pic = /^https?:\/\//i.test(cand) ? cand : HOST + (cand.startsWith('/') ? cand : '/' + cand);
@@ -134,11 +138,31 @@ function parseCards(html) {
   return items.filter(it => it.vod_name && it.vod_name.length >= 2);
 }
 
+// 2026-10-30 晚按用户令重排并扩充：无码第一、字幕第二、素人最后；
+// 中间为站内 /categories 索引的真实题材分类（/category/{slug}，均已验有内容）。
 const CATS = [
-  { type_id: '/amateur', type_name: '素人' },
-  { type_id: '/censored', type_name: '有码' },
   { type_id: '/uncensored', type_name: '无码' },
   { type_id: '/subtitle', type_name: '字幕' },
+  { type_id: '/censored', type_name: '有码' },
+  { type_id: '/category/big-tits', type_name: '巨乳' },
+  { type_id: '/category/big-asses', type_name: '大屁股' },
+  { type_id: '/category/beautiful-girl', type_name: '美少女' },
+  { type_id: '/category/cosplay', type_name: '角色扮演' },
+  { type_id: '/category/married-woman', type_name: '人妻' },
+  { type_id: '/category/mature-woman', type_name: '熟女' },
+  { type_id: '/category/milf', type_name: '熟妇' },
+  { type_id: '/category/school-girls', type_name: '校园' },
+  { type_id: '/category/creampie', type_name: '中出' },
+  { type_id: '/category/blowjob', type_name: '口交' },
+  { type_id: '/category/drama', type_name: '剧情' },
+  { type_id: '/category/lesbian', type_name: '女同' },
+  { type_id: '/category/massage', type_name: '按摩' },
+  { type_id: '/category/office-lady', type_name: 'OL' },
+  { type_id: '/category/outdoor', type_name: '野外' },
+  { type_id: '/category/anal', type_name: '肛交' },
+  { type_id: '/category/bondage', type_name: '捆绑' },
+  { type_id: '/category/orgy', type_name: '群交' },
+  { type_id: '/amateur', type_name: '素人' },
 ];
 
 async function warmSession() {
