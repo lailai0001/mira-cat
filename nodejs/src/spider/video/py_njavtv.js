@@ -47,22 +47,33 @@ async function getDirect(url) {
   } catch { return ''; }
 }
 
-// 直连优先；CF 墙（Just a moment / 403 / 空）时走 jina 兜底
+// 2026-10-30 晚重写（真机全空后的根因修复）：
+//  ① 直连在 App 侧过不了 CF 墙（真浏览器才过得了，App 的 req 拿不到内容，
+//     用户截图 4 分类全是“暂无数据”即为证），故改 jina 优先，不再先浪费 12 秒
+//     等直连超时；直连只作 CF 墙松动时的后备。
+//  ② jina 若不认 x-respond-with 头会返回 Markdown（非 HTML），旧解析只认
+//     <a> 标签，拿到“成功”的 Markdown 也解析出 0 条——同样表现为全空。
+//     故 getHtml 照单全收（含 Markdown），解析层双格式兼容。
 async function getHtml(url) {
-  const direct = await getDirect(url);
-  if (direct && direct.indexOf('Just a moment') < 0 && direct.indexOf('/cn/') >= 0) return direct;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const jinaTry = async () => {
     try {
       const { data } = await req.get(JINA + url, {
         headers: { 'User-Agent': UA, 'x-respond-with': 'html', 'Referer': HOST + '/cn' },
-        timeout: 20000,
+        timeout: 25000,
       });
       const t = String(data || '');
       if (t && t.indexOf('/cn/') >= 0) return t;
     } catch {}
-    // jina 对突发请求会短暂 403，隔 2 秒重试一次
-    if (attempt === 0) await new Promise(r => setTimeout(r, 2000));
-  }
+    return '';
+  };
+  const j = await jinaTry();
+  if (j) return j;
+  const direct = await getDirect(url);
+  if (direct && direct.indexOf('Just a moment') < 0 && direct.indexOf('/cn/') >= 0) return direct;
+  // jina 对突发请求会短暂 403，隔 3 秒再试一次
+  await new Promise(r => setTimeout(r, 3000));
+  const j2 = await jinaTry();
+  if (j2) return j2;
   return direct || '';
 }
 
@@ -100,20 +111,26 @@ function unpackDeanEdwards(html) {
 function parseCards(html) {
   const items = [];
   const seen = new Set();
+  const push = (code, title, pic) => {
+    code = String(code).toLowerCase();
+    if (seen.has(code)) return;
+    // 列表里混有栏目卡（如 /cn/actresses），番号必含数字，纯词跳过
+    if (!/\d/.test(code)) return;
+    seen.add(code);
+    if (!pic) pic = 'https://fourhoi.com/' + code + '/cover-t.jpg';
+    if (!title) title = code.toUpperCase();
+    items.push({ vod_id: HOST + '/cn/' + code, vod_name: title, vod_pic: pic, vod_remarks: code.toUpperCase() });
+  };
+  // HTML 卡片
   const re = /<a[^>]*href="https:\/\/njavtv\.com\/cn\/([a-z0-9\-]+)"[^>]*>([\s\S]{0,2000}?)<\/a>/gi;
   let m;
   while ((m = re.exec(html)) !== null) {
-    const code = m[1].toLowerCase();
-    if (seen.has(code)) continue;
-    // 列表里混有栏目卡（如 /cn/actresses），番号必含数字，纯词跳过
-    if (!/\d/.test(code)) continue;
-    seen.add(code);
+    const code = m[1];
     const inner = m[2];
     let pic = '';
     // 卡片里 preview.mp4 的 data-src 排在封面前面，只取图片后缀的
     const dms = [...inner.matchAll(/data-src="(https:\/\/fourhoi\.com\/[^"]+)"/gi)].map(x => x[1]);
     pic = dms.find(u => /\.(jpg|jpeg|png|webp)(\?|$)/i.test(u)) || '';
-    if (!pic) pic = 'https://fourhoi.com/' + code + '/cover-t.jpg';
     let title = '';
     const am = inner.match(/alt="([^"]+)"/i);
     if (am && am[1] && am[1] !== code) title = stripTags(am[1]);
@@ -121,18 +138,36 @@ function parseCards(html) {
       const tm = inner.match(/<[^>]*class="[^"]*(title|name)[^"]*"[^>]*>([\s\S]{0,300}?)<\/[^>]+>/i);
       if (tm) title = stripTags(tm[2]);
     }
-    if (!title) title = code.toUpperCase();
-    items.push({ vod_id: HOST + '/cn/' + code, vod_name: title, vod_pic: pic, vod_remarks: code.toUpperCase() });
-    if (items.length >= 60) break;
+    push(code, title, pic);
+    if (items.length >= 60) return items;
+  }
+  // Markdown 兜底（jina 不认 x-respond-with 时返回 Markdown 链接）：
+  // [标题](https://njavtv.com/cn/{code})；封面无图时用 cover-t.jpg 规律地址
+  if (items.length < 3) {
+    const mre = /\[([^\]]{1,200})\]\(https:\/\/njavtv\.com\/cn\/([a-z0-9\-]+)\)/gi;
+    while ((m = mre.exec(html)) !== null) {
+      const txt = stripTags(m[1]);
+      // 时长链接（1:57:52）在标题链接之前，跳过它，让标题链接占位
+      if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(txt)) continue;
+      push(m[2], txt, '');
+      if (items.length >= 60) break;
+    }
   }
   return items;
 }
 
+// 2026-10-30 晚新增 5 个：dm 编号均以当日站内导航实测为准（dm 代码稳定，
+// 旧 4 个当日仍在），新段页各验出 63~75 条卡片链接。
 const CATS = [
   { type_id: '/dm635/cn/release', type_name: '新作上市' },
   { type_id: '/dm539/cn/new', type_name: '最新' },
   { type_id: '/dm278/cn/chinese-subtitle', type_name: '中文字幕' },
   { type_id: '/dm117/cn/genres/%E4%B8%8D%E4%BC%A6', type_name: '不伦' },
+  { type_id: '/dm301/cn/today-hot', type_name: '今日热门' },
+  { type_id: '/dm170/cn/weekly-hot', type_name: '周热门' },
+  { type_id: '/dm273/cn/monthly-hot', type_name: '月热门' },
+  { type_id: '/dm817/cn/uncensored-leak', type_name: '无码流出' },
+  { type_id: '/dm597/cn/fc2', type_name: 'FC2' },
 ];
 
 async function init() { return {}; }
@@ -149,7 +184,7 @@ async function home() {
 
 async function category(reqIn) {
   const body = reqIn?.body || {};
-  let tid = String(body.id || '');
+  let tid = String(body.id || body.tid || '');
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!tid) tid = '/dm635/cn/release';
   const base = (/^https?:\/\//i.test(tid) ? tid : HOST + '/' + tid.replace(/^\/+/, '')).replace(/\/+$/, '');
