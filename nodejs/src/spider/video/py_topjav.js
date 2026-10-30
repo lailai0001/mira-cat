@@ -82,12 +82,35 @@ function parseCards(html) {
   return items;
 }
 
+// 2026-10-30 晚：站内题材页为 /cn/genre/{slug}（/cn/genres 索引页实测数百个，
+// 含大量拼写重复项，只取干净常用的；抽查 10 个均 200 且有内容）。
 const CATS = [
   { type_id: '/cn', type_name: '最新' },
   { type_id: '/cn/popular', type_name: '热门' },
   { type_id: '/cn/categories/censored', type_name: '有码' },
   { type_id: '/cn/categories/uncensored', type_name: '无码' },
   { type_id: '/cn/categories/reducing_mosaic', type_name: '减码' },
+  { type_id: '/cn/genre/busty', type_name: '巨乳' },
+  { type_id: '/cn/genre/butt', type_name: '屁股' },
+  { type_id: '/cn/genre/huge-butt', type_name: '巨臀' },
+  { type_id: '/cn/genre/creampie', type_name: '中出' },
+  { type_id: '/cn/genre/blowjob', type_name: '口交' },
+  { type_id: '/cn/genre/cosplay', type_name: '角色扮演' },
+  { type_id: '/cn/genre/school-girls', type_name: '校园' },
+  { type_id: '/cn/genre/housewife', type_name: '人妻' },
+  { type_id: '/cn/genre/young-wife', type_name: '年轻妻' },
+  { type_id: '/cn/genre/lesbian', type_name: '女同' },
+  { type_id: '/cn/genre/anal', type_name: '肛交' },
+  { type_id: '/cn/genre/bondage', type_name: '捆绑' },
+  { type_id: '/cn/genre/massage', type_name: '按摩' },
+  { type_id: '/cn/genre/uniform', type_name: '制服' },
+  { type_id: '/cn/genre/squirting', type_name: '潮吹' },
+  { type_id: '/cn/genre/pov', type_name: '第一视角' },
+  { type_id: '/cn/genre/hardcore', type_name: '硬核' },
+  { type_id: '/cn/genre/gangbang', type_name: '轮奸' },
+  { type_id: '/cn/genre/slender', type_name: '苗条' },
+  { type_id: '/cn/genre/cowgirl', type_name: '骑乘' },
+  { type_id: '/cn/genre/bukkake', type_name: '颜射' },
 ];
 
 // 签名 URL 现解：slice(16, -16) → 反转 → base64 解码
