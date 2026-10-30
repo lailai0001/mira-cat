@@ -128,10 +128,33 @@ function parseCards(html) {
   return items;
 }
 
+// 2026-10-30 晚：站内导航只有 3 个视频分类；其余用 WP 标签页（/tag/{slug}/，
+// 首页卡片 tag-* 类实测 55 个，标签页与翻页 /page/N/ 均已验出内容）。
+// 标签分类沿用 category() 的通用路径拼接，无需改逻辑。
 const CATS = [
   { type_id: '/category/censored/', type_name: '有码' },
   { type_id: '/category/english-subtitle/', type_name: '英字' },
   { type_id: '/category/reducing-mosaic/', type_name: '减码' },
+  { type_id: '/tag/big-tits/', type_name: '巨乳' },
+  { type_id: '/tag/huge-butt/', type_name: '巨臀' },
+  { type_id: '/tag/beautiful-butt/', type_name: '美臀' },
+  { type_id: '/tag/amateur/', type_name: '素人' },
+  { type_id: '/tag/beautiful-girl/', type_name: '美少女' },
+  { type_id: '/tag/married-woman/', type_name: '人妻' },
+  { type_id: '/tag/mature-woman/', type_name: '熟女' },
+  { type_id: '/tag/milf/', type_name: '熟妇' },
+  { type_id: '/tag/school-girls/', type_name: '校园' },
+  { type_id: '/tag/cheating-wife/', type_name: '出轨妻' },
+  { type_id: '/tag/young-wife/', type_name: '年轻妻' },
+  { type_id: '/tag/creampie/', type_name: '中出' },
+  { type_id: '/tag/blowjob/', type_name: '口交' },
+  { type_id: '/tag/drama/', type_name: '剧情' },
+  { type_id: '/tag/lesbian/', type_name: '女同' },
+  { type_id: '/tag/hardcore/', type_name: '硬核' },
+  { type_id: '/tag/pov/', type_name: '第一视角' },
+  { type_id: '/tag/squirting/', type_name: '潮吹' },
+  { type_id: '/tag/threesome-foursome/', type_name: '多人' },
+  { type_id: '/tag/slender/', type_name: '苗条' },
 ];
 
 async function init() { return {}; }
