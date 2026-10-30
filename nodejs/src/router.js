@@ -68,7 +68,6 @@ import javtiful from './spider/video/py_javtiful.js';
 import hornyjav from './spider/video/py_hornyjav.js';
 import javct from './spider/video/py_javct.js';
 import topjav from './spider/video/py_topjav.js';
-import njavtv from './spider/video/py_njavtv.js';
 import perverzija from './spider/video/py_perverzija.js';
 import one from './spider/video/py_one.js';
 
@@ -128,7 +127,7 @@ const spiders = [
     hornyjav,
     javct,
     topjav,
-    njavtv, perverzija, one,];
+    perverzija, one,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
