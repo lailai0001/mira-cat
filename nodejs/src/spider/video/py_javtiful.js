@@ -93,9 +93,17 @@ function parseCards(html) {
 }
 
 // 2026-10-30 晚扩到站内 /categories 索引的全部 21 个真实分类（均已验有内容）。
-// 注意：站里没有“无码破解”“大屁股”这两个分类（实测 /category/uncensored-leaked、
-// /category/big-ass 等均为 404），故把最接近用户口味的丰满（bbw）与巨乳置顶。
+// 2026-10-30 深夜按用户令补前列：顶层类型页实测均 200 且有内容——
+//  无码破解 = 站内 Reducing Mosaic（/reducing-mosaic，用户说的无码泄露/流出/减码
+//  即此）；最新 = /videos（默认按新到旧排，ID 降序）；无码 = /uncensored；
+//  有码 = /censored；分页均 ?page=N 已验。注意：站里没有“大屁股”“中字”
+//  这两个榜单（无标签页、无字幕筛选，详情页亦无相关链接），故不编造，
+//  最接近的丰满（bbw）仍紧随前列之后。
 const CATS = [
+  { type_id: '/reducing-mosaic', type_name: '无码破解' },
+  { type_id: '/videos', type_name: '最新' },
+  { type_id: '/uncensored', type_name: '无码' },
+  { type_id: '/censored', type_name: '有码' },
   { type_id: '/category/bbw/', type_name: '丰满' },
   { type_id: '/category/big-tits/', type_name: '巨乳' },
   { type_id: '/category/affair/', type_name: '偷情' },
