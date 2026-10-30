@@ -29,6 +29,9 @@ const KEY = 'py_njavtv';
 const NAME = 'nJAV';
 const HOST = 'https://njavtv.com';
 const JINA = 'https://r.jina.ai/';
+// 自家抓取中转（2026-10-30 深夜新增，用户部署 site-fetch Worker 后生效；
+// 未部署/不通时自动回落 jina/直连。Worker 代码见 site-fetch-worker.js）
+const WORKER = 'https://site-fetch.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 function H(referer) {
@@ -55,6 +58,15 @@ async function getDirect(url) {
 //     <a> 标签，拿到“成功”的 Markdown 也解析出 0 条——同样表现为全空。
 //     故 getHtml 照单全收（含 Markdown），解析层双格式兼容。
 async function getHtml(url) {
+  // ① 自家 Worker 优先（App→自家域名最稳；Worker 内直连+jina 两腿）
+  try {
+    const { data } = await req.get(WORKER + '/?u=' + encodeURIComponent(url), {
+      headers: { 'User-Agent': UA, 'Referer': HOST + '/cn' },
+      timeout: 35000,
+    });
+    const t = String(data || '');
+    if (t && t.indexOf('/cn/') >= 0) return t;
+  } catch {}
   const jinaTry = async () => {
     try {
       const { data } = await req.get(JINA + url, {
