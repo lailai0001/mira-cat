@@ -1,4 +1,4 @@
-// MyFreeCams - CatPawOpen JS Spider（2026-10-30 新源）
+// MyFreeCams - CatPawOpen JS Spider（2026-10-30 新源；2026-10-30 晚播放修复）
 // 站点：https://www.myfreecams.com/（直播间列表，非点播站）
 // 结构（2026-10-30 VM 实测）：
 //  - 列表：GET https://api-edge.myfreecams.com/trendingRooms?lookback=60
@@ -11,16 +11,22 @@
 //    （username 与数字 id 都接受）→ result.user = {id, username, avatar,
 //    cam_score, profile, sessions: [{session_id, vstate, room_count,
 //    vidserver_id, room_topic, server_name, phase, ...}]}；离线 sessions=[]。
-//  - 播放：官方播放器（player chunk 8471 + 配置生成器）拼法：
-//    stream = 'mfc_' + phase + '_' + user_id（phase 来自 session，如 'a_'
-//    → 'mfc_a__41621209'，双下划线是对的）；edgevideo 分支：
+//  - 播放：官方播放器拼法：stream = 'mfc_' + phase + '_' + user_id
+//    （phase 来自 session，如 'a_' → 'mfc_a__41621209'，双下划线是对的）；
+//    edgevideo 分支：
 //    https://edgevideo.myfreecams.com/llhls/NxServer/{serverNum}
 //      /ngrp:{stream}.f4v_cmaf/playlist_sfm4s.m3u8?nc={随机}&v=0.4.0
 //    （serverNum = server_name 的数字部分，如 video992 → 992）。
-//    VM 实测：正确流名返回 403（Tomcat 拒访，流存在），错误流名返回 404，
-//    故流名已坐实、403 是 VM 机房出口被 Wowza 拦（与 surrit/javct 同类
-//    现象），真机（住宅/移动出口）待验。detail 里若能拉到 master 清单，
-//    按 RESOLUTION 拆出清晰度线；拉不到则只给自动线。
+//    VM 实测：正确流名返回 403（流存在），错误流名返回 404。
+//  - 播放修复（2026-10-30 真机反馈“能看列表、不能播”后，对照
+//    chaturbate 真机可播的写法改）：直返原始 LL-HLS 主列表会让播放器
+//    在多档 + 独立音频组 + fMP4 分片上选档失败（chaturbate 同款病因，
+//    其解法是本地一跳代理裁档）。故本蜘蛛同样走本地代理：
+//    play/detail 只给代理地址 js2p://_WEB_/spider/py_myfreecams/3/
+//    proxy/master?u={b64url 主列表}[&q={高度}]；代理在 App 内拉取主列表，
+//    裁到一档（q 指定高度，否则最高档）+ 锁定该档的音频组，所有 URI
+//    改写为绝对地址；拉取/裁剪失败时 302 回原始主列表（不劣于直返）。
+//    媒体列表与分片仍走 edgevideo 直连（不经代理）。
 //  - 只列公开房间（vstate 0 优先；无公开场时仍列出在线场并在备注标明）。
 import req from '../../util/req.js';
 
@@ -138,6 +144,134 @@ function parseVariants(masterText, masterUrlStr) {
   return lines;
 }
 
+// ---------- 主列表裁档（本地一跳代理，同 chaturbate 写法） ----------
+
+function b64url(s) {
+  return Buffer.from(String(s), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function unb64url(s) {
+  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+}
+
+// 本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 chaturbate/avhub 先例）
+function proxyUrl(reqLike, path, targetUrl, q) {
+  try {
+    const server = reqLike?.server;
+    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
+    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
+    let u = `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}`;
+    if (q) u += '&q=' + encodeURIComponent(q);
+    return u;
+  } catch (e) { return ''; }
+}
+
+function absUrl(u, base) {
+  try { return new URL(u, base).toString(); } catch (e) { return u; }
+}
+
+// 把主列表裁到一档：q 指定高度则取该档，否则最高档（高度优先，其次码率），
+// 并保留该档引用的音频组，所有 URI 改写为以主列表地址为基准的绝对地址。
+function filterMaster(raw, baseUrl, q) {
+  const lines = String(raw).split(/\r?\n/);
+  const head = [];
+  const mediaByGroup = new Map();
+  const variants = [];
+  let pendingInf = null;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXT-X-MEDIA:')) {
+      const g = /GROUP-ID="([^"]+)"/.exec(line);
+      if (g) {
+        if (!mediaByGroup.has(g[1])) mediaByGroup.set(g[1], []);
+        mediaByGroup.get(g[1]).push(line);
+      }
+      continue;
+    }
+    if (line.startsWith('#EXT-X-STREAM-INF:')) { pendingInf = line; continue; }
+    if (line.startsWith('#')) {
+      if (line === '#EXTM3U' || line.startsWith('#EXT-X-VERSION') || line.startsWith('#EXT-X-INDEPENDENT-SEGMENTS')) head.push(line);
+      continue;
+    }
+    if (pendingInf) {
+      const res = /RESOLUTION=(\d+)x(\d+)/.exec(pendingInf);
+      const bw = /BANDWIDTH=(\d+)/.exec(pendingInf);
+      const audio = /AUDIO="([^"]+)"/.exec(pendingInf);
+      variants.push({
+        inf: pendingInf,
+        uri: line,
+        h: res ? parseInt(res[2], 10) : 0,
+        bw: bw ? parseInt(bw[1], 10) : 0,
+        audio: audio ? audio[1] : '',
+      });
+      pendingInf = null;
+    }
+  }
+  if (!variants.length) return '';
+  variants.sort((a, b) => (b.h - a.h) || (b.bw - a.bw));
+  let top = variants[0];
+  if (q) {
+    const want = parseInt(q, 10);
+    const hit = variants.find(v => v.h === want);
+    if (hit) top = hit;
+  }
+  const out = ['#EXTM3U'];
+  for (const h of head) { if (h !== '#EXTM3U') out.push(h); }
+  if (top.audio && mediaByGroup.has(top.audio)) {
+    for (const ml of mediaByGroup.get(top.audio)) {
+      out.push(ml.replace(/URI="([^"]+)"/, (mm, u) => `URI="${absUrl(u, baseUrl)}"`));
+    }
+  }
+  out.push(top.inf);
+  out.push(absUrl(top.uri, baseUrl));
+  return out.join('\n') + '\n';
+}
+
+async function fetchPlaylist(url, timeout = 8000) {
+  try {
+    const { data, status } = await req.get(url, {
+      headers: { 'User-Agent': UA, 'Accept': '*/*', 'Referer': WEB + '/' },
+      timeout,
+    });
+    if (status === 200 && data != null) return typeof data === 'string' ? data : JSON.stringify(data);
+  } catch (e) { /* ignore */ }
+  return '';
+}
+
+const masterCache = new Map(); // key -> { text, exp }
+const MASTER_CACHE_TTL = 60000;
+
+// GET /proxy/master?u={b64url 主列表地址}[&q={高度}] —— 返回裁到一档的主列表；
+// 拉取/裁剪失败时 302 跳回原始主列表（不劣于直返）。
+async function masterProxy(request, reply) {
+  const q = request?.query || {};
+  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  try { target = unb64url(q.u); } catch (e) { reply.code(400).send('bad u'); return; }
+  let host = '';
+  try { host = new URL(target).hostname; } catch (e) { /* ignore */ }
+  if (!/^https:\/\//.test(target) || !/\.myfreecams\.com$/.test(host)) {
+    reply.code(400).send('bad u'); return;
+  }
+  const nowMs = Date.now();
+  const cacheKey = target + '|q=' + (q.q || '');
+  const hit = masterCache.get(cacheKey);
+  if (hit && hit.exp > nowMs) {
+    reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+    reply.header('Cache-Control', 'no-cache');
+    reply.send(hit.text);
+    return;
+  }
+  const raw = await fetchPlaylist(target);
+  const filtered = raw && raw.includes('#EXT-X-STREAM-INF') ? filterMaster(raw, target, q.q) : '';
+  if (!filtered) { reply.redirect(target); return; }
+  if (masterCache.size > 64) masterCache.delete(masterCache.keys().next().value);
+  masterCache.set(cacheKey, { text: filtered, exp: nowMs + MASTER_CACHE_TTL });
+  reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+  reply.header('Cache-Control', 'no-cache');
+  reply.send(filtered);
+}
+
 async function init() { return {}; }
 
 async function home() {
@@ -155,7 +289,7 @@ async function home() {
 
 async function category(reqIn) {
   const body = reqIn?.body || {};
-  const tid = String(body.id || 'trending');
+  const tid = String(body.id || body.tid || 'trending');
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   let list = [];
   if (tid === 'online') {
@@ -187,22 +321,27 @@ async function detail(reqIn) {
       continue;
     }
     const master = masterUrl(user, sess);
-    let playUrl = '自动$' + master;
+    let playUrl = '';
     if (master) {
+      // 自动线走代理裁最高档；能拉到主列表时再按高度拆清晰度线（同样走代理）
+      playUrl = '自动$' + (proxyUrl(reqIn, '/proxy/master', master) || master);
       const mt = await getText(master, roomUrl);
       if (mt && mt.indexOf('#EXTM3U') >= 0) {
         const vars = parseVariants(mt, master);
         if (vars.length) {
-          playUrl = ['自动$' + master].concat(vars.map(v => v.h + 'p$' + v.u)).join('#');
+          playUrl = ['自动$' + (proxyUrl(reqIn, '/proxy/master', master) || master)]
+            .concat(vars.map(v => v.h + 'p$' + (proxyUrl(reqIn, '/proxy/master', master, v.h) || v.u)))
+            .join('#');
         }
       }
     }
+    if (!playUrl) playUrl = '直播$' + roomUrl;
     list.push({
       vod_id: key,
       vod_name: String(user.username || user.id),
       vod_pic: String(user.avatar || ''),
       vod_play_from: NAME,
-      vod_play_url: playUrl || ('直播$' + roomUrl),
+      vod_play_url: playUrl,
     });
   }
   return { list };
@@ -211,7 +350,11 @@ async function detail(reqIn) {
 async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
   if (id.includes('$')) id = id.split('$').pop().trim();
-  const isVideo = /\.(m3u8|mp4|n4v9)/i.test(id);
+  // 代理地址直接放行；原始 m3u8 则包一层代理（构造失败时直返）
+  if (/\.m3u8(\?|$)/i.test(id) && id.indexOf('/proxy/master') < 0) {
+    id = proxyUrl(reqIn, '/proxy/master', id) || id;
+  }
+  const isVideo = /\.(m3u8|mp4|n4v9)/i.test(id) || id.indexOf('/proxy/master') >= 0;
   return {
     parse: isVideo ? 0 : 1,
     url: id,
@@ -239,6 +382,7 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
+      fastify.get('/proxy/master', masterProxy);
     },
   };
 }
