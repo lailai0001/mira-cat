@@ -64,7 +64,6 @@ import cg91 from './spider/video/cg91.js';
 import noodle from './spider/video/noodle.js';
 import ultra from './spider/video/ultra.js';
 import asian from './spider/video/asian.js';
-import myfreecams from './spider/video/py_myfreecams.js';
 import javtiful from './spider/video/py_javtiful.js';
 import hornyjav from './spider/video/py_hornyjav.js';
 import javct from './spider/video/py_javct.js';
@@ -123,7 +122,6 @@ const spiders = [
     stripchat,
     hohoj,
     rip17, brazz, bigbuttshub, mmtv, javideo, bestjavporn, chaturbate, asmrba, hlbdy, shipin51, javneon, dycg66, cg91, noodle, ultra, asian,
-    myfreecams,
     javtiful,
     hornyjav,
     javct,
