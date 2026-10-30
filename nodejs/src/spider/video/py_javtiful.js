@@ -52,12 +52,19 @@ function absUrl(href) {
 function imgOf(block) {
   const clean = block.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
   const m = clean.match(/<img[^>]*>/gi);
-  if (m) {
-    for (const tag of m) {
-      const sm = tag.match(/(?:data-src|data-original|src)\s*=\s*"([^"]+)"/i);
-      if (sm && /^https?:\/\//i.test(sm[1]) && !/data:image/i.test(sm[1])) return sm[1];
-      const sm2 = tag.match(/(?:data-src|data-original|src)\s*=\s*"([^"]+)"/i);
-      if (sm2 && sm2[1].startsWith('/')) return HOST + sm2[1];
+  if (!m) return '';
+  for (const tag of m) {
+    // 懒加载真实图优先：javtiful 卡片的 src 是占位图（video-thumb-placeholder.svg），
+    // 真图在 data-front-lazy-src 里；旧写法先命中 src，封面全是占位图。
+    const dm = tag.match(/data-[a-z0-9\-]*lazy-src\s*=\s*"([^"]+)"/i)
+      || tag.match(/data-src\s*=\s*"([^"]+)"/i)
+      || tag.match(/data-original\s*=\s*"([^"]+)"/i);
+    if (dm && dm[1] && !/placeholder/i.test(dm[1]) && !/data:image/i.test(dm[1])) {
+      return dm[1].startsWith('/') ? HOST + dm[1] : dm[1];
+    }
+    const sm = tag.match(/src\s*=\s*"([^"]+)"/i);
+    if (sm && sm[1] && !/placeholder/i.test(sm[1]) && !/data:image/i.test(sm[1])) {
+      return sm[1].startsWith('/') ? HOST + sm[1] : sm[1];
     }
   }
   return '';
@@ -85,16 +92,31 @@ function parseCards(html) {
   return items;
 }
 
+// 2026-10-30 晚扩到站内 /categories 索引的全部 21 个真实分类（均已验有内容）。
+// 注意：站里没有“无码破解”“大屁股”这两个分类（实测 /category/uncensored-leaked、
+// /category/big-ass 等均为 404），故把最接近用户口味的丰满（bbw）与巨乳置顶。
 const CATS = [
+  { type_id: '/category/bbw/', type_name: '丰满' },
+  { type_id: '/category/big-tits/', type_name: '巨乳' },
   { type_id: '/category/affair/', type_name: '偷情' },
   { type_id: '/category/amateur/', type_name: '素人' },
   { type_id: '/category/beautiful-girl/', type_name: '美少女' },
-  { type_id: '/category/big-tits/', type_name: '巨乳' },
+  { type_id: '/category/chinese-av/', type_name: '国产' },
+  { type_id: '/category/cosplay/', type_name: '角色扮演' },
   { type_id: '/category/drama/', type_name: '剧情' },
+  { type_id: '/category/female-boss/', type_name: '女上司' },
+  { type_id: '/category/female-investigator/', type_name: '女侦探' },
+  { type_id: '/category/female-student/', type_name: '女学生' },
+  { type_id: '/category/female-teacher/', type_name: '女教师' },
+  { type_id: '/category/housekeeper/', type_name: '家政妇' },
+  { type_id: '/category/hypnosis/', type_name: '催眠' },
   { type_id: '/category/married-woman/', type_name: '人妻' },
   { type_id: '/category/mature-woman/', type_name: '熟女' },
+  { type_id: '/category/milf/', type_name: '熟妇' },
+  { type_id: '/category/nurse/', type_name: '护士' },
   { type_id: '/category/office-lady/', type_name: 'OL' },
   { type_id: '/category/school-girls/', type_name: '校园' },
+  { type_id: '/category/sister-in-law/', type_name: '嫂子' },
 ];
 
 async function init() { return {}; }
