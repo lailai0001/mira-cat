@@ -70,10 +70,17 @@ async function trendingIds() {
   return ids;
 }
 
+// 主播查询缓存 120 秒：首页→分类→详情重复查同一主播时不再发请求
+const userCache = new Map();
 async function lookupUser(idOrName) {
-  const j = await getJson(API + '/usernameLookup/' + encodeURIComponent(String(idOrName)), WEB + '/' + encodeURIComponent(String(idOrName)));
-  const u = j && j.result && j.result.user;
-  return u || null;
+  const key = String(idOrName);
+  const hit = userCache.get(key);
+  if (hit && hit.exp > Date.now()) return hit.user;
+  const j = await getJson(API + '/usernameLookup/' + encodeURIComponent(key), WEB + '/' + encodeURIComponent(key));
+  const u = (j && j.result && j.result.user) || null;
+  if (userCache.size > 200) userCache.delete(userCache.keys().next().value);
+  userCache.set(key, { user: u, exp: Date.now() + 120000 });
+  return u;
 }
 
 function sessionOf(user) {
@@ -87,13 +94,21 @@ function streamName(user, sess) {
   return 'mfc_' + phase + '_' + String(user.id);
 }
 
-function masterUrl(user, sess) {
+// 官方播放器格式表（mfc-player-chunk.js 实测）：
+//  hls   = .f4v_mobile/playlist.m3u8（标准 HLS，兼容性最广）
+//  llhls = .f4v_cmaf/playlist_sfm4s.m3u8（低延迟 CMAF fMP4）
+// 2026-10-30 晚真机：llhls 经代理裁档仍播不出，改 hls 为主线、llhls 作后备线。
+function masterUrl(user, sess, format) {
   const sn = String(sess.server_name || '');
   const num = (sn.match(/(\d+)/) || [])[1] || '';
   const stream = streamName(user, sess);
   if (!num) return '';
-  return 'https://edgevideo.myfreecams.com/llhls/NxServer/' + num
-    + '/ngrp:' + stream + '.f4v_cmaf/playlist_sfm4s.m3u8'
+  const suffix = format === 'llhls'
+    ? '.f4v_cmaf/playlist_sfm4s.m3u8'
+    : '.f4v_mobile/playlist.m3u8';
+  const app = format === 'llhls' ? 'llhls' : 'hls';
+  return 'https://edgevideo.myfreecams.com/' + app + '/NxServer/' + num
+    + '/ngrp:' + stream + suffix
     + '?nc=' + Math.random() + '&v=0.4.0';
 }
 
@@ -113,16 +128,20 @@ function toItem(user) {
   };
 }
 
+// 2026-10-30 晚修复“首页慢”：旧写法 24 个主播逐个串行查（24 次往返，
+// 实测首页要等十几秒）。改 8 并发分批、保序返回；调用方传入已切片的 id。
 async function itemsForIds(ids) {
-  const list = [];
-  for (const id of ids) {
-    const u = await lookupUser(id);
-    if (!u) continue;
-    if (!sessionOf(u)) continue;
-    list.push(toItem(u));
-    if (list.length >= 24) break;
+  const out = new Array(ids.length).fill(null);
+  const CONC = 8;
+  for (let s = 0; s < ids.length; s += CONC) {
+    const chunk = ids.slice(s, s + CONC);
+    const rs = await Promise.all(chunk.map(async (id) => {
+      const u = await lookupUser(id);
+      return (u && sessionOf(u)) ? toItem(u) : null;
+    }));
+    rs.forEach((r, i) => { out[s + i] = r; });
   }
-  return list;
+  return out.filter(Boolean).slice(0, 24);
 }
 
 function parseVariants(masterText, masterUrlStr) {
@@ -320,7 +339,9 @@ async function detail(reqIn) {
       list.push({ vod_id: key, vod_name: String(user.username || user.id), vod_pic: String(user.avatar || ''), vod_play_from: NAME, vod_play_url: '主播已离线$' + roomUrl });
       continue;
     }
-    const master = masterUrl(user, sess);
+    // 主线改标准 HLS（f4v_mobile，兼容性最广），低延迟 llhls 作后备线，均走代理
+    const master = masterUrl(user, sess, 'hls');
+    const llMaster = masterUrl(user, sess, 'llhls');
     let playUrl = '';
     if (master) {
       // 自动线走代理裁最高档；能拉到主列表时再按高度拆清晰度线（同样走代理）
@@ -334,6 +355,7 @@ async function detail(reqIn) {
             .join('#');
         }
       }
+      if (llMaster) playUrl += '#低延迟$' + (proxyUrl(reqIn, '/proxy/master', llMaster) || llMaster);
     }
     if (!playUrl) playUrl = '直播$' + roomUrl;
     list.push({
