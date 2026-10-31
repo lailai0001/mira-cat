@@ -1,7 +1,8 @@
 // ToJav - 由 https://tojav.net/ 移植（初稿，待用户定名）
 // 站方结构：HTML 列表页（tray 卡片）+ JSON 接口（搜索 / 播放 / 分页）。
-// 分页实测结论（2026-10-31）：无码列表与 genre 页没有可用深翻页
-// （?page= 被忽略：第 2 页或回第 1 页、或回全局列表，故只取第 1 页）；
+// 分页实测结论（2026-10-31 修正）：无码列表与 genre 页走 /page-N
+// （如 /genre/big-tits/page-2，p1/p2/p3 实测均 30 条不同内容；
+// 旧代码用的 ?page= 会被站方忽略，才导致翻页无内容）；
 // 有码列表走 POST /api/v1/pageView {page}（实测 p1/p2/p3 均不同、
 // 均为有码内容，可正常翻页）；关键词分类走搜索接口（见下）。
 // 详情：/<slug>，取 og:title / og:image / filmId / epButton(data-id)。
@@ -99,7 +100,7 @@ function parseItems(html) {
   return out;
 }
 async function listPage(path, page) {
-  const url = HOST + path + (page > 1 ? '?page=' + page : '');
+  const url = HOST + path + (page > 1 ? '/page-' + page : '');
   const r = await reqGet(url, { 'User-Agent': UA });
   if (r.status !== 200) return { list: [], more: false };
   const list = parseItems(r.body);
@@ -152,6 +153,8 @@ const CATS = [
 ];
 // 关键词分类：走站方搜索接口（POST /api/v1/search {term}，
 // 站方返回 30 条；标题盲扫 240 条曾 0 命中，搜索接口是唯一可靠途径）。
+// 搜索接口不支持翻页（page/offset 参数实测均被忽略、回同样 30 条），
+// 故关键词分类只有 1 页、属接口上限，非程序 bug。
 // 短剧：用户 2026-10-31 令四家统一去掉，本站不设（站内搜“短編”得 0 条）。
 const KWCACHE = {};
 async function kwSearch(cat, page) {
@@ -447,18 +450,15 @@ async function category(reqIn) {
   let r = { list: [], more: false };
   try {
     if (tid === 'latest') {
-      // 无码无可用深翻页，只第 1 页
-      if (page === 1) r = await listPage('/jav/uncensored', 1);
-      else r = { list: [], more: false };
+      r = await listPage('/jav/uncensored', page);
     }
     else if (tid === 'censored') r = await censoredPage(page);
     else if (tid.indexOf('kw_') === 0) {
       const cat = KW_CATS.find((c) => c.id === tid);
       if (cat) r = await kwSearch(cat, page);
     } else if (tid.indexOf('genre:') === 0) {
-      // 原生 genre 只第 1 页可靠（站方第 2 页起回全局列表，故不翻页）
-      if (page === 1) r = await listPage('/genre/' + tid.slice(6), 1);
-      else r = { list: [], more: false };
+      // genre 深翻页走 /genre/<slug>/page-N（站方分页锚链实测；?page= 会被忽略）
+      r = await listPage('/genre/' + tid.slice(6), page);
     }
   } catch (e) { r = { list: [], more: false }; }
   return { page, pagecount: r.more ? page + 1 : page, list: r.list };
