@@ -746,6 +746,16 @@ async function liveItems(part, page, size) {
 
 // ---------- 详情 / 播放 ----------
 const STREAM_CACHE = new Map();
+// 用户真机确认：线路 1 的 host（46e9nz.mfpt8g.com）在他手机上所有片都播不了，
+// 其余线路正常；VM 侧 5 个 host 都通（46e9nz 首字节最慢），不能坐实是 host 死了，
+// 但删掉这条线只剩 4 条可用线，代价为零，故按用户令过滤该 host。
+// 注意：不过滤下标、只过滤 host 身份——会话 host 顺序若轮换，坏 host 在哪都照样滤掉；
+// 序号按用户 2026-10-31 令顺延重排：剩下的可用线依次叫线路 1-5（不叫 2-6）。
+const BAD_VIDEO_HOSTS = ['46e9nz.mfpt8g.com'];
+function isBadVideoHost(h) {
+  for (const b of BAD_VIDEO_HOSTS) if (String(h).indexOf(b) >= 0) return true;
+  return false;
+}
 function videoHosts() {
   const list = [];
   const add = (arr) => {
@@ -757,7 +767,7 @@ function videoHosts() {
     }
   };
   if (S) { add(S.video); add(S.vdl); add(S.vplay); add(S.audl); add(S.audio); }
-  if (!list.length) list.push('https://46e9nz.mfpt8g.com', 'https://f86xxm.upmf83.com');
+  if (!list.length) list.push('https://f86xxm.upmf83.com');
   return list;
 }
 function absVideo(path, kind) {
@@ -774,12 +784,20 @@ function videoLines(a) {
   const pushMp4 = (path, label) => {
     if (!path) return;
     const p = String(path);
-    for (let i = 0; i < hosts.length && i < 5; i++) {
-      const url = /^https?:\/\//.test(p) ? p : hosts[i] + (p.charAt(0) === '/' ? '' : '/') + p;
-      lines.push({ name: label + '·线路' + (i + 1) + (/h265/i.test(p) ? '(H.265)' : ''), url });
+    // 坏 host 跳过，序号按保留下来的线顺延重排 1-5
+    const cands = [];
+    for (let i = 0; i < hosts.length; i++) {
+      if (isBadVideoHost(hosts[i])) continue;
+      cands.push(hosts[i]);
+      if (cands.length >= 5) break;
+    }
+    for (let j = 0; j < cands.length; j++) {
+      const url = /^https?:\/\//.test(p) ? p : cands[j] + (p.charAt(0) === '/' ? '' : '/') + p;
+      lines.push({ name: label + '·线路' + (j + 1) + (/h265/i.test(p) ? '(H.265)' : ''), url });
     }
   };
   const previewOnly = isPreviewOnly(a);
+  // pushMp4 内坏 host 跳过，序号按保留下来的线顺延重排 1-5（用户令）
   pushMp4(a.video_download, '完整版MP4');
   if (!previewOnly && a.video_file && String(a.video_file) !== String(a.video_download || '')) pushMp4(a.video_file, 'MP4');
   else if (previewOnly) pushMp4(a.video_file, '预告MP4');
@@ -825,6 +843,46 @@ function articleDesc(a) {
   return body ? head + '\n' + body : head;
 }
 
+// ---------- 关键词分类 ----------
+// 服务端没有标签筛选接口（discovery 只给 model/月份/排序），故与日本/国产/欧美分区
+// 同机理：复用 monthFeed 月度流（已滤预告），按标题+标签+作者文本匹配；
+// 命中是文本口径、非服务端标签，分类名即匹配词本身，不编造不存在的筛选。
+const KW_CATS = [
+  { id: 'kw_wuma', title: '无码流出', re: /无码|无修正|流出|泄露|破解/ },
+  { id: 'kw_juru', title: '巨乳', re: /巨乳|爆乳|大奶|美乳|大胸|G杯|H杯|I杯|J杯/ },
+  { id: 'kw_dapigu', title: '大屁股', re: /大屁股|巨臀|丰臀|美臀|翘臀|蜜桃臀|大臀|肥臀/ },
+  { id: 'kw_renqi', title: '人妻', re: /人妻|熟女|少妇|已婚|主妇/ },
+  { id: 'kw_zhifu', title: '制服', re: /制服|女教师|空姐|护士|女警|女仆|秘书|职业装/ },
+  { id: 'kw_duanju', title: '短剧', re: /短剧/ },
+];
+function kwText(a) {
+  return [pick(a.title, a.video_name, ''), tagList(a).join(' '), String(a.author || '')].join(' ');
+}
+const KWALL = {};
+async function kwItems(cat, page, size) {
+  const need = page * size;
+  let st = KWALL[cat.id];
+  if (!st) { st = { items: [], seen: {}, off: 0, emptyRun: 0, done: false }; KWALL[cat.id] = st; }
+  while (st.items.length < need && !st.done && st.off < 400) {
+    const arr = await monthFeed(st.off);
+    if (!arr.length) { st.emptyRun++; st.off++; if (st.emptyRun >= 8) st.done = true; continue; }
+    st.emptyRun = 0;
+    const label = monthLabel(st.off);
+    for (const it of arr) {
+      if (!cat.re.test(kwText(it))) continue;
+      const key = String(it.id);
+      if (st.seen[key]) continue;
+      st.seen[key] = 1;
+      const item = articleItem(it);
+      item.vod_remarks = label + ' · ' + item.vod_remarks;
+      st.items.push(item);
+    }
+    st.off++;
+  }
+  const from = (page - 1) * size;
+  return { list: st.items.slice(from, from + size), more: !st.done };
+}
+
 // ---------- 猫源路由 ----------
 const CATS = [
   { type_id: 'newest', type_name: '最新视频' },
@@ -833,6 +891,12 @@ const CATS = [
   { type_id: 'cn', type_name: '国产' },
   { type_id: 'us', type_name: '欧美' },
   { type_id: 'live', type_name: 'ONE直播' },
+  { type_id: 'kw_wuma', type_name: '无码流出' },
+  { type_id: 'kw_juru', type_name: '巨乳' },
+  { type_id: 'kw_dapigu', type_name: '大屁股' },
+  { type_id: 'kw_renqi', type_name: '人妻' },
+  { type_id: 'kw_zhifu', type_name: '制服' },
+  { type_id: 'kw_duanju', type_name: '短剧' },
 ];
 const PAGE_SIZE = 24;
 
@@ -856,6 +920,10 @@ async function category(reqIn) {
     if (tid === 'newest') r = await newestItems(page, PAGE_SIZE);
     else if (tid === 'hot') r = await hotItems(page, PAGE_SIZE);
     else if (tid === 'live') r = await liveItems(partitionById('live'), page, PAGE_SIZE);
+    else if (tid.indexOf('kw_') === 0) {
+      const cat = KW_CATS.find((c) => c.id === tid);
+      if (cat) r = await kwItems(cat, page, PAGE_SIZE);
+    }
     else {
       const part = partitionById(tid);
       if (part) r = await regionItems(part, page, PAGE_SIZE);
