@@ -595,8 +595,13 @@ function articleItem(a, fallbackCover) {
 }
 
 // ---------- 月度流 / 分区 / 最新 / 热门 ----------
-const MONTH_CACHE = {};
-const PART_CACHE = {};
+// 提速（2026-10-31，用户报加载慢，实测首页 11.9 秒）：旧 monthFeed 每月固定拉满
+// 8 次请求（两模型各 4 页），但一页只要 24 条；改为分批拉取：batch 0 = 两模型
+// 各第 1 页（2 次请求），batch 1 = 两模型第 2-4 页（最多 6 次，仅当第 1 页满
+// 100 条时才拉）。累加器按需消费，够一页就停，不再为一页内容拉满整月；
+// 内容池与旧逻辑一致（同月内 batch 0 为各模型最新 100 条，首页 24 条必在
+// 其中；深页按需续拉，批内按发布时间倒序）。
+const MONTHB = {};
 function monthTtl(offset) {
   return (parseInt(offset, 10) || 0) <= 1 ? 10 * 60 * 1000 : 12 * 60 * 60 * 1000;
 }
@@ -608,67 +613,85 @@ async function fetchMonthPage(model, offset, page, size, sortMode) {
     return arr || [];
   } catch (e) { return []; }
 }
-async function monthFeed(offset) {
-  const key = 'm' + offset;
-  const c = MONTH_CACHE[key];
-  if (c && Date.now() - c.ts < monthTtl(offset)) return c.arr;
-  const firsts = await Promise.all(VIDEO_MODELS.map((m) => fetchMonthPage(m, offset, 1, 100)));
-  const chunks = [];
-  const moreJobs = [];
-  for (let mi = 0; mi < firsts.length; mi++) {
-    const p1 = firsts[mi] || [];
-    chunks.push(p1);
-    if (p1.length >= 100) for (let pg = 2; pg <= 4; pg++) moreJobs.push(fetchMonthPage(VIDEO_MODELS[mi], offset, pg, 100));
-  }
-  if (moreJobs.length) {
-    const mores = await Promise.all(moreJobs);
-    for (const mo of mores) chunks.push(mo || []);
-  }
-  const arr = []; const seen = {};
-  for (const chunk of chunks) {
-    for (const it of (chunk || [])) {
-      const id = String(it.id);
-      if (seen[id]) continue;
-      if (isPreviewOnly(it)) continue;
-      seen[id] = 1;
-      arr.push(it);
-    }
-  }
+function sortByPubDesc(arr) {
   arr.sort((x, y) => String(y.published_at || '').localeCompare(String(x.published_at || '')));
-  MONTH_CACHE[key] = { ts: Date.now(), arr };
   return arr;
 }
-async function partitionFeed(part, offset) {
-  const key = part.id + ':' + offset;
-  const c = PART_CACHE[key];
-  if (c && Date.now() - c.ts < monthTtl(offset)) return c.arr;
-  const all = await monthFeed(offset);
+async function monthBatch(offset, batch) {
+  let st = MONTHB[offset];
+  if (!st || Date.now() - st.ts > monthTtl(offset)) {
+    st = { b0: null, b1: null, full: [false, false], seen: {}, ts: Date.now() };
+    MONTHB[offset] = st;
+  }
+  if (batch === 0) {
+    if (st.b0) return st.b0;
+    const firsts = await Promise.all(VIDEO_MODELS.map((m) => fetchMonthPage(m, offset, 1, 100)));
+    const out = [];
+    for (let mi = 0; mi < firsts.length; mi++) {
+      const p1 = firsts[mi] || [];
+      st.full[mi] = p1.length >= 100;
+      for (const it of p1) {
+        const id = String(it.id);
+        if (st.seen[id]) continue;
+        if (isPreviewOnly(it)) continue;
+        st.seen[id] = 1;
+        out.push(it);
+      }
+    }
+    st.b0 = sortByPubDesc(out);
+    return st.b0;
+  }
+  if (st.b1) return st.b1;
+  await monthBatch(offset, 0);
+  const jobs = [];
+  for (let mi = 0; mi < VIDEO_MODELS.length; mi++) {
+    if (!st.full[mi]) continue;
+    for (let pg = 2; pg <= 4; pg++) jobs.push(fetchMonthPage(VIDEO_MODELS[mi], offset, pg, 100));
+  }
+  const mores = jobs.length ? await Promise.all(jobs) : [];
   const out = [];
-  for (const it of all) if (classifyPart(it) === part.id) out.push(it);
-  out.sort((x, y) => String(y.published_at || '').localeCompare(String(x.published_at || '')));
-  PART_CACHE[key] = { ts: Date.now(), arr: out };
-  return out;
+  for (const chunk of mores) {
+    for (const it of (chunk || [])) {
+      const id = String(it.id);
+      if (st.seen[id]) continue;
+      if (isPreviewOnly(it)) continue;
+      st.seen[id] = 1;
+      out.push(it);
+    }
+  }
+  st.b1 = sortByPubDesc(out);
+  return st.b1;
 }
-const NEWEST = { items: [], seen: {}, off: 0, emptyRun: 0, done: false };
-async function newestItems(page, size) {
+// 通用按需扫描：st 为 { items, seen, off, batch, emptyRun, done, monthStart }；
+// filterFn 为空表示全收，否则只收匹配项；够 need 条就停，不再多拉。
+async function scanFeed(st, filterFn, page, size) {
   const need = page * size;
-  while (NEWEST.items.length < need && !NEWEST.done && NEWEST.off < 400) {
-    const arr = await monthFeed(NEWEST.off);
-    if (!arr.length) { NEWEST.emptyRun++; NEWEST.off++; if (NEWEST.emptyRun >= 8) NEWEST.done = true; continue; }
-    NEWEST.emptyRun = 0;
-    const label = monthLabel(NEWEST.off);
-    for (const it of arr) {
+  while (st.items.length < need && !st.done && st.off < 400) {
+    if (st.batch === 0) st.monthStart = st.items.length;
+    const batch = await monthBatch(st.off, st.batch);
+    const label = monthLabel(st.off);
+    for (const it of batch) {
+      if (filterFn && !filterFn(it)) continue;
       const key = String(it.id);
-      if (NEWEST.seen[key]) continue;
-      NEWEST.seen[key] = 1;
+      if (st.seen[key]) continue;
+      st.seen[key] = 1;
       const item = articleItem(it);
       item.vod_remarks = label + ' · ' + item.vod_remarks;
-      NEWEST.items.push(item);
+      st.items.push(item);
     }
-    NEWEST.off++;
+    if (st.batch === 0) st.batch = 1;
+    else {
+      if (st.items.length === st.monthStart) { st.emptyRun++; if (st.emptyRun >= 8) st.done = true; }
+      else st.emptyRun = 0;
+      st.off++; st.batch = 0;
+    }
   }
-  const start = (page - 1) * size;
-  return { list: NEWEST.items.slice(start, start + size), more: !NEWEST.done };
+  const from = (page - 1) * size;
+  return { list: st.items.slice(from, from + size), more: !st.done };
+}
+const NEWEST = { items: [], seen: {}, off: 0, batch: 0, emptyRun: 0, done: false, monthStart: 0 };
+async function newestItems(page, size) {
+  return scanFeed(NEWEST, null, page, size);
 }
 const HOTMONTH = {};
 async function hotMonth(offset) {
@@ -713,26 +736,9 @@ async function hotItems(page, size) {
 }
 const PALL = {};
 async function regionItems(part, page, size) {
-  const need = page * size;
   let st = PALL[part.id];
-  if (!st) { st = { items: [], seen: {}, off: 0, emptyRun: 0, done: false }; PALL[part.id] = st; }
-  while (st.items.length < need && !st.done && st.off < 400) {
-    const arr = await partitionFeed(part, st.off);
-    if (!arr.length) { st.emptyRun++; st.off++; if (st.emptyRun >= 8) st.done = true; continue; }
-    st.emptyRun = 0;
-    const label = monthLabel(st.off);
-    for (const it of arr) {
-      const key = String(it.id);
-      if (st.seen[key]) continue;
-      st.seen[key] = 1;
-      const item = articleItem(it);
-      item.vod_remarks = label + ' · ' + item.vod_remarks;
-      st.items.push(item);
-    }
-    st.off++;
-  }
-  const from = (page - 1) * size;
-  return { list: st.items.slice(from, from + size), more: !st.done };
+  if (!st) { st = { items: [], seen: {}, off: 0, batch: 0, emptyRun: 0, done: false, monthStart: 0 }; PALL[part.id] = st; }
+  return scanFeed(st, (it) => classifyPart(it) === part.id, page, size);
 }
 async function liveItems(part, page, size) {
   const arr = await call('article/search', { keyword: 'ONE直播', model_id: 0, series_category: 0, page, size });
@@ -845,7 +851,7 @@ function articleDesc(a) {
 
 // ---------- 关键词分类 ----------
 // 服务端没有标签筛选接口（discovery 只给 model/月份/排序），故与日本/国产/欧美分区
-// 同机理：复用 monthFeed 月度流（已滤预告），按标题+标签+作者文本匹配；
+// 同机理：复用 monthBatch 分批月度流（已滤预告），按标题+标签+作者文本匹配；
 // 命中是文本口径、非服务端标签，分类名即匹配词本身，不编造不存在的筛选。
 const KW_CATS = [
   { id: 'kw_wuma', title: '无码流出', re: /无码|无修正|流出|泄露|破解/ },
@@ -860,36 +866,15 @@ function kwText(a) {
 }
 const KWALL = {};
 async function kwItems(cat, page, size) {
-  const need = page * size;
   let st = KWALL[cat.id];
-  if (!st) { st = { items: [], seen: {}, off: 0, emptyRun: 0, done: false }; KWALL[cat.id] = st; }
-  while (st.items.length < need && !st.done && st.off < 400) {
-    const arr = await monthFeed(st.off);
-    if (!arr.length) { st.emptyRun++; st.off++; if (st.emptyRun >= 8) st.done = true; continue; }
-    st.emptyRun = 0;
-    const label = monthLabel(st.off);
-    for (const it of arr) {
-      if (!cat.re.test(kwText(it))) continue;
-      const key = String(it.id);
-      if (st.seen[key]) continue;
-      st.seen[key] = 1;
-      const item = articleItem(it);
-      item.vod_remarks = label + ' · ' + item.vod_remarks;
-      st.items.push(item);
-    }
-    st.off++;
-  }
-  const from = (page - 1) * size;
-  return { list: st.items.slice(from, from + size), more: !st.done };
+  if (!st) { st = { items: [], seen: {}, off: 0, batch: 0, emptyRun: 0, done: false, monthStart: 0 }; KWALL[cat.id] = st; }
+  return scanFeed(st, (it) => cat.re.test(kwText(it)), page, size);
 }
 
 // ---------- 猫源路由 ----------
 const CATS = [
   { type_id: 'newest', type_name: '最新视频' },
   { type_id: 'hot', type_name: '热门视频' },
-  { type_id: 'jp', type_name: '日本' },
-  { type_id: 'cn', type_name: '国产' },
-  { type_id: 'us', type_name: '欧美' },
   { type_id: 'live', type_name: 'ONE直播' },
   { type_id: 'kw_wuma', type_name: '无码流出' },
   { type_id: 'kw_juru', type_name: '巨乳' },
@@ -897,6 +882,9 @@ const CATS = [
   { type_id: 'kw_renqi', type_name: '人妻' },
   { type_id: 'kw_zhifu', type_name: '制服' },
   { type_id: 'kw_duanju', type_name: '短剧' },
+  { type_id: 'jp', type_name: '日本' },
+  { type_id: 'cn', type_name: '国产' },
+  { type_id: 'us', type_name: '欧美' },
 ];
 const PAGE_SIZE = 24;
 
