@@ -109,19 +109,19 @@ async function listPage(path, page) {
 
 // ---------- 分类 ----------
 const KW_CATS = [
-  { id: 'kw_dapigu', name: '大屁股', term: '尻' },
+  // 大屁股已改走原生 genre:big-asses（见 CATS；搜索接口只回 30 条且不支持翻页，2026-10-31 实测）
 ];
 const CATS = [
+  { type_id: 'latest', type_name: '最新' },
   { type_id: 'genre:uncensored-leaked', type_name: '无码流出' },
   { type_id: 'genre:big-tits', type_name: '巨乳' },
-  { type_id: 'kw_dapigu', type_name: '大屁股' },
+  { type_id: 'genre:big-asses', type_name: '大屁股' },
   { type_id: 'genre:married-woman', type_name: '人妻' },
   { type_id: 'genre:uniform', type_name: '制服' },
   { type_id: 'genre:4k', type_name: '4K' },
   { type_id: 'genre:reducing-mosaic', type_name: '减码' },
   { type_id: 'genre:nurse', type_name: '护士' },
   { type_id: 'genre:maid', type_name: '女仆' },
-  { type_id: 'latest', type_name: '最新' },
   { type_id: 'censored', type_name: '有码' },
   { type_id: 'genre:beautiful-girl', type_name: 'Beautiful Girl' },
   { type_id: 'genre:featured-actress', type_name: 'Featured Actress' },
@@ -553,7 +553,48 @@ async function play(reqIn) {
     }
     const m = playerHtml.match(/embed\/([0-9a-f-]{36})/);
     if (!m) {
+      // javtiful 嵌套播放器（2026-10-31 查实：-mosaic 类条目走 javtiful.com/embed/<数字 id>，
+      // 旧代码只认 36 位 UUID，匹配失败回空地址 → 播放器一直转圈；MNGS-079 即此类）
+      const jm = playerHtml.match(/javtiful\.com\/embed\/(\d+)/);
+      if (jm) {
+        const jtEmbed = 'https://javtiful.com/embed/' + jm[1];
+        try {
+          const eh = await reqGet(jtEmbed, { 'User-Agent': UA, Referer: HOST + '/' });
+          const pm = (eh.body || '').match(/"playback"\s*:\s*\{\s*"endpoint"\s*:\s*"([^"]+)"\s*,\s*"ticket"\s*:\s*"([^"]+)"/i);
+          if (pm) {
+            const endpoint = pm[1].startsWith('http') ? pm[1] : 'https://javtiful.com' + pm[1];
+            const pb = await reqPostForm(endpoint, { ticket: pm[2] },
+              { 'User-Agent': UA, Referer: jtEmbed, 'X-Requested-With': 'XMLHttpRequest' });
+            let pj = pb.json;
+            if (!pj && pb.text) { try { pj = JSON.parse(pb.text); } catch (e) {} }
+            if (pj && pj.success && Array.isArray(pj.sources) && pj.sources.length) {
+              let best = pj.sources[0];
+              for (const s of pj.sources) { if ((s.size || 0) > (best.size || 0)) best = s; }
+              let src = best.src || best.fallbackSrc || '';
+              if (src && !/^https?:\/\//i.test(src)) src = 'https://javtiful.com' + (src.startsWith('/') ? '' : '/') + src;
+              if (src) {
+                const subs = await subsP;
+                const res = { parse: 0, url: src, header: { Referer: jtEmbed, 'User-Agent': UA } };
+                if (subs && subs.length) res.subs = subs;
+                return res;
+              }
+            }
+          }
+        } catch (e) { /* 落到嗅探 */ }
+        // javtiful 链路失败时退回嵌套页嗅探，绝不回空地址（空地址即转圈）
+        const subs = await subsP;
+        const res = { parse: 1, url: jtEmbed, header: { Referer: HOST + '/', 'User-Agent': UA } };
+        if (subs && subs.length) res.subs = subs;
+        return res;
+      }
+      // 未知嵌套：有 iframe 地址就嗅探，否则才回空
+      const im = playerHtml.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
       const subs = await subsP;
+      if (im) {
+        const res = { parse: 1, url: im[1], header: { Referer: HOST + '/', 'User-Agent': UA } };
+        if (subs && subs.length) res.subs = subs;
+        return res;
+      }
       const res = { parse: 0, url: '' };
       if (subs && subs.length) res.subs = subs;
       return res;
