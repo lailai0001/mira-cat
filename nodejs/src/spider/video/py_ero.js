@@ -58,6 +58,7 @@ async function getHtml(url, timeoutMs) {
 // 前列 9 个为用户钦定中文名（均有原生支撑，见 REPORT_ero.md 对照表；短剧已去掉）；
 // 其后 20 个为原生类型按站内数量排序（中文显示名，原名见报告）。
 const CATS = [
+  { type_id: 'newest', type_name: '最新' },
   { type_id: 'g:%e3%83%a2%e3%82%b6%e3%82%a4%e3%82%af%e9%99%a4%e5%8e%bb', type_name: '无码流出' },
   { type_id: 'g:%e5%b7%a8%e4%b9%b3', type_name: '巨乳' },
   { type_id: 'g:%e5%b7%a8%e5%b0%bb', type_name: '大屁股' },
@@ -67,7 +68,6 @@ const CATS = [
   { type_id: 'g:4k', type_name: '4K' },
   { type_id: 'g:%e4%b8%ad%e5%87%ba%e3%81%97', type_name: '中出し' },
   { type_id: 'g:%e7%b4%a0%e4%ba%ba', type_name: '素人' },
-  { type_id: 'newest', type_name: '最新' },
   { type_id: 'g:%e5%8d%98%e4%bd%93%e4%bd%9c%e5%93%81', type_name: '单体作品' },
   { type_id: 'g:%e3%83%8f%e3%82%a4%e3%83%93%e3%82%b8%e3%83%a7%e3%83%b3', type_name: '高清' },
   { type_id: 'g:%e7%8b%ac%e5%8d%a0%e9%85%8d%e4%bf%a1', type_name: '独占配信' },
