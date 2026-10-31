@@ -74,6 +74,7 @@ import tojav from './spider/video/py_tojav.js';
 import javplayer from './spider/video/py_javplayer.js';
 import ero from './spider/video/py_ero.js';
 import javcc from './spider/video/py_javcc.js';
+import javfeed from './spider/video/py_javfeed.js';
 
 const spiders = [
     missav_xptv,
@@ -131,7 +132,7 @@ const spiders = [
     hornyjav,
     javct,
     topjav,
-    perverzija, one, tojav, javplayer, ero, javcc,];
+    perverzija, one, tojav, javplayer, ero, javcc, javfeed,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
