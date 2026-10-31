@@ -109,7 +109,9 @@ function parseCards(html) {
 // 分类：前列为用户钦定的关键词类（全部对应站方原生标签页，真实可验证）；
 // 短剧在本站无对应内容，不设。末尾为站方原生 3 分类 + 最新。
 const CATS = [
+  { type_id: 'latest', type_name: '最新' },
   { type_id: 'tag/uncensored-leaked', type_name: '无码流出' },
+  { type_id: 'category/reducing-mosaic', type_name: '减码' },
   { type_id: 'tag/big-tits', type_name: '巨乳' },
   { type_id: 'tag/huge-butt', type_name: '大屁股' },
   { type_id: 'tag/married-woman', type_name: '人妻' },
@@ -118,9 +120,7 @@ const CATS = [
   { type_id: 'tag/creampie', type_name: '中出' },
   { type_id: 'tag/amateur', type_name: '素人' },
   { type_id: 'tag/beautiful-girl', type_name: '美少女' },
-  { type_id: 'latest', type_name: '最新' },
   { type_id: 'category/censored', type_name: '有码' },
-  { type_id: 'category/reducing-mosaic', type_name: '减码' },
   { type_id: 'category/english-subtitle', type_name: '英字' },
 ];
 
