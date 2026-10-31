@@ -32,6 +32,7 @@ const KEY = 'py_javplayer';
 const NAME = 'JavPlayer';
 const HOST = 'https://javplayer.org';
 const WORKER = 'https://sextb-hls.li768435813.workers.dev';
+const SITE_FETCH = 'https://site-fetch.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 function H(referer) {
@@ -43,7 +44,22 @@ function H(referer) {
   };
 }
 
+// 站方 WAF 拦截程序化直连（2026-10-31：VM curl / node / 换 UA 均 403
+// "Your request was blocked"，设备侧同样无内容；jina 实测可回真实 HTML）。
+// 取数依次走：自家中转 site-fetch → jina → 直连；首个拿到真实 HTML 的胜出。
+// site-fetch 需 v3（allowlist 含 javplayer.org；未更新前回 400，自动落到下一腿）。
+function looksRealHtml(t) {
+  return !!t && t.length > 2000 && !/Your request was blocked|Just a moment|Checking your browser|Attention Required|cf-challenge|cf\.errors/i.test(t);
+}
 async function getText(url, referer) {
+  try {
+    const r = await req.get(SITE_FETCH + '/?u=' + encodeURIComponent(url), { headers: H(referer), timeout: 12000 });
+    if (r.status === 200 && looksRealHtml(String(r.data || ''))) return String(r.data);
+  } catch {}
+  try {
+    const r = await req.get('https://r.jina.ai/' + url, { headers: Object.assign(H(referer), { 'x-respond-with': 'html' }), timeout: 20000 });
+    if (r.status === 200 && looksRealHtml(String(r.data || ''))) return String(r.data);
+  } catch {}
   try {
     const { data } = await req.get(url, { headers: H(referer), timeout: 15000 });
     return String(data || '');
@@ -438,17 +454,25 @@ async function ajaxPlayer(filmId, episode, pt, durl) {
   let ajaxUrl = '';
   try { ajaxUrl = new URL(durl).origin + '/ajax/player'; } catch { return null; }
   const body = 'episode=' + encodeURIComponent(episode) + '&filmId=' + encodeURIComponent(filmId) + '&pt=' + encodeURIComponent(pt);
+  const headers = {
+    'User-Agent': UA,
+    'Referer': durl,
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'X-Requested-With': 'XMLHttpRequest',
+  };
+  // ① 中转 POST（需 site-fetch v3：allowlist 含 javplayer.org + POST 透传；
+  // 未更新前中转回 400/非 JSON，自动落到直连，不影响旧行为）
   try {
-    const { data, status } = await req.post(ajaxUrl, body, {
-      headers: {
-        'User-Agent': UA,
-        'Referer': durl,
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'X-Requested-With': 'XMLHttpRequest',
-      },
-      timeout: 15000,
-    });
+    const r = await req.post(SITE_FETCH + '/?u=' + encodeURIComponent(ajaxUrl), body, { headers, timeout: 15000 });
+    if (r.status === 200 && r.data != null) {
+      const j = typeof r.data === 'string' ? JSON.parse(r.data) : r.data;
+      if (j && (j.player || j.player_enc)) return j;
+    }
+  } catch (e) {}
+  // ② 直连 POST
+  try {
+    const { data, status } = await req.post(ajaxUrl, body, { headers, timeout: 15000 });
     if (status === 200 && data != null) {
       return typeof data === 'string' ? JSON.parse(data) : data;
     }
