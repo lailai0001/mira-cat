@@ -150,7 +150,8 @@ function parseCards(html) {
 
 // ---------- 分类 ----------
 const CATS = [
-  { type_id: 'kw_wuma', type_name: '无码流出' },
+  { type_id: '/new-releases', type_name: '最新' },
+  { type_id: 'kw_jianma', type_name: '减码' },
   { type_id: '/category/big-tits', type_name: '巨乳' },
   { type_id: '/category/big-asses', type_name: '大屁股' },
   { type_id: '/category/married-woman', type_name: '人妻' },
@@ -159,7 +160,6 @@ const CATS = [
   { type_id: '/amateur', type_name: '素人' },
   { type_id: '/uncensored', type_name: '无码' },
   { type_id: '/subtitle', type_name: '字幕' },
-  { type_id: '/new-releases', type_name: '最新' },
   { type_id: '/censored', type_name: '有码' },
   { type_id: '/category/anal', type_name: '肛交' },
   { type_id: '/category/av-idol', type_name: 'AV偶像' },
@@ -275,7 +275,9 @@ async function fetchList(path, page) {
 // 三个关键词分类共用底页缓存；匹配只用列表卡片自带的标题+番号（卡片不带标签，
 // 逐卡抓详情太贵，故不含标签——见报告）。
 const KW = [
-  { id: 'kw_wuma', re: /流出|泄露|leaked/i },
+  // 减码 = 番号 -rm 后缀（站方减码版标记；new-releases p1 实测 24 条中 12 条带 -rm）。
+  // 旧 无码流出（流出|泄露|leaked）在站内标题+番号中几乎无命中，致分类为空，2026-10-31 设备侧坐实。
+  { id: 'kw_jianma', re: /-rm$/i },
   { id: 'kw_zhifu', re: /制服|セーラー|女子校生|女子○生|女教師|ブレザー|学園/ },
 ];
 const KWALL = {};
