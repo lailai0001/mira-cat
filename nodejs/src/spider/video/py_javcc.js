@@ -135,8 +135,15 @@ async function category(reqIn) {
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const base = tid === 'latest' ? HOST : HOST + '/' + tid.replace(/^\/+/, '').replace(/\/+$/, '');
   const url = page === 1 ? (base + '/') : (base + '/page/' + page + '/');
-  const html = await getText(url, HOST + '/');
-  const list = parseCards(html);
+  let html = await getText(url, HOST + '/');
+  let list = parseCards(html);
+  // 翻页兜底（2026-10-31：VM 侧 /page/N/ 本是通的，但设备侧有用户报翻页无内容，
+  // 原因未坐实，可能是个别网络/缓存导致主地址空回；主地址空回时换 ?paged=N 再取一次）
+  if (page > 1 && !list.length) {
+    const alt = tid === 'latest' ? HOST + '/?paged=' + page : base + '/?paged=' + page;
+    html = await getText(alt, HOST + '/', 20000);
+    list = parseCards(html);
+  }
   return { page, pagecount: list.length ? page + 1 : page, list };
 }
 
