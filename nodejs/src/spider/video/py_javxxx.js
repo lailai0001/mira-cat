@@ -21,6 +21,7 @@ import * as cheerio from 'cheerio';
 const KEY = 'py_javxxx';
 const NAME = 'JavXXX';
 const HOST = 'https://www.javxxx.me';
+const JINA = 'https://r.jina.ai/';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 // 顶级分类（type_id = slug，不含 v 号）
@@ -84,7 +85,14 @@ function isRealHtml(t) {
   return true;
 }
 
+function isCfBlock(t) {
+  return /Just a moment|Attention Required|challenges\.cloudflare/i.test(t || '');
+}
+
+// 取页：直连优先，失败/被 CF 拦则走 jina 兜底（直连被拦时设备上 5G 移动 IP 也常被拦）。
+// 直连回 HTML，jina 回 Markdown；列表解析两种都认，详情仍需直连 HTML 才有 data-ts-live。
 async function getText(url, referer) {
+  // ① 直连
   try {
     const r = await req.get(url, {
       headers: {
@@ -96,8 +104,19 @@ async function getText(url, referer) {
       timeout: 20000,
     });
     const t = typeof r.data === 'string' ? r.data : '';
-    return isRealHtml(t) ? t : '';
-  } catch (e) { return ''; }
+    if (isRealHtml(t)) return t;
+  } catch (e) { /* 落到 jina */ }
+  // ② jina 兜底
+  try {
+    const r = await req.get(JINA + url, {
+      headers: { 'User-Agent': UA, Accept: 'text/plain' },
+      timeout: 30000,
+    });
+    const t = typeof r.data === 'string' ? r.data : '';
+    // jina 成功回 Markdown（含 'Markdown Content:'）；429 限流回 JSON，必须排除
+    if (t && t.includes('Markdown Content:') && !isCfBlock(t)) return t;
+  } catch (e) { /* 失败 */ }
+  return '';
 }
 
 // ---------- base64 / RC4（cast.js _0xfme 的纯 JS 复现） ----------
@@ -212,9 +231,48 @@ function vFor(slug, vmap) {
 // 卡片：div.item.thumb-block > div.video-img > a[href="/video/{code}/"]
 //   封面在 img 的 data-wpsrc（wp.com 代理）/ data-lazy-src / data-src，
 //   src 是占位 svg；标题在 a[title] 或 h3 a 文本；时长在 .video-duration。
+// jina Markdown 列表解析（直连被 CF 拦、走 jina 兜底时用）。
+// jina 渲染不稳定，两种卡形都认：
+// ① 图片链 [![Image N: 标题](封面)...](视频地址 "标题")——封面是真地址时用；
+// ② ### [标题](视频地址 "标题")——图片链封面是 blob:（jina 渲染坏了）时用，
+//    只有标题+地址、无封面，但至少能出列表、可点播。
+// 实测一页 18~24 张（直连 HTML 更多，jina 只是兜底）。
+function parseCardsMd(text, host) {
+  const cards = [];
+  if (!text) return cards;
+  const seen = new Set();
+  // ① 图片链（封面须是真 http 地址，blob: 的不要）
+  const re = /\[!\[Image \d+: ([^\]]*)\]\((https?:\/\/[^)]+)\)[^\]]*\]\((https?:\/\/[^)\s]+\/video\/[^)\s]+)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const title = cleanText(m[1]);
+    const cover = m[2];
+    let href = m[3].split('"')[0].trim();
+    if (!href || !title || seen.has(href)) continue;
+    seen.add(href);
+    cards.push({ vod_id: absUrl(href, host), vod_name: title, vod_pic: absUrl(cover, host), vod_remarks: '' });
+  }
+  // ② ### 标题链（图片链没出卡时补）
+  if (!cards.length) {
+    const re2 = /### \[([^\]]+)\]\((https?:\/\/[^)\s]+\/video\/[^)\s]+)/g;
+    while ((m = re2.exec(text)) !== null) {
+      const title = cleanText(m[1]);
+      let href = m[2].split('"')[0].trim();
+      if (!href || !title || seen.has(href)) continue;
+      seen.add(href);
+      cards.push({ vod_id: absUrl(href, host), vod_name: title, vod_pic: '', vod_remarks: '' });
+    }
+  }
+  return cards;
+}
+
 function parseCards(html, host) {
   const cards = [];
   if (!html || html.includes('Just a moment...')) return cards;
+  // jina Markdown（直连被拦时 getText 回的是 Markdown，不是 HTML）
+  if (!/<[a-z][\s\S]*>/i.test(html.slice(0, 2000)) || html.includes('Markdown Content:')) {
+    return parseCardsMd(html, host);
+  }
   const $ = cheerio.load(html);
   $('.item.thumb-block').each((_, e) => {
     const el = $(e);
@@ -373,8 +431,9 @@ async function category(reqIn) {
   const extend = body.filters || body.extend || {};
   const sub = String(extend.sub || '').trim().toLowerCase();
   const slug = sub || tid;
-  const vmap = await getVMap(false);
-  let v = vFor(slug, vmap);
+  // 先用 V_DEFAULT（已验正确），不先取首页——取首页要多一次 jina 调用，
+  // 与分类页连发会撞 jina 限流。若列表为空再重解析首页取新 v 号重试。
+  let v = vFor(slug, null);
   let path = '/' + v + '/category/' + slug + '/';
   let url = HOST + path + (page > 1 ? 'page/' + page + '/' : '');
   let html = await getText(url, HOST + '/');

@@ -10,10 +10,8 @@
 // 1920x1080（cawb075、fc2ppv-5014920 均 200 取回、单条 STREAM-INF；
 // adn808 一次 502 一次超时，属 CDN 抖动），站方嵌页里根本没有 720p，
 // 蜘蛛按 master 有几档出几档，不编造 720p。
-// streamtape 已死（2026-11-28，三部片 cawb075 / adn808 / fc2ppv-5014920）：
-// /e/ 嵌页仍 200 且含 get_video 链接，但 /v/ 页一律 404 “Video not found! /
-// deleted by the creator!”，get_video 直 curl 回 (52) Empty reply from server；
-// 文件是站方删了，不是缺 Referer/头能修的，故整条线去掉，只留 minochinos。
+// streamtape 线（2026-11-28 用户令回到修前，加回来）：三部抽查片的 /v/ 页
+// 曾 404，但用户实测修前能播，以用户真机为准。嵌页含 get_video 直链 mp4。
 // 分类：censored / uncensored / amature / fc2ppv / vr / popularity / trend
 // + studios（制作商筛选卡片，12 家实测均 200 且 36 卡）+ tags 标签（筛选卡片，
 // 含 モザイク除去/無修正流出/javplayer-モザイク破壊 三个 LTX 相关标签）；
@@ -221,6 +219,18 @@ function extractEmbeds(html) {
   return out;
 }
 
+// streamtape 嵌页 -> 直链 mp4：嵌页含 get_video?id=&expires=&ip=&token=<redacted>
+// （2026-11-28 用户令线路回到修前：修后只剩 minochinos、好多播不了，
+// 修前 streamtape + minochinos 1080p 都能播，故把 streamtape 线加回来。
+// 注：三部抽查片的 /v/ 页曾 404，但用户实测修前能播，以用户真机为准。）
+async function resolveStreamtape(embedUrl) {
+  const html = await fetchHtml(embedUrl, 12000);
+  if (!html) return '';
+  const m = html.match(/get_video\?id=[^"'&\s]+&expires=\d+&ip=[^"'&\s]+&token=[^"'&\s]+/);
+  if (!m) return '';
+  return 'https://streamtape.com/' + m[0];
+}
+
 // minochinos（VidHide 系）嵌页 -> m3u8：解包取 links.hls2（真 m3u8，
 // asn 令牌绑取页 IP——蜘蛛在设备上取页，与播放器同 IP）优先，hls3 兜底。
 async function resolveMinochinos(embedUrl) {
@@ -268,9 +278,11 @@ function hostOf(u) {
 // 解析失败返回空数组，该线路直接省略）。
 async function resolveEmbed(embedUrl) {
   const host = hostOf(embedUrl);
-  // streamtape 已删线：三部片 /v/ 页均 404 “Video not found / deleted by
-  // the creator”，文件在源站已删、修不回来，直接去掉、不留播不了的线。
-  if (/streamtape\.com/i.test(host)) return [];
+  // streamtape 线（用户令回到修前，加回来）。
+  if (/streamtape\.com/i.test(host)) {
+    const u = await resolveStreamtape(embedUrl);
+    return u ? [{ label: 'Streamtape', url: u }] : [];
+  }
   if (/minochinos\.com/i.test(host)) {
     const u = await resolveMinochinos(embedUrl);
     if (!u) return [];
