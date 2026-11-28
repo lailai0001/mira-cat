@@ -119,8 +119,6 @@ import javshujin from './spider/video/javshujin.js';
 import podjav from './spider/video/podjav.js';
 import popjav from './spider/video/popjav.js';
 import tinyav from './spider/video/tinyav.js';
-import javxxx from './spider/video/py_javxxx.js';
-import javdock from './spider/video/py_javdock.js';
 
 const spiders = [
     missav,
@@ -179,7 +177,6 @@ const spiders = [
     javcc,
     javct,
     javday,
-    javdock,
     javfeed,
     javgg,
     javhd,
@@ -197,7 +194,6 @@ const spiders = [
     javrate,
     javshujin,
     javtiful,
-    javxxx,
     jinguo,
     juheduanju,
     kanav,
