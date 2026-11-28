@@ -1,7 +1,9 @@
 // MissAV — 重写（2026-11-28 用户令：旧版删了，按 missav.fans 从头写）。
 // 以 missav.fans 为主站（VM 直连 200，站方现站结构与 live 一致）。
-// 封面：不再改写到 fourhoi——fourhoi 是残缺镜像，新封面全 404，
-// “有的出、有的不出”的根因。封面走站方原地址 d.surrit 直链。
+// 封面：走 missav-cover Worker 代理（2026-11-28 真机：d.surrit 直链全灭，
+// 手机到不了 d.surrit；Worker 侧 d.surrit 也 525，http 回落救不了；
+// 只有 fourhoi 能通，故封面先统一回 fourhoi、再包 Worker 代理。
+// 老片封面 fourhoi 有 → 能出；新片封面 fourhoi 缺 → 仍不出，待找新源）。
 // 取页：fans 直连 → fans 经 missav-fetch Worker → live 直连（fans 删片的回落）。
 // 播放：详情 packed JS 解出分档 m3u8，统一走 missav-hls 中转（BBTU-123 真机已验）。
 // 源站：https://missav.fans 为主、https://missav.live 回落（中文 /cn/）。
@@ -69,10 +71,23 @@ function absUrl(u, base) {
 // （/dm509/cn/release）封面是 fourhoi；fourhoi 是残缺镜像，
 // 新封面全 404，“有的出、有的不出”的根因。所以 fourhoi 一律改回 d.surrit，
 // 已是 d.surrit 的不动。
+const COVER_PROXY = 'https://missav-cover.li768435813.workers.dev/?u=';
+// 封面：统一走 missav-cover Worker 代理（2026-11-28 用户真机：改回 d.surrit 后
+// 所有封面全灭——手机到不了 d.surrit；Worker 侧 d.surrit 也 525（证书握手失败，
+// http 回落也救不了），只有 fourhoi 能通（Worker 取 200）。
+// 所以先把 d.surrit 改回 fourhoi、再包一层 Worker 代理：
+// 老片封面 fourhoi 有 → 代理 200 能出；新片封面 fourhoi 403/503 → 仍缺，
+// 待找新封面源（d.surrit 全线不通是死结，不靠它）。
 function fixCover(u) {
   u = String(u || '').trim();
   if (!u) return '';
-  return u.replace(/^https:\/\/fourhoi\.mrstcdn\.store\//i, 'https://d.surrit.mrstcdn.store/');
+  // 先统一 host 到 fourhoi（Worker 唯一能取到的封面 host）
+  u = u.replace(/^https:\/\/d\.surrit\.mrstcdn\.store\//i, 'https://fourhoi.mrstcdn.store/');
+  u = u.replace(/^https:\/\/surrit\.mrstcdn\.store\//i, 'https://fourhoi.mrstcdn.store/');
+  u = u.replace(/^https:\/\/c\.surrit\.mrstcdn\.store\//i, 'https://fourhoi.mrstcdn.store/');
+  // 只代理 mrstcdn 封面，其他 host 原样
+  if (!/^https:\/\/fourhoi\.mrstcdn\.store\//i.test(u)) return u;
+  return COVER_PROXY + encodeURIComponent(u);
 }
 
 // 取页：以 missav.fans 为主（先直连、再走 missav-fetch Worker），
