@@ -62,6 +62,8 @@ import ultra from './spider/video/ultra.js';
 import asian from './spider/video/asian.js';
 import javtiful from './spider/video/py_javtiful.js';
 import hornyjav from './spider/video/py_hornyjav.js';
+import hqporner from './spider/video/py_hqporner.js';
+import pinksnake from './spider/video/py_pinksnake.js';
 import javct from './spider/video/py_javct.js';
 import topjav from './spider/video/py_topjav.js';
 import perverzija from './spider/video/py_perverzija.js';
@@ -168,6 +170,7 @@ const spiders = [
     hlbdy,
     hohoj,
     hornyjav,
+    hqporner,
     huangguo,
     huangvideo,
     sanjipian,
@@ -213,6 +216,7 @@ const spiders = [
     pandalive,
     perverzija,
     pimpbunny,
+    pinksnake,
     podjav,
     popjav,
     porncgw,
